@@ -1,6 +1,6 @@
 # dokkebi-cli
 
-![Dokkebi logo](./icon-512.png)
+![Dokkebi logo](https://github.com/kigi625/dokkebi-cli/blob/main/icon-512.png?raw=true)
 
 [자세한 내용 확인하기](https://dokkebi.net)
 
