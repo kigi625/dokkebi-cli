@@ -4,6 +4,8 @@
 
 [자세한 내용 확인하기](https://dokkebi.net)
 
+[Contact](https://notofly.com?page=noto&id=54a144f4-2ac1-41a4-b13d-0269fc265b4f)
+
 # 브라우저 안에서 백엔드가 실행되는 클라이언트사이드 서버리스 프레임워크
 
 도깨비는 백엔드 TypeScript 코드를 **QuickJS** WASM으로 빌드하여 브라우저에서 직접 실행하는 혁신적인 프레임워크입니다. 서버가 없어도 API가 동작하며, DB 통신은 E2E 암호화된 프록시를 통해 안전하게 처리됩니다.

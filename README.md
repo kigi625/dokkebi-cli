@@ -4,6 +4,8 @@
 
 [Learn more](https://dokkebi.net)
 
+[Contact](https://notofly.com?page=noto&id=54a144f4-2ac1-41a4-b13d-0269fc265b4f)
+
 # A client-side serverless framework where the backend runs in the browser
 
 Dokkebi is an innovative framework that compiles backend TypeScript into **QuickJS** WASM and runs it directly in the browser. APIs work without a server, and database communication is handled securely through an E2E-encrypted proxy.
