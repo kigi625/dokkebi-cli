@@ -10,6 +10,12 @@ name: npm publish
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: npm에 publish할 semver (예: 1.0.0)
+        required: true
+        default: '1.0.0'
 
 permissions:
   contents: read
@@ -29,8 +35,12 @@ jobs:
 
       - name: Align package version with release tag
         run: |
-          VERSION="${{ github.event.release.tag_name }}"
-          VERSION="${VERSION#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"
+          fi
           echo "Publishing dokkebi-cli@${VERSION}"
           npm version "$VERSION" --no-git-tag-version
 
