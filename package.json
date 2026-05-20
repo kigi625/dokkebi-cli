@@ -25,7 +25,10 @@
     "supabase",
     "appwrite"
   ],
-  "author": "",
+  "author": {
+    "name":"park yong woo",
+    "url":"(https://notofly.com?page=noto&id=54a144f4-2ac1-41a4-b13d-0269fc265b4f)"
+  },
   "license": "Elastic-2.0",
   "engines": {
     "node": ">=20.0.0"
@@ -46,5 +49,10 @@
   },
   "optionalDependencies": {
     "mysql2": "^3.11.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kigi625/dokkebi-cli.git"
+  },
+  "homepage": "https://github.com/kigi625/dokkebi-cli#readme",
 }
