@@ -15,5 +15,10 @@
   "license": "Elastic-2.0",
   "peerDependencies": {
     "vite": ">=5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
   }
 }
