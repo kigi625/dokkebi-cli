@@ -146,4 +146,6 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
-docs/design
+!docs/design/TENANT_POLICY.md
+!docs/design/AUTHORIZATION.md
+!docs/design/QUERY_REGISTRY.md

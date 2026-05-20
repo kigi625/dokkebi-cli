@@ -1,0 +1,43 @@
+# GitHub Release가 publish되면 NPM_TOKEN으로 npm publish를 실행합니다.
+#
+# 사전 설정:
+#   1. npmjs.com에서 Automation 타입 access token 발급
+#   2. GitHub repo → Settings → Secrets → Actions → NPM_TOKEN 등록
+#   3. GitHub에서 Release 생성 (태그 예: v1.0.1)
+
+name: npm publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Align package version with release tag
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          echo "Publishing dokkebi-cli@${VERSION}"
+          npm version "$VERSION" --no-git-tag-version
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
