@@ -1,0 +1,16 @@
+{
+  "name": "dokkebi-dsl",
+  "version": "1.0.0",
+  "description": "dokkebi Type-safe Query DSL — Drizzle 스타일 쿼리 빌더 (D1/Supabase/Appwrite 지원)",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.js",
+      "types": "./src/index.d.ts"
+    }
+  },
+  "keywords": ["dokkebi", "query-dsl", "type-safe", "d1", "supabase", "appwrite"],
+  "license": "Elastic-2.0"
+}

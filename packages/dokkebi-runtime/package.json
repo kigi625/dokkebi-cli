@@ -1,0 +1,19 @@
+{
+  "name": "dokkebi-runtime",
+  "version": "1.0.0",
+  "description": "dokkebi Guest-side Runtime — QuickJS WASM 내에서 실행되는 라우터/컨텍스트/미들웨어 API",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.js",
+      "types": "./src/index.d.ts"
+    }
+  },
+  "keywords": ["dokkebi", "runtime", "quickjs", "wasm", "router"],
+  "license": "Elastic-2.0",
+  "dependencies": {
+    "dokkebi-dsl": "file:../dokkebi-dsl"
+  }
+}

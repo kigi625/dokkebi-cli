@@ -1,0 +1,19 @@
+{
+  "name": "dokkebi-vite-plugin",
+  "version": "1.0.0",
+  "description": "dokkebi Vite 플러그인 — WASM 로더 주입, WIT 바인딩 자동 연결, HMR 지원",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.js",
+      "types": "./src/index.d.ts"
+    }
+  },
+  "keywords": ["dokkebi", "vite-plugin", "wasm", "quickjs"],
+  "license": "Elastic-2.0",
+  "peerDependencies": {
+    "vite": ">=5.0.0"
+  }
+}

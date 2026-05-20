@@ -1,0 +1,50 @@
+{
+  "name": "dokkebi-cli",
+  "version": "1.0.0",
+  "description": "QuickJS WASM ClientSide Backend Framework - Dokkebi",
+  "type": "module",
+  "main": "src/cli.js",
+  "bin": {
+    "dokkebi": "./src/cli.js",
+    "dok": "./src/cli.js"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build:example": "node src/cli.js build example-app",
+    "serve:example": "node src/cli.js serve example-app --skip-build",
+    "create:example": "node src/cli.js create"
+  },
+  "keywords": [
+    "dokkebi",
+    "wasm",
+    "quickjs",
+    "serverless",
+    "cloudflare-d1",
+    "supabase",
+    "appwrite"
+  ],
+  "author": "",
+  "license": "Elastic-2.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@jitl/quickjs-singlefile-browser-release-asyncify": "^0.31.0",
+    "@jitl/quickjs-wasmfile-release-sync": "^0.31.0",
+    "commander": "^12.1.0",
+    "esbuild": "^0.24.0",
+    "inquirer": "^9.2.23",
+    "javascript-obfuscator": "^5.4.2",
+    "node-fetch": "^3.3.2",
+    "quickjs-emscripten": "^0.31.0",
+    "quickjs-emscripten-core": "^0.31.0"
+  },
+  "devDependencies": {
+    "mysql2": "^3.11.0"
+  },
+  "optionalDependencies": {
+    "mysql2": "^3.11.0"
+  }
+}
