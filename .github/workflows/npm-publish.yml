@@ -41,8 +41,13 @@ jobs:
             VERSION="${{ github.event.release.tag_name }}"
             VERSION="${VERSION#v}"
           fi
-          echo "Publishing dokkebi-cli@${VERSION}"
-          npm version "$VERSION" --no-git-tag-version
+          CURRENT=$(node -p "require('./package.json').version")
+          echo "Publishing dokkebi-cli@${VERSION} (current: ${CURRENT})"
+          if [ "$VERSION" != "$CURRENT" ]; then
+            npm version "$VERSION" --no-git-tag-version
+          else
+            echo "Version unchanged, skipping bump"
+          fi
 
       - name: Publish to npm
         env:
