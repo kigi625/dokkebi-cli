@@ -45,6 +45,25 @@ test('denormalize activeForward', () => {
     assert.deepStrictEqual(out.params, []);
 });
 
+test('denormalize previousForwards chain (multi-deploy)', () => {
+    const flags = { rotate: true, pow: true };
+    const w1 = buildWireRuntimeJson(flags, null, 'build0000000001');
+    const w2 = buildWireRuntimeJson(flags, w1.rotation, 'build0000000002');
+    const w3 = buildWireRuntimeJson(flags, w2.rotation, 'build0000000003');
+    const oldAlias = w1.rotation.activeForward.queryId;
+    const enc = { [oldAlias]: 'q-old', params: [] };
+    const out = denormalizePayload(enc, w3);
+    assert.strictEqual(out.queryId, 'q-old');
+});
+
+test('denormalize accepts canonical keys from skipWire client', () => {
+    const flags = { rotate: true, pow: true };
+    const w = buildWireRuntimeJson(flags, null, 'build2222222222');
+    const out = denormalizePayload({ queryId: 'q1', params: [], _debugSql: 'SELECT 1' }, w);
+    assert.strictEqual(out.queryId, 'q1');
+    assert.strictEqual(out._debugSql, 'SELECT 1');
+});
+
 test('PoW mine + verify + strip', () => {
     const wire = { pow: { enabled: true, bits: 10 } };
     const sid = 'a'.repeat(32);

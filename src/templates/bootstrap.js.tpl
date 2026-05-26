@@ -1184,7 +1184,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
     return next;
   }
 
-  async function _encryptPayload(data) {
+  async function _encryptPayload(data, opts) {
     if (!_LOCAL_DB_MODE) await _handshakeBgP;
     if (!_encKey || !_sigKey || !_sessionId) {
       throw new Error('[dokkebi] 보안 핸드셰이크가 완료되지 않았습니다.');
@@ -1202,7 +1202,8 @@ function _dokkebiScheduleVersionProbeForPath(path) {
 
     // AES-256-GCM 암호화 (출력: ciphertext + 16바이트 auth tag)
     const wired = await _maybeAttachPow(data);
-    const dataOut = _payloadCanonToAlias(wired);
+    // skipWire: 배포 직후 구버전 클라 → 서버가 이전 회전 매핑을 못 읽을 때 정규 키로 1회 재시도
+    const dataOut = (opts && opts.skipWire) ? wired : _payloadCanonToAlias(wired);
     const plain     = new TextEncoder().encode(JSON.stringify(dataOut));
     const encrypted = new Uint8Array(
       await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, _encKey, plain)
@@ -1754,6 +1755,26 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           var resultR = jsonR._enc ? await _decryptResponse(jsonR) : jsonR;
           if (_qHash && resultR && resultR.ok !== false) _cacheQueryResult(_qHash, resultR);
           return resultR;
+        }
+
+        // (b2) 배포 직후 wire 회전 불일치 — 세션 유지, 정규 필드명으로 1회 재시도
+        if (!payload._canonWireRetry) {
+          console.warn('[dokkebi] 🔁 배포 호환 — 정규 필드명으로 DB 재시도 (새로고침 없이)');
+          const payloadR = await _buildDbPayload(sql, params);
+          payloadR._canonWireRetry = true;
+          const bodyR = await _encryptPayload(payloadR, { skipWire: true });
+          const respR = await _fetch('/api/_dokkebi/db', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body: bodyR,
+          });
+          const jsonR = await respR.json();
+          _learnFromResponse(respR, jsonR, Date.now());
+          var resultCanon = jsonR._enc ? await _decryptResponse(jsonR) : jsonR;
+          if (resultCanon && resultCanon.ok !== false) {
+            if (_qHash) _cacheQueryResult(_qHash, resultCanon);
+            return resultCanon;
+          }
         }
 
         // (d) 세션 만료 또는 서명 오류 → 재핸드셰이크
@@ -2774,27 +2795,11 @@ function _dokkebiScheduleVersionProbeForPath(path) {
             }
           }
           if (_retryDecErr) {
-            // reload 가드 — bundleHash 별로 분리하고 60초 후 자동 만료.
-            // 가드가 만료된 상태면 OPFS/세션 정리 후 한 번 더 reload 한다.
-            var _reloadKey = 'dokkebi_decrypt_reload___DOKKEBI_PH_BUNDLE_HASH__';
-            var _RELOAD_GUARD_MS = 60_000;
-            var _now = Date.now();
-            var _prevTs = Number(sessionStorage.getItem(_reloadKey) || 0);
-            var _withinGuard = _prevTs > 0 && (_now - _prevTs) < _RELOAD_GUARD_MS;
-            if (!_withinGuard) {
-              sessionStorage.setItem(_reloadKey, String(_now));
-              var _kindMsg = (_retryDecErr && _retryDecErr.code === 'prop_pending')
-                ? '배포 전파가 진행 중입니다. 페이지를 새로고침해 다시 시도합니다.'
-                : '배포 전파가 아직 끝나지 않아 페이지를 한 번 새로고침합니다.';
-              console.warn('[dokkebi] ⏳ ' + _kindMsg, _retryDecErr?.name || _retryDecErr?.message || _retryDecErr);
-              setTimeout(function() { window.location.reload(); }, 500);
-              await new Promise(function() {});
-            }
-            // 가드 만료(60s 이상 경과) — 다시 reload 시도하지 않고 사용자에게 명시적으로 알림.
-            sessionStorage.removeItem(_reloadKey);
-            if (_retryDecErr && _retryDecErr.code === 'prop_pending') {
-              console.error('[dokkebi] ⛔ 배포 업데이트 반영이 60초 이상 지연되고 있습니다. 잠시 후 자동으로 복구됩니다.');
-            }
+            // 자동 새로고침 없음 — 이미 열린 탭은 세션·WASM 으로 DB 계속 가능. 첫 로드만 실패 시 배너 Reload 유도.
+            var _kindMsg = (_retryDecErr && _retryDecErr.code === 'prop_pending')
+              ? '배포 전파 중입니다. 잠시 후 다시 시도하거나, 하단 «Reload»로 새로고침하세요.'
+              : '새 배포가 있습니다. 하단 «Reload»로 새로고침하면 최신 번들을 받습니다. (이미 로드된 탭은 DB가 계속 동작할 수 있습니다)';
+            console.warn('[dokkebi] ⏳ ' + _kindMsg, _retryDecErr?.name || _retryDecErr?.message || _retryDecErr);
             throw _retryDecErr;
           }
         }
@@ -3441,7 +3446,6 @@ function _dokkebiScheduleVersionProbeForPath(path) {
     const _MIN_GAP = 30000;
 
     async function _check() {
-      if (_updateShown) return;
       const now = Date.now();
       if (now - _lastCheck < _MIN_GAP) return;
       _lastCheck = now;
@@ -3453,8 +3457,10 @@ function _dokkebiScheduleVersionProbeForPath(path) {
         const cur = document.querySelector('meta[name="dokkebi-build-ver"]');
         const curVer = cur ? cur.content : (window.__DOKKEBI_BUILD_VER__ || '');
         if (!curVer || d.v === curVer) return;
-        _updateShown = true;
-        _showBanner();
+        if (!_updateShown) {
+          _updateShown = true;
+          _showBanner();
+        }
       } catch {}
     }
 
@@ -3466,7 +3472,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
       const b = document.createElement('div');
       b.style.cssText = 'background:#1e293b;color:#fff;border-radius:12px;padding:0.75rem 1.25rem;display:flex;align-items:center;justify-content:center;gap:0.75rem;box-shadow:0 8px 32px rgba(0,0,0,0.4);border:1px solid rgba(99,102,241,0.4);pointer-events:auto;animation:dokSlideUp .3s ease-out;';
       b.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#818cf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>'
-        + '<span style="font-size:0.88rem">A new version is available</span>';
+        + '<span style="font-size:0.88rem">A new version is available — you can keep using this tab; reload when convenient</span>';
       const btn = document.createElement('button');
       btn.textContent = 'Reload';
       btn.style.cssText = 'padding:0.35rem 0.9rem;border-radius:8px;background:linear-gradient(135deg,#6366f1,#7c3aed);color:#fff;border:none;cursor:pointer;font-weight:700;font-size:0.82rem;';

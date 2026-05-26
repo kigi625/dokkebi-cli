@@ -20,10 +20,12 @@ export const PAYLOAD_FIELD_ROTATE_CANONICAL = [
 ];
 
 /** @returns {ReturnType<typeof buildWireRuntimeJson>} */
+const MAX_WIRE_PREVIOUS_FORWARDS = 5;
+
 export function disabledWireRuntimeJson() {
     return {
         version: 1,
-        rotation: { enabled: false, buildId: '', activeForward: {}, previousForward: null },
+        rotation: { enabled: false, buildId: '', activeForward: {}, previousForward: null, previousForwards: [] },
         pow: { enabled: false, bits: 14 },
     };
 }
@@ -57,8 +59,35 @@ export async function loadWireRuntimeForLocalProxy(distRoot, proxyMode) {
  * @param {{ enabled?: boolean, activeForward?: Record<string,string>, buildId?: string }|null} previousState
  * @param {string} buildId
  */
+/** @param {unknown} previousState rotation-state.json | rotation-history entry | { previousForwards } */
+export function collectPreviousForwards(previousState) {
+    /** @type {Record<string, string>[]} */
+    const list = [];
+    const push = (m) => {
+        if (!m || typeof m !== 'object' || !Object.keys(m).length) return;
+        const key = JSON.stringify(m);
+        if (list.some((x) => JSON.stringify(x) === key)) return;
+        list.push({ ...m });
+    };
+    if (Array.isArray(previousState?.previousForwards)) {
+        for (const m of previousState.previousForwards) push(m);
+    }
+    if (Array.isArray(previousState?.forwards)) {
+        for (const entry of previousState.forwards) push(entry?.activeForward);
+    }
+    push(previousState?.activeForward);
+    if (previousState?.enabled && previousState?.activeForward) push(previousState.activeForward);
+    return list.slice(-MAX_WIRE_PREVIOUS_FORWARDS);
+}
+
 export function buildWireRuntimeJson(flags, previousState, buildId) {
-    const rotation = { enabled: false, buildId: String(buildId || '').slice(0, 16), activeForward: {}, previousForward: null };
+    const rotation = {
+        enabled: false,
+        buildId: String(buildId || '').slice(0, 16),
+        activeForward: {},
+        previousForward: null,
+        previousForwards: [],
+    };
     const pow = { enabled: flags.pow !== false, bits: 14 };
 
     if (!flags.rotate) {
@@ -71,8 +100,10 @@ export function buildWireRuntimeJson(flags, previousState, buildId) {
     }
     rotation.enabled = true;
     rotation.activeForward = activeForward;
-    if (previousState?.enabled && previousState.activeForward && typeof previousState.activeForward === 'object') {
-        rotation.previousForward = { ...previousState.activeForward };
+    const prevList = collectPreviousForwards(previousState);
+    rotation.previousForwards = prevList;
+    if (prevList.length > 0) {
+        rotation.previousForward = { ...prevList[prevList.length - 1] };
     }
 
     return { version: 1, rotation, pow };
@@ -101,17 +132,28 @@ function _invertForward(forward) {
  * @param {Record<string, unknown>} body
  * @param {{ rotation?: { enabled?: boolean, activeForward?: Record<string,string>, previousForward?: Record<string,string>|null } }} wire
  */
+function _canonFieldFromWireKey(k, activeR, previousForwards) {
+    if (activeR && activeR[k]) return activeR[k];
+    if (PAYLOAD_FIELD_ROTATE_CANONICAL.includes(k)) return k;
+    const prevList = Array.isArray(previousForwards) ? previousForwards : [];
+    for (let i = prevList.length - 1; i >= 0; i--) {
+        const pr = _invertForward(prevList[i]);
+        if (pr && pr[k]) return pr[k];
+    }
+    return k;
+}
+
 export function denormalizePayload(body, wire) {
     const rot = wire?.rotation;
     if (!rot?.enabled) return body;
     const activeR = _invertForward(rot.activeForward);
-    const prevR = rot.previousForward ? _invertForward(rot.previousForward) : null;
+    const prevList = rot.previousForwards?.length
+        ? rot.previousForwards
+        : (rot.previousForward ? [rot.previousForward] : []);
     /** @type {Record<string, unknown>} */
     const out = {};
     for (const k of Object.keys(body)) {
-        let canon = activeR && activeR[k];
-        if (!canon && prevR && prevR[k]) canon = prevR[k];
-        if (!canon) canon = k;
+        const canon = _canonFieldFromWireKey(k, activeR, prevList);
         out[canon] = body[k];
     }
     return out;
@@ -205,7 +247,7 @@ export function verifyAndStripPow(body, sid, wire) {
 export function emitPayloadWireTs(wire) {
     const json = JSON.stringify(wire);
     // dok update 가 설치 버전을 추적하려면 첫 줄에 @dokkebi-version 필요 (commands/update.js WORKER_FILES 와 동기)
-    return `// @dokkebi-version: 1
+    return `// @dokkebi-version: 2
 // @dokkebi-generated — payload wire (rotation + PoW). dok build 가 덮어씁니다.
 export const WIRE_RUNTIME = ${json} as const;
 
@@ -236,11 +278,20 @@ export function denormalizeDbPayload(body: Record<string, unknown>): Record<stri
   const rot = (WIRE_RUNTIME as any).rotation;
   if (!rot?.enabled) return body;
   const activeR = _invertForward(rot.activeForward as Record<string, string>);
-  const prevR = rot.previousForward ? _invertForward(rot.previousForward as Record<string, string>) : null;
+  const prevList: Record<string, string>[] = Array.isArray(rot.previousForwards) && rot.previousForwards.length
+    ? rot.previousForwards
+    : (rot.previousForward ? [rot.previousForward as Record<string, string>] : []);
+  const _CANON = ${JSON.stringify(PAYLOAD_FIELD_ROTATE_CANONICAL)};
   const out: Record<string, unknown> = {};
   for (const k of Object.keys(body)) {
     let canon = activeR && activeR[k];
-    if (!canon && prevR && prevR[k]) canon = prevR[k];
+    if (!canon && _CANON.indexOf(k) >= 0) canon = k;
+    if (!canon) {
+      for (let i = prevList.length - 1; i >= 0; i--) {
+        const pr = _invertForward(prevList[i]);
+        if (pr && pr[k]) { canon = pr[k]; break; }
+      }
+    }
     if (!canon) canon = k;
     out[canon] = body[k];
   }

@@ -1658,10 +1658,15 @@ function relaxCspForCrossOriginEmbed(csp: string): string {
   return out ? out + '; frame-ancestors *' : 'frame-ancestors *';
 }
 
+function _isEmbeddableNotoPage(url: URL): boolean {
+  const page = url.searchParams.get('page');
+  return page === 'embed' || page === 'noto';
+}
+
 function _relaxEmbedFrameAncestors(res: Response, url: URL): Response {
-  // SPA embed 공유 (?page=embed) 는 타 사이트 iframe 에서도 표시되어야 함 — _headers 의
+  // SPA embed 공유 (?page=embed, ?page=noto) 는 타 사이트 iframe 에서도 표시되어야 함 — _headers 의
   // X-Frame-Options / CSP frame-ancestors 가 SAMEORIGIN 이면 브라우저가 차단함.
-  if (url.searchParams.get('page') !== 'embed') return res;
+  if (!_isEmbeddableNotoPage(url)) return res;
   const h = new Headers(res.headers);
   h.delete('x-frame-options');
   const csp = h.get('Content-Security-Policy');

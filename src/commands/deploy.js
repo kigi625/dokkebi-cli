@@ -23,7 +23,7 @@ import { execFileSync } from 'child_process';
 import { createHmac, createHash } from 'crypto';
 import { runBuild } from './build.js';
 import { loadDokkebiConfigMerged } from '../core/dokkebiConfigLoad.js';
-import { CSP_FRAME_SRC_ALLOWLIST } from '../core/cspFrameSrc.js';
+import { CSP_FRAME_SRC_ALLOWLIST, CSP_SCRIPT_SRC_LEMON_SQUEEZY } from '../core/cspFrameSrc.js';
 import { isBundleEncryptEnabled } from '../core/buildWasm.js';
 import { purgeBuildArtifactsFromDist } from '../core/buildArtifactPurge.js';
 import { t } from '../i18n/index.js';
@@ -313,7 +313,7 @@ async function _writeSecurityHeaders(distDir, { strictCsp = false } = {}) {
     //   을 제거한다. 인라인 블록이 전혀 없으면 더 엄격한 디폴트가 적용된다.
     // Safari/iPadOS Safari still gates WebAssembly compilation behind 'unsafe-eval'
     // even when 'wasm-unsafe-eval' is present. QuickJS WASM cannot boot without it.
-    let scriptSrc = `'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' blob: https://cdn.jsdelivr.net https://static.cloudflareinsights.com`;
+    let scriptSrc = `'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' blob: https://cdn.jsdelivr.net https://static.cloudflareinsights.com ${CSP_SCRIPT_SRC_LEMON_SQUEEZY}`;
     let styleSrc  = `'self' 'unsafe-inline' https://fonts.googleapis.com`;
 
     if (strictCsp) {
@@ -323,7 +323,7 @@ async function _writeSecurityHeaders(distDir, { strictCsp = false } = {}) {
             const { scriptHashes, styleHashes, inlineEventCount } = _collectInlineHashes(html);
             const scriptTok = scriptHashes.map(h => `'sha256-${h}'`).join(' ');
             const styleTok  = styleHashes.map(h => `'sha256-${h}'`).join(' ');
-            scriptSrc = [`'self'`, `'wasm-unsafe-eval'`, `'unsafe-eval'`, scriptTok, `https://cdn.jsdelivr.net`, `https://static.cloudflareinsights.com`].filter(Boolean).join(' ').trim();
+            scriptSrc = [`'self'`, `'wasm-unsafe-eval'`, `'unsafe-eval'`, scriptTok, `https://cdn.jsdelivr.net`, `https://static.cloudflareinsights.com`, CSP_SCRIPT_SRC_LEMON_SQUEEZY].filter(Boolean).join(' ').trim();
             // 스타일은 인라인 속성 (style="...") 까지 잡기 어렵기 때문에 hash + 'unsafe-hashes' 조합 안내
             styleSrc  = [`'self'`, styleTok, `https://fonts.googleapis.com`].filter(Boolean).join(' ').trim();
             if (inlineEventCount > 0) {

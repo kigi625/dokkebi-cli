@@ -944,7 +944,8 @@ export async function runDev(src, options = {}) {
     const server = http.createServer(async (req, res) => {
         const urlPath = req.url?.split('?')[0] || '/';
         const reqUrl = new URL(req.url || '/', 'http://dokkebi.dev');
-        const allowEmbed = reqUrl.searchParams.get('page') === 'embed';
+        const page = reqUrl.searchParams.get('page');
+        const allowEmbed = page === 'embed' || page === 'noto';
 
         // ── 보안 헤더 ────────────────────────────────────────
         setSecurityHeaders(res, 'dev', { allowEmbed });

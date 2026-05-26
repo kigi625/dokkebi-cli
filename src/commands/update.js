@@ -51,7 +51,7 @@ const WORKER_FILES = [
     {
         rel:      'worker/api/_dokkebi/_payloadWire.ts',
         generate: () => emitPayloadWireTs(disabledWireRuntimeJson()),
-        version:  1,
+        version:  2,
         desc:     '암호화 페이로드 wire (회전 + PoW) — dok build 시 최신으로 덮어씀',
     },
     {

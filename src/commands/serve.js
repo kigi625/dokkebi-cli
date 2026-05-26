@@ -28,7 +28,7 @@
 
 import path from 'path';
 import http from 'http';
-import { frameSrcDirective } from '../core/cspFrameSrc.js';
+import { frameSrcDirective, CSP_SCRIPT_SRC_LEMON_SQUEEZY } from '../core/cspFrameSrc.js';
 import https from 'https';
 import fs from 'fs/promises';
 import { handleAdminRoute, logSecurityEvent, logRequest, logError } from '../core/adminPanel.js';
@@ -297,7 +297,8 @@ export async function runServe(src, options = {}) {
     const server = http.createServer(async (req, res) => {
         const urlPath = req.url?.split('?')[0] || '/';
         const reqUrl = new URL(req.url || '/', 'http://dokkebi.serve');
-        const allowEmbed = reqUrl.searchParams.get('page') === 'embed';
+        const page = reqUrl.searchParams.get('page');
+        const allowEmbed = page === 'embed' || page === 'noto';
 
         // ── 보안 헤더 ────────────────────────────────────────
         setSecurityHeaders(res, 'serve', { allowEmbed });
@@ -1203,8 +1204,8 @@ export function setSecurityHeaders(res, mode = 'serve', opts = {}) {
 
     // dev 모드에서는 esbuild-wasm 번들러(esm.sh), sql.js/@webcontainer(jsdelivr) 외부 스크립트 허용
     const scriptSrc = mode === 'dev'
-        ? `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://esm.sh https://cdn.jsdelivr.net blob:`
-        : `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net blob:`;
+        ? `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://esm.sh https://cdn.jsdelivr.net ${CSP_SCRIPT_SRC_LEMON_SQUEEZY} blob:`
+        : `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net ${CSP_SCRIPT_SRC_LEMON_SQUEEZY} blob:`;
 
     const imgSrc = mode === 'dev'
         ? `img-src 'self' data: blob: https://picsum.photos https://*.picsum.photos https://placehold.co`

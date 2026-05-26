@@ -32,7 +32,7 @@ import { loadDokkebiConfigMerged, applySecurityPreset } from '../core/dokkebiCon
 import { getHardeningFlags } from '../core/hardeningFlags.js';
 import { runSeoPipeline } from '../core/seo/index.js';
 import { purgeBuildArtifactsFromDist } from '../core/buildArtifactPurge.js';
-import { buildWireRuntimeJson, emitPayloadWireTs, disabledWireRuntimeJson } from '../core/payloadWireRuntime.js';
+import { buildWireRuntimeJson, emitPayloadWireTs, disabledWireRuntimeJson, collectPreviousForwards } from '../core/payloadWireRuntime.js';
 import { t } from '../i18n/index.js';
 
 const DEFAULT_OUTPUT = 'dist';
@@ -627,7 +627,15 @@ export async function runBuild(src, options = {}) {
     let wireRuntimeJson = disabledWireRuntimeJson();
     let rotationPreviousState = null;
     try {
-        rotationPreviousState = JSON.parse(await fs.readFile(path.join(sourceRoot, '.dokkebi', 'rotation-state.json'), 'utf-8'));
+        const dokDir = path.join(sourceRoot, '.dokkebi');
+        try {
+            const hist = JSON.parse(await fs.readFile(path.join(dokDir, 'rotation-history.json'), 'utf-8'));
+            const forwards = collectPreviousForwards(hist);
+            if (forwards.length) rotationPreviousState = { previousForwards: forwards };
+        } catch { /* no history */ }
+        if (!rotationPreviousState) {
+            rotationPreviousState = JSON.parse(await fs.readFile(path.join(dokDir, 'rotation-state.json'), 'utf-8'));
+        }
     } catch { /* first build */ }
 
     // 실제 자격증명: .env 변수로 config의 ${VAR} 플레이스홀더 치환
@@ -1221,19 +1229,31 @@ export async function runBuild(src, options = {}) {
         }
 
         try {
-            await fs.mkdir(path.join(sourceRoot, '.dokkebi'), { recursive: true });
+            const dokDir = path.join(sourceRoot, '.dokkebi');
+            await fs.mkdir(dokDir, { recursive: true });
             if (wireRuntimeJson.rotation?.enabled) {
-                await fs.writeFile(
-                    path.join(sourceRoot, '.dokkebi', 'rotation-state.json'),
-                    JSON.stringify({
-                        enabled: true,
-                        activeForward: wireRuntimeJson.rotation.activeForward,
-                        buildId: wireRuntimeJson.rotation.buildId,
-                    }),
-                    'utf-8',
-                );
+                const stateSnap = {
+                    enabled: true,
+                    activeForward: wireRuntimeJson.rotation.activeForward,
+                    buildId: wireRuntimeJson.rotation.buildId,
+                };
+                await fs.writeFile(path.join(dokDir, 'rotation-state.json'), JSON.stringify(stateSnap), 'utf-8');
+                let hist = [];
+                try {
+                    const raw = JSON.parse(await fs.readFile(path.join(dokDir, 'rotation-history.json'), 'utf-8'));
+                    if (Array.isArray(raw.forwards)) hist = raw.forwards;
+                } catch { /* empty */ }
+                hist.push({ ...stateSnap, savedAt: new Date().toISOString() });
+                const seen = new Set();
+                hist = hist.filter((e) => {
+                    const k = JSON.stringify(e.activeForward || {});
+                    if (seen.has(k)) return false;
+                    seen.add(k);
+                    return true;
+                }).slice(-5);
+                await fs.writeFile(path.join(dokDir, 'rotation-history.json'), JSON.stringify({ forwards: hist }, null, 2), 'utf-8');
             } else {
-                await fs.writeFile(path.join(sourceRoot, '.dokkebi', 'rotation-state.json'), JSON.stringify({ enabled: false }), 'utf-8');
+                await fs.writeFile(path.join(dokDir, 'rotation-state.json'), JSON.stringify({ enabled: false }), 'utf-8');
             }
         } catch { /* ignore */ }
 
