@@ -13,6 +13,7 @@ export const PAYLOAD_FIELD_ROTATE_CANONICAL = [
     'params',
     '_debugSql',
     '_setTenant',
+    '_login',
     '_attest',
     '_capabilityUnlock',
     'sql',

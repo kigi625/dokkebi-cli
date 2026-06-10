@@ -39,7 +39,12 @@ const CORS = {
 };
 
 const EPHEMERAL_TTL_MS = 60_000;
-const CLIENT_HANDSHAKE_SECRET_KEYS = ['__DOKKEBI_BC_KEY__', 'JWT_SECRET', 'DOKKEBI_JWT_SECRET'] as const;
+// ── C-1 방어: 인가용 JWT 서명 시크릿은 절대 클라이언트로 내려보내지 않는다. ──
+//   HS256 은 대칭키이므로, 시크릿이 브라우저에 도달하면 누구나 임의 role/user_id JWT 를
+//   위조해 Authorization Policy 와 JWT 기반 테넌트 격리를 무력화할 수 있다.
+//   로그인/토큰 발급은 워커측 `_login`(DB 검증 + 워커 전용 시크릿 서명) 으로만 수행한다.
+//   여기서는 번들 복호화 키(__DOKKEBI_BC_KEY__) 만 전달한다.
+const CLIENT_HANDSHAKE_SECRET_KEYS = ['__DOKKEBI_BC_KEY__'] as const;
 
 // 무중단 배포 — 클라이언트가 보낸 ?bh=<bundleHash 앞 12자> 와 매칭되는 키를
 // __DOKKEBI_BC_KEY_MAP__ JSON 에서 찾는다.

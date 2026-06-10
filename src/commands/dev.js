@@ -27,6 +27,18 @@ import {
     randomBytes,
 } from 'crypto';
 import { tryDevBlogMediaPost, tryDevBlogMediaGet } from '../core/devBlogMedia.js';
+
+let _scatchyDrawingDev = null;
+async function loadScatchyDrawingDev(sourceRoot) {
+    if (_scatchyDrawingDev !== null) return _scatchyDrawingDev;
+    try {
+        const mod = await import(path.join(sourceRoot, 'dev/scatchyDrawingDev.js'));
+        _scatchyDrawingDev = mod;
+    } catch {
+        _scatchyDrawingDev = false;
+    }
+    return _scatchyDrawingDev;
+}
 import {
     loadEnvFile,
     resolveDbConfig,
@@ -888,6 +900,9 @@ export async function runDev(src, options = {}) {
 
     // ── 개발용 부트스트랩 생성 (vite 재빌드 후 index.html 재주입용) ──
     // bundleHash를 빈 문자열로 설정해 개발 모드에서 무결성 검사 비활성화
+    // dok build 후 wire-runtime.json 이 있으면 클라이언트에도 동일 wire/PoW 설정을 넣어
+    // dev DB 프록시(serverless)와 불일치로 403·재시도 루프가 나지 않게 한다.
+    const payloadWireClient = await loadWireRuntimeForLocalProxy(distRoot, proxyMode);
     _devBootstrapHtml = generateBootstrapScript({
         dbType,
         bundleHash: '',
@@ -897,6 +912,7 @@ export async function runDev(src, options = {}) {
         pluginVmBridge,
         queryLearn: true,
         logging: dokConfig?.logging,
+        payloadWireClient,
     });
 
     // ── SQL Allowlist 로드 (dok build 단계에서 생성된 파일) ─────
@@ -948,7 +964,11 @@ export async function runDev(src, options = {}) {
         const allowEmbed = page === 'embed' || page === 'noto';
 
         // ── 보안 헤더 ────────────────────────────────────────
-        setSecurityHeaders(res, 'dev', { allowEmbed });
+        const _cspExtraDev = dokConfig?.security?.cspExtraHosts || {};
+        setSecurityHeaders(res, 'dev', {
+            allowEmbed,
+            imgSrcExtra: Array.isArray(_cspExtraDev.imgSrc) ? _cspExtraDev.imgSrc : [],
+        });
 
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -1055,6 +1075,26 @@ export async function runDev(src, options = {}) {
             'change-this-in-production';
         if (await tryDevBlogMediaPost(req, res, { jwtSecret: jwtForMedia, mediaRoot: devMediaRoot })) return;
         if (await tryDevBlogMediaGet(req, res, urlPath, devMediaRoot)) return;
+
+        // ── Sketchy: AI 그림 평가 + 로컬 미디어 (dev/scatchyDrawingDev.js) ──
+        const scatchyDev = await loadScatchyDrawingDev(sourceRoot);
+        if (scatchyDev) {
+            const devDrawingsRoot = path.join(sourceRoot, '.dev-drawings');
+            const scatchyDevCtx = {
+                sourceRoot,
+                envVars,
+                dbConfig: localDbMode ? null : dbConfig,
+                drawingsRoot: devDrawingsRoot,
+            };
+            if (await scatchyDev.tryDevScatchyDrawingPost(req, res, urlPath, scatchyDevCtx)) return;
+            if (scatchyDev.tryDevPlayerAvatarPost
+                && await scatchyDev.tryDevPlayerAvatarPost(req, res, urlPath, scatchyDevCtx)) return;
+            if (scatchyDev.tryDevPostGuess
+                && await scatchyDev.tryDevPostGuess(req, res, urlPath, scatchyDevCtx)) return;
+            if (scatchyDev.tryDevPostReport
+                && await scatchyDev.tryDevPostReport(req, res, urlPath, scatchyDevCtx)) return;
+            if (await scatchyDev.tryDevScatchyDrawingMediaGet(req, res, urlPath, devDrawingsRoot)) return;
+        }
 
         // ── 정적 파일 서빙 (path traversal 방어) ─────────────
         let filePath = safeStaticJoin(distRoot, urlPath);

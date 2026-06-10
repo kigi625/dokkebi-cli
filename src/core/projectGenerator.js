@@ -507,8 +507,9 @@ export function workerHandshake() {
  * @param {object|null} registry  - Query Registry (Stage 3)
  * @param {object|null} policy    - normalizePolicyConfig() 결과 (Stage 1/2)
  * @param {object|null} authz     - normalizeAuthorizationConfig() 결과 (Stage 4)
+ * @param {object|null} authLoginCfg - normalizeAuthLoginConfig() 결과 (C-1 워커측 로그인)
  */
-export function workerDb(database, allowlist = null, registry = null, policy = null, authz = null, replayCfg = null, buildMeta = null, adlCfg = null, capabilityCfg = null, sessionsCfg = null) {
+export function workerDb(database, allowlist = null, registry = null, policy = null, authz = null, replayCfg = null, buildMeta = null, adlCfg = null, capabilityCfg = null, sessionsCfg = null, authLoginCfg = null) {
     const d1QueryCode = database === 'd1' ? `
 async function executeD1Query(env: Env, sql: string, params: unknown[]): Promise<DbResult> {
   const stmt = _userDbForSql(env, sql).prepare(sql);
@@ -560,6 +561,14 @@ async function executeD1Query(env: Env, sql: string, params: unknown[]): Promise
         ? JSON.stringify(authz)
         : 'null';
 
+    // ── 워커측 로그인 임베드 (C-1, opt-in) ─────────────────────
+    //   authLoginCfg === null 또는 enabled === false → _login 명령 비활성(LOGIN_DISABLED).
+    //   활성 시: DB 검증 + 워커 전용 DOKKEBI_JWT_SECRET 서명. JWT 시크릿은 더 이상
+    //   핸드셰이크로 클라이언트에 전달되지 않는다 (handshake.ts.tpl 참고).
+    const authLoginEmbedded = authLoginCfg && authLoginCfg.enabled && authLoginCfg.query
+        ? JSON.stringify(authLoginCfg)
+        : 'null';
+
     // ── Replay 방어 설정 임베드 ────────────────────────────────
     //   security.replay 는 opt-out 불가(보안 필수). 값만 조정 가능:
     //     - timestampWindowMs: 클라↔서버 허용 시계 오차 (기본 5초)
@@ -605,6 +614,7 @@ async function executeD1Query(env: Env, sql: string, params: unknown[]): Promise
         { find: '__DOKKEBI_PH_REGISTRY__',   replace: registryEmbedded },
         { find: '__DOKKEBI_PH_POLICY__',     replace: policyEmbedded },
         { find: '__DOKKEBI_PH_AUTHZ__',      replace: authzEmbedded },
+        { find: '__DOKKEBI_PH_AUTH_LOGIN__', replace: authLoginEmbedded },
         { find: '__DOKKEBI_PH_INTERNAL_BINDING__', replace: internalBinding },
         { find: '__DOKKEBI_PH_SHARD_BINDINGS__',   replace: shardBindings },
         { find: '__DOKKEBI_PH_SESSIONS__',         replace: sessionsEmbedded },

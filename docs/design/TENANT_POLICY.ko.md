@@ -159,7 +159,7 @@ HTTP 403 + `_dokkebi_security` 에 `tenant_policy_violation` 이벤트 기록.
 - **CTE (WITH)** 내부 각 SELECT 에 대해 verify 는 최종 연산 기준으로만 작동 — 내부 SELECT 에 대한 완전 재귀 검사는 미지원.
 - **INSERT 단일 VALUES 튜플** 만 inject 지원. 복수 튜플은 verify 만.
 - **동적 테이블명** (변수 치환) 은 파싱 실패 → strict=true 에서 거부.
-- **관리자 bypass**: `tenantContext._isAdmin === true` 일 때만. `_isAdmin` 세팅은 `ctx.setSessionTenant({user_id:'u1', _isAdmin: true})` 로 명시.
+- **관리자 bypass**: `tenantContext._isAdmin === true` 일 때만. **⚠ 보안(C-2 수정):** 클라이언트는 더 이상 `ctx.setSessionTenant()` 로 `_isAdmin`(및 `_` 접두 예약 키)을 설정할 수 없다 — 프록시가 예약 키를 거부한다(`TENANT_RESERVED_KEY`). 관리자 승격은 서버 신뢰 경로(워커측 `_login` 역할 클레임 + Authorization Policy)로만 부여해야 하며, 클라이언트가 보낸 테넌트 값으로는 불가능하다.
 
 ---
 

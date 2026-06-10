@@ -39,7 +39,9 @@ const DSL_SRC     = path.join(CLI_ROOT, 'packages/dokkebi-dsl/src/index.js');
 const SENSITIVE_ENV_PATTERN = /.*/;
 /** 빌드 타임에만 인라인 허용할 화이트리스트 키 (값이 민감하지 않은 표준 키만). */
 const BUILD_TIME_ENV_KEYS = new Set(['NODE_ENV']);
-const CLIENT_HANDSHAKE_SECRET_KEYS = new Set(['__DOKKEBI_BC_KEY__', 'JWT_SECRET', 'DOKKEBI_JWT_SECRET']);
+// C-1: JWT 서명 시크릿은 더 이상 클라이언트로 전달되지 않는다(워커측 _login 으로 발급).
+//   따라서 백엔드 WASM 이 JWT_SECRET 을 직접 읽으면 "Worker 전용 Secret" 경고 대상이 된다.
+const CLIENT_HANDSHAKE_SECRET_KEYS = new Set(['__DOKKEBI_BC_KEY__']);
 
 /**
  * 백엔드 번들 AES+난독화(Step 2A) — 항상 강제 ON.

@@ -259,6 +259,7 @@ We do not assume malicious dependencies or a compromised build machine. This che
 
 - Do not disable **`--preflight`** on **`dok deploy`**; use **`--preflight-strict`** to fail deploy on warnings when needed.
 - Optionally reviewed **`security.strictCsp: true`** (trade off with browser/CDN compatibility).
+- Allowlist external images/APIs/iframes per app via **`security.cspExtraHosts`** (e.g. `imgSrc: ['https://api.dicebear.com']`) — the baseline CSP stays strict. See [`docs/SECURITY_OPTIONS.md`](docs/SECURITY_OPTIONS.md) §12.
 - Reduce **frontend XSS** (with CSP allowing `unsafe-inline` / `unsafe-eval`, XSS can lead to compromise of in-browser execution context).
 
 ### Assume reconnaissance is possible

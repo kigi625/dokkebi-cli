@@ -306,7 +306,7 @@ async function _purgeSecretsFromDist(distDir) {
 // Cloudflare Pages _headers 보안 헤더 파일 생성
 // ─────────────────────────────────────────────────────────────
 
-async function _writeSecurityHeaders(distDir, { strictCsp = false } = {}) {
+async function _writeSecurityHeaders(distDir, { strictCsp = false, imgSrcExtra = [], connectSrcExtra = [], frameSrcExtra = [] } = {}) {
     // Phase 2-⑥ — Strict CSP (hash 방식)
     //   strictCsp=true 이면 index.html 의 인라인 <script>/<style> 콘텐츠를 SHA-256
     //   으로 해시해 script-src/style-src 에 'sha256-...' 를 추가하고 'unsafe-inline'
@@ -336,8 +336,11 @@ async function _writeSecurityHeaders(distDir, { strictCsp = false } = {}) {
     }
 
     // iframe: YouTube + NotoFly + Toonify (serve.js · cspFrameSrc.js 와 동일하게 유지)
-    const frameSrc = CSP_FRAME_SRC_ALLOWLIST;
-    const csp = `default-src 'self'; script-src ${scriptSrc}; style-src ${styleSrc}; img-src 'self' data: blob:; media-src 'self' blob:; worker-src 'self' blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' blob: https: wss: https://cloudflareinsights.com; frame-src ${frameSrc}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'`;
+    const _frameSrcExtraStr = Array.isArray(frameSrcExtra) && frameSrcExtra.length ? ' ' + frameSrcExtra.join(' ') : '';
+    const frameSrc = CSP_FRAME_SRC_ALLOWLIST + _frameSrcExtraStr;
+    const _imgExtra = Array.isArray(imgSrcExtra) && imgSrcExtra.length ? ' ' + imgSrcExtra.join(' ') : '';
+    const _connectExtra = Array.isArray(connectSrcExtra) && connectSrcExtra.length ? ' ' + connectSrcExtra.join(' ') : '';
+    const csp = `default-src 'self'; script-src ${scriptSrc}; style-src ${styleSrc}; img-src 'self' data: blob:${_imgExtra}; media-src 'self' blob:; worker-src 'self' blob:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' blob: https: wss: https://cloudflareinsights.com${_connectExtra}; frame-src ${frameSrc}; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'`;
 
     const content = `# dokkebi 보안 헤더 (자동 생성)
 # https://developers.cloudflare.com/pages/configuration/headers/
@@ -443,7 +446,13 @@ async function _deployToCloudflarePages(sourceRoot, distDir, projectName, apiTok
     if (accountId) process.env.CLOUDFLARE_ACCOUNT_ID = accountId;
 
     // Cloudflare Pages _headers 파일 자동 생성 (보안 헤더 + 선택적 strict CSP)
-    await _writeSecurityHeaders(distDir, { strictCsp: opts.strictCsp === true });
+    const _cspExtra = opts?.dokkebiConfig?.security?.cspExtraHosts || {};
+    await _writeSecurityHeaders(distDir, {
+        strictCsp: opts.strictCsp === true,
+        imgSrcExtra: Array.isArray(_cspExtra.imgSrc) ? _cspExtra.imgSrc : [],
+        connectSrcExtra: Array.isArray(_cspExtra.connectSrc) ? _cspExtra.connectSrc : [],
+        frameSrcExtra: Array.isArray(_cspExtra.frameSrc) ? _cspExtra.frameSrc : [],
+    });
 
     // 배포 전 Secret 등록 시도 (프로젝트가 이미 존재하는 경우 성공)
     const pendingSecrets = await ensureWorkerSecrets(sourceRoot, projectName);

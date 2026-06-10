@@ -256,6 +256,7 @@ export const users = defineTable('users', {
 
 - `**dok deploy`** 시 `**--preflight**` 를 끄지 않으며, 필요 시 `**--preflight-strict**` 로 경고 존재 시 배포 실패하게 한다.
 - 선택적으로 `**security.strictCsp: true**` 를 검토했다(브라우저·CDN 호환성과 트레이드오프).
+- 외부 이미지·API·iframe 화이트리스트는 `**security.cspExtraHosts**` 로 **앱별 화이트리스트만** 열어준다(예: `imgSrc: ['https://api.dicebear.com']`). 베이스라인 CSP 는 그대로 유지된다 — 자세한 내용은 [`docs/SECURITY_OPTIONS.md`](docs/SECURITY_OPTIONS.md) 12번.
 - **프론트 XSS** 를 줄인다(`unsafe-inline` / `unsafe-eval` 이 허용된 CSP에서는 XSS 가 곧 브라우저 내 실행 맥락 침해로 이어질 수 있다).
 
 ### 사전 정찰이 가능함을 인지

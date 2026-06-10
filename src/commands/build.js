@@ -326,6 +326,47 @@ function normalizeWebAuthnConfig(rawSecurity) {
     };
 }
 
+// ── C-1: 워커측 로그인 설정 정규화 (dokkebi.config.js 의 auth.login) ──────────
+//   인가용 JWT 를 워커가 직접 발급하기 위한 설정. enabled+query 가 있어야 활성.
+//   { enabled, query, passwordColumn, hash, claims, issuer, audience, expiresInSec, bindTenant }
+function normalizeAuthLoginConfig(rawAuth) {
+    const raw = rawAuth && typeof rawAuth === 'object' && rawAuth.login && typeof rawAuth.login === 'object'
+        ? rawAuth.login
+        : {};
+    if (raw.enabled !== true) return { enabled: false };
+    if (typeof raw.query !== 'string' || !raw.query.trim()) {
+        console.warn('[dokkebi] ⚠ auth.login.enabled=true 이지만 query 가 없습니다 — 워커측 로그인이 비활성화됩니다.');
+        return { enabled: false };
+    }
+    const hash = ['pbkdf2', 'plain'].includes(raw.hash) ? raw.hash : 'pbkdf2';
+    if (hash === 'plain') {
+        console.warn('[dokkebi] ⚠ auth.login.hash="plain" 은 개발용입니다 — 운영에서는 pbkdf2 를 사용하세요.');
+    }
+    let claims = { user_id: 'id' };
+    if (raw.claims && typeof raw.claims === 'object' && !Array.isArray(raw.claims)) {
+        claims = {};
+        for (const k of Object.keys(raw.claims)) {
+            if (k.charCodeAt(0) === 95) continue; // 예약(`_`) 클레임 차단
+            if (typeof raw.claims[k] === 'string') claims[k] = raw.claims[k];
+        }
+        if (Object.keys(claims).length === 0) claims = { user_id: 'id' };
+    }
+    const expiresInSec = Number.isFinite(Number(raw.expiresInSec)) && Number(raw.expiresInSec) > 0
+        ? Math.floor(Number(raw.expiresInSec))
+        : 3600;
+    return {
+        enabled: true,
+        query: raw.query.trim(),
+        passwordColumn: typeof raw.passwordColumn === 'string' && raw.passwordColumn ? raw.passwordColumn : 'password_hash',
+        hash,
+        claims,
+        issuer: typeof raw.issuer === 'string' ? raw.issuer : undefined,
+        audience: typeof raw.audience === 'string' ? raw.audience : undefined,
+        expiresInSec,
+        bindTenant: raw.bindTenant !== false,
+    };
+}
+
 function normalizeReplayConfig(rawSecurity) {
     const raw = rawSecurity && typeof rawSecurity === 'object' && rawSecurity.replay && typeof rawSecurity.replay === 'object'
         ? rawSecurity.replay
@@ -1019,6 +1060,7 @@ export async function runBuild(src, options = {}) {
     }
 
     const authzMeta = normalizeAuthorizationConfig(effectiveConfig?.authorization);
+    const authLoginMeta = normalizeAuthLoginConfig(effectiveConfig?.auth);
     const replayMeta = normalizeReplayConfig(effectiveConfig?.security);
     const webauthnMeta = normalizeWebAuthnConfig(effectiveConfig?.security);
     const adlMeta = normalizeActiveDefenseConfig(effectiveConfig?.security);
@@ -1270,12 +1312,13 @@ export async function runBuild(src, options = {}) {
                     : (_rawSess && typeof _rawSess === 'object'
                         ? { enabled: _rawSess.enabled !== false, mode: _rawSess.mode === 'first-primary' ? 'first-primary' : 'first-unconstrained' }
                         : { enabled: false, mode: 'first-unconstrained' });
-            const nextSource = workerDb(dbType, allowlist, queryRegistry, policyMeta, authzMeta, replayMeta, buildMeta, adlMeta, capabilityMeta, sessionsMeta);
+            const nextSource = workerDb(dbType, allowlist, queryRegistry, policyMeta, authzMeta, replayMeta, buildMeta, adlMeta, capabilityMeta, sessionsMeta, authLoginMeta);
             await fs.writeFile(workerDbPath, nextSource, 'utf-8');
             const parts = ['allowlist'];
             if (queryRegistry) parts.push('query-registry');
             if (policyMeta?.enabled) parts.push('tenant-policy');
             if (authzMeta?.enabled) parts.push('authorization');
+            if (authLoginMeta?.enabled) parts.push('worker-login');
             if (capabilityMeta?.enabled) parts.push('capabilities');
             parts.push(`replay(window=${replayMeta.timestampWindowMs}ms, nonce=${replayMeta.nonceTtlMs}ms)`);
             if (adlMeta?.enabled) parts.push(`adl(${adlMeta.mode}, ${adlMeta.trigger}, ${Math.round(adlMeta.intervalMs/60000)}m)`);

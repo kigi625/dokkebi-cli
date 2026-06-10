@@ -129,6 +129,38 @@ Value specs:
 - **Optional claims**: `nbf`, `iss`, `aud`
 - **secret**: `DOKKEBI_JWT_SECRET` Pages env var (32+ random bytes recommended)
 
+> **⚠ Security (C-1): never sign JWTs in the browser.** `DOKKEBI_JWT_SECRET` is a symmetric HS256 key — it is a **Worker-only secret** and is no longer shipped to the client via handshake. Backend code running in the browser-WASM cannot read it (`__dokkebi_env__("JWT_SECRET")` returns empty). Issue tokens from a trusted server path only. Two options:
+>
+> 1. **Built-in worker-side login (recommended)** — configure `auth.login` in `dokkebi.config.js`; the proxy verifies credentials against the DB and mints the JWT itself. Call it from the client via `window.__DOKKEBI_LOGIN__({ identifier, password })`. See §4.1.
+> 2. **Your own Pages Function** (`functions/api/auth/login.ts`) that signs with `env.DOKKEBI_JWT_SECRET`, as shown below.
+
+### 4.1 Built-in worker-side login (`auth.login`)
+
+```js
+// dokkebi.config.js
+export default {
+  auth: {
+    login: {
+      enabled: true,
+      // parameterized: exactly one bind (?1) = the identifier
+      query: 'SELECT id, role, password_hash FROM users WHERE email = ?1',
+      passwordColumn: 'password_hash',
+      hash: 'pbkdf2',                 // 'pbkdf2' (default) | 'plain' (dev only)
+      claims: { user_id: 'id', role: 'role' },  // JWT claim ← DB column
+      issuer: 'my-app', audience: 'web', expiresInSec: 3600,
+      bindTenant: true,              // also writes claims into session tenant_json
+    },
+  },
+};
+```
+
+Stored password format for `hash: 'pbkdf2'`: `pbkdf2$<iterations>$<saltB64url>$<hashB64url>` (PBKDF2-SHA256). Password comparison is constant-time. Reserved (`_`-prefixed) claim names are dropped. `DOKKEBI_JWT_SECRET` must be set as a Pages secret (used worker-side only).
+
+```js
+const { ok, value } = await window.__DOKKEBI_LOGIN__({ identifier: email, password });
+if (ok) { /* value.token = signed JWT, value.claims = mapped claims */ }
+```
+
 ### Issuance example (you implement)
 
 ```ts

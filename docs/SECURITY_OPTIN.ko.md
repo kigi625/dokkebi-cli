@@ -23,6 +23,7 @@
 | `authorization` | role 무시 SQL, JWT 위조 | off |
 | `webauthn` | 세션 탈취 후 민감 행위 | off |
 | `strictCsp` | XSS 후속 공격 | off |
+| `cspExtraHosts` | 베이스라인 CSP 유지하며 외부 이미지·API·iframe 호스트 화이트리스트 | `{}` |
 
 ---
 
@@ -222,6 +223,28 @@ security: { strictCsp: true }
 ```
 
 > 일부 third-party 스크립트(외부 광고 SDK 등)는 도메인 추가가 필요할 수 있습니다.
+
+---
+
+## 12. `cspExtraHosts` — 앱별 CSP 화이트리스트 (외부 이미지·API·iframe)
+
+**용도**: 베이스라인 CSP 를 유지한 채, 정당한 외부 리소스(예: Dicebear 아바타 CDN, 결제 위젯)만 화이트리스트에 추가.
+
+```js
+security: {
+  cspExtraHosts: {
+    imgSrc:     ['https://api.dicebear.com'],
+    connectSrc: ['https://api.openai.com'],
+    frameSrc:   ['https://embed.partner.com'],
+  },
+}
+```
+
+- `imgSrc` → `img-src` (deploy / serve / dev 모두 반영)
+- `connectSrc` → `connect-src` (deploy)
+- `frameSrc` → `frame-src` (deploy)
+- `dok build` 는 `_headers` 를 만들지 않습니다 — CSP 변경은 **`dok deploy` 재실행** 필요.
+- 풀 origin (`https://...`) 또는 와일드카드 (`https://*.example.com`) 지원.
 
 ---
 

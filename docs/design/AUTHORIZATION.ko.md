@@ -129,6 +129,37 @@ POST /api/_dokkebi/db
 - **선택 클레임**: `nbf`, `iss`, `aud`
 - **secret**: `DOKKEBI_JWT_SECRET` Pages 환경변수 (최소 32 bytes 랜덤 권장)
 
+> **⚠ 보안(C-1): 브라우저에서 JWT 를 서명하지 마라.** `DOKKEBI_JWT_SECRET` 는 대칭(HS256) 키 — **워커 전용 시크릿**이며 더 이상 핸드셰이크로 클라이언트에 전달되지 않는다. 브라우저 WASM 백엔드는 이 값을 읽을 수 없다(`__dokkebi_env__("JWT_SECRET")` → 빈 문자열). 토큰은 신뢰된 서버 경로에서만 발급해야 한다. 두 가지 방법:
+>
+> 1. **내장 워커측 로그인(권장)** — `dokkebi.config.js` 의 `auth.login` 설정. 프록시가 DB 로 자격증명을 검증하고 JWT 를 직접 서명한다. 클라이언트는 `window.__DOKKEBI_LOGIN__({ identifier, password })` 로 호출. §4.1 참고.
+> 2. **직접 만든 Pages Function**(`functions/api/auth/login.ts`)에서 `env.DOKKEBI_JWT_SECRET` 로 서명 — 아래 예제.
+
+### 4.1 내장 워커측 로그인 (`auth.login`)
+
+```js
+// dokkebi.config.js
+export default {
+  auth: {
+    login: {
+      enabled: true,
+      query: 'SELECT id, role, password_hash FROM users WHERE email = ?1', // 바인딩 1개(?1)=식별자
+      passwordColumn: 'password_hash',
+      hash: 'pbkdf2',                 // 'pbkdf2'(기본) | 'plain'(개발용)
+      claims: { user_id: 'id', role: 'role' },  // JWT 클레임 ← DB 컬럼
+      issuer: 'my-app', audience: 'web', expiresInSec: 3600,
+      bindTenant: true,              // 클레임을 세션 tenant_json 에도 기록
+    },
+  },
+};
+```
+
+`hash: 'pbkdf2'` 저장 형식: `pbkdf2$<iterations>$<saltB64url>$<hashB64url>` (PBKDF2-SHA256). 비밀번호 비교는 상수시간. 예약(`_` 접두) 클레임명은 무시된다. `DOKKEBI_JWT_SECRET` 는 Pages 시크릿으로 설정(워커측에서만 사용).
+
+```js
+const { ok, value } = await window.__DOKKEBI_LOGIN__({ identifier: email, password });
+if (ok) { /* value.token = 서명된 JWT, value.claims = 매핑된 클레임 */ }
+```
+
 ### 발급 예제 (사용자가 직접 구현)
 
 ```ts

@@ -301,7 +301,11 @@ export async function runServe(src, options = {}) {
         const allowEmbed = page === 'embed' || page === 'noto';
 
         // ── 보안 헤더 ────────────────────────────────────────
-        setSecurityHeaders(res, 'serve', { allowEmbed });
+        const _cspExtraServe = dokConfig?.security?.cspExtraHosts || {};
+        setSecurityHeaders(res, 'serve', {
+            allowEmbed,
+            imgSrcExtra: Array.isArray(_cspExtraServe.imgSrc) ? _cspExtraServe.imgSrc : [],
+        });
 
         // ── CORS preflight ──────────────────────────────────
         res.setHeader('Access-Control-Allow-Origin', '*');
@@ -496,7 +500,9 @@ ${C.bold}[dokkebi] ━━━━━━━━━━━━━━━━━━━━�
 // ECDH 핸드셰이크 핸들러
 // ─────────────────────────────────────────────────────────────
 
-const CLIENT_HANDSHAKE_SECRET_KEYS = new Set(['__DOKKEBI_BC_KEY__', 'JWT_SECRET', 'DOKKEBI_JWT_SECRET']);
+// ── C-1 방어: 인가용 JWT 서명 시크릿은 클라이언트로 전달하지 않는다. ──
+//   (대칭키 노출 시 임의 토큰 위조 가능 → 인가/테넌트 격리 붕괴)
+const CLIENT_HANDSHAKE_SECRET_KEYS = new Set(['__DOKKEBI_BC_KEY__']);
 
 function pickClientHandshakeSecrets(envSecrets = {}) {
     const picked = {};
@@ -1207,9 +1213,11 @@ export function setSecurityHeaders(res, mode = 'serve', opts = {}) {
         ? `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://esm.sh https://cdn.jsdelivr.net ${CSP_SCRIPT_SRC_LEMON_SQUEEZY} blob:`
         : `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net ${CSP_SCRIPT_SRC_LEMON_SQUEEZY} blob:`;
 
+    const _imgExtraArr = Array.isArray(opts.imgSrcExtra) ? opts.imgSrcExtra : [];
+    const _imgExtra = _imgExtraArr.length ? ' ' + _imgExtraArr.join(' ') : '';
     const imgSrc = mode === 'dev'
-        ? `img-src 'self' data: blob: https://picsum.photos https://*.picsum.photos https://placehold.co`
-        : `img-src 'self' data: blob: https://picsum.photos https://*.picsum.photos`;
+        ? `img-src 'self' data: blob: https://picsum.photos https://*.picsum.photos https://placehold.co${_imgExtra}`
+        : `img-src 'self' data: blob: https://picsum.photos https://*.picsum.photos${_imgExtra}`;
 
     res.setHeader('Content-Security-Policy', [
         `default-src 'self'`,

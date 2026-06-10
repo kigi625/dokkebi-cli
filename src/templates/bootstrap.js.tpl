@@ -838,9 +838,10 @@ function _dokkebiScheduleVersionProbeForPath(path) {
   let _sessionId = null;  // 서버에서 발급받은 세션 ID
   /** 온라인 모드에서 Step 1b 가 백그라운드 핸드셰이크 Promise 로 교체됨 — /db 암호화 전 await */
   var _handshakeBgP = Promise.resolve();
-  const _envSecretMap = {};  // 클라이언트 허용 Secret만 보관 (기본: 번들 복호화 키)
-  // 로그인 JWT 서명용 — Worker 의 DOKKEBI_JWT_SECRET / JWT_SECRET 과 동일 값이 핸드셰이크로 전달됨
-  const _CLIENT_SECRET_KEYS = { __DOKKEBI_BC_KEY__: true, JWT_SECRET: true, DOKKEBI_JWT_SECRET: true };
+  const _envSecretMap = {};  // 클라이언트 허용 Secret만 보관 (번들 복호화 키 전용)
+  // ── C-1 방어: JWT 서명 시크릿은 더 이상 클라이언트로 전달/보관하지 않는다. ──
+  //   로그인은 ctx.login()/__DOKKEBI_LOGIN__ → 워커 _login 이 서버측에서 검증·서명한다.
+  const _CLIENT_SECRET_KEYS = { __DOKKEBI_BC_KEY__: true };
 
   function _storeClientSecrets(source) {
     if (!source) return 0;
@@ -1428,6 +1429,30 @@ function _dokkebiScheduleVersionProbeForPath(path) {
   }
   try { window.__DOKKEBI_SET_TENANT__ = _proxySetTenant; } catch {}
 
+  // ── C-1: 워커측 로그인 ──────────────────────────────────────
+  //   비밀번호 검증과 JWT 서명은 전적으로 워커에서 수행된다(클라이언트는 시크릿 미보유).
+  //     const { ok, value } = await window.__DOKKEBI_LOGIN__({ identifier, password })
+  //     value.token  → 이후 db 요청의 _jwt / Authorization 으로 사용
+  //   서버 설정: dokkebi.config.js 의 auth.login (enabled+query). 미설정 시 LOGIN_DISABLED.
+  async function _proxyLogin(identifier, password) {
+    return _dbRequest(async function() {
+      try {
+        const payload = { _login: { identifier: String(identifier == null ? '' : identifier), password: String(password == null ? '' : password) } };
+        const body = await _encryptPayload(payload);
+        const resp = await _fetch('/api/_dokkebi/db', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body,
+        });
+        const json = await resp.json();
+        return json._enc ? await _decryptResponse(json) : json;
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
+    });
+  }
+  try { window.__DOKKEBI_LOGIN__ = _proxyLogin; } catch {}
+
   // Bundle Attestation — 서버가 발급한 청크 인덱스를 메모리 내 암호화 번들 바이트로
   // 슬라이싱해 SHA-256 응답을 만든다. 번들이 변조됐다면 응답 해시가 어긋난다.
   async function _proxyAttestRun() {
@@ -1771,7 +1796,9 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           const jsonR = await respR.json();
           _learnFromResponse(respR, jsonR, Date.now());
           var resultCanon = jsonR._enc ? await _decryptResponse(jsonR) : jsonR;
-          if (resultCanon && resultCanon.ok !== false) {
+          // HTTP 200 일 때만 성공 처리. 403/500 은 ok 필드가 없어 ok!==false 가 true 가 되며
+          // 실패 응답을 성공처럼 캐시·반환해 (d) 재핸드셰이크 분기를 막던 버그 수정.
+          if (respR.status >= 200 && respR.status < 300 && resultCanon && resultCanon.ok !== false) {
             if (_qHash) _cacheQueryResult(_qHash, resultCanon);
             return resultCanon;
           }

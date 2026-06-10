@@ -159,7 +159,7 @@ HTTP 403 + `tenant_policy_violation` event recorded in `_dokkebi_security`.
 - **CTE (WITH)** — verify only works on the final operation; full recursive checks on inner SELECTs are not supported.
 - **INSERT single VALUES tuple** only for inject. Multiple tuples: verify only.
 - **Dynamic table names** (variable substitution) cause parse failure → rejected when `strict=true`.
-- **Admin bypass**: only when `tenantContext._isAdmin === true`. Set via `ctx.setSessionTenant({user_id:'u1', _isAdmin: true})`.
+- **Admin bypass**: only when `tenantContext._isAdmin === true`. **⚠ Security (C-2 fix):** clients can no longer set `_isAdmin` (or any `_`-prefixed key) via `ctx.setSessionTenant()` — the proxy rejects reserved keys (`TENANT_RESERVED_KEY`). Admin elevation must come from a server-trusted path (worker-side `_login` role claims + Authorization Policy), never from client-supplied tenant values.
 
 ---
 

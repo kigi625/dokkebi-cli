@@ -404,9 +404,50 @@ security: { strictCsp: true }
 
 ---
 
+## 12. `cspExtraHosts` — Per-app CSP allowlist (external images / APIs / iframes)
+
+### Attacks blocked
+- Complement to #11 strictCsp. When CSP is so strict that legitimate external resources (avatar CDN, payment widget, …) get blocked, this is the per-app escape hatch — **without weakening the baseline CSP**.
+
+### What it does
+Appends extra hosts to the CSP that `dok deploy` writes into `dist/_headers` and that `dok dev` / `dok serve` set on every response. The baseline directives are kept; only the listed directives are extended.
+
+| Key | CSP directive | Applied by |
+|---|---|---|
+| `imgSrc` | `img-src` | deploy / serve / dev |
+| `connectSrc` | `connect-src` | deploy |
+| `frameSrc` | `frame-src` | deploy |
+
+### How to apply
+```js
+// dokkebi.config.js
+security: {
+  level: 'standard',
+  cspExtraHosts: {
+    imgSrc:     ['https://api.dicebear.com'],
+    connectSrc: ['https://api.openai.com'],
+    frameSrc:   ['https://embed.partner.com'],
+  },
+},
+```
+
+→ After `dok deploy`, `dist/_headers` CSP becomes:
+
+```
+img-src 'self' data: blob: https://api.dicebear.com; ...
+```
+
+### Operations notes
+- `dok build` does **not** write `_headers`. CSP changes require **re-running `dok deploy`**.
+- Use full origins (`https://...`); wildcards (`https://*.example.com`) are supported.
+- `connect-src` defaults already allow `https:`, so most external APIs work without extras — only add when blocked.
+- Safety net: a `scripts/patch-headers.mjs` postbuild step keeps `_headers` patched even on older CLI caches.
+
+---
+
 ## Option ↔ attack mapping — one table
 
-| Attack scenario | 1 capabilities | 2 prev | 3 attest | 4 panelIp | 5 replay | 6 ADL | 8 tenant | 9 authz | 10 webauthn | 11 CSP |
+| Attack scenario | 1 capabilities | 2 prev | 3 attest | 4 panelIp | 5 replay | 6 ADL | 8 tenant | 9 authz | 10 webauthn | 11 CSP | 12 cspHosts |
 |---|---|---|---|---|---|---|---|---|---|---|
 | A1 Permission branch bypass | ✅ | | | | | | | (supplement) | | |
 | A2 Direct costly route call | ✅ | | | | | | | | | |

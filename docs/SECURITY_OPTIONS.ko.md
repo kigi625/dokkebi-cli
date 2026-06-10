@@ -404,9 +404,50 @@ security: { strictCsp: true }
 
 ---
 
+## 12. `cspExtraHosts` — CSP 화이트리스트 확장 (외부 이미지·API·iframe)
+
+### 막는 공격
+- 11번 strictCsp 의 보완. CSP 가 너무 엄격해서 정당한 외부 리소스(아바타 CDN, 결제 위젯 등)가 차단될 때 **앱별로 화이트리스트만 열어주는** 출구.
+
+### 무엇을 하는가
+`dok deploy` 가 만드는 `dist/_headers` 의 CSP 와 `dok dev` / `dok serve` 가 응답에 붙이는 CSP 의 다음 지시문 끝에 **추가 호스트를 이어붙입니다** (기본 CSP 를 덮어쓰지 않음).
+
+| 키 | CSP 지시문 | 적용 시점 |
+|---|---|---|
+| `imgSrc` | `img-src` | deploy / serve / dev |
+| `connectSrc` | `connect-src` | deploy |
+| `frameSrc` | `frame-src` | deploy |
+
+### 적용 방법
+```js
+// dokkebi.config.js
+security: {
+  level: 'standard',
+  cspExtraHosts: {
+    imgSrc:    ['https://api.dicebear.com'],
+    connectSrc:['https://api.openai.com'],
+    frameSrc:  ['https://embed.partner.com'],
+  },
+},
+```
+
+→ `dok deploy` 후 `dist/_headers` 의 CSP:
+
+```
+img-src 'self' data: blob: https://api.dicebear.com; ...
+```
+
+### 운영 메모
+- `dok build` 는 `_headers` 를 만들지 않습니다. CSP 변경은 **`dok deploy` 재실행**이 필요합니다.
+- 도메인은 반드시 풀 origin (`https://...`) 으로 적습니다. 와일드카드 (`https://*.example.com`) 도 허용됩니다.
+- `connect-src` 는 기본값이 이미 `https:` 로 열려 있어 대부분의 외부 API 는 추가 없이 동작합니다 — 막힐 때만 보강하세요.
+- 안전망: 후처리 스크립트(`scripts/patch-headers.mjs`) 를 두면 구버전 CLI 캐시 상황에서도 `_headers` 가 올바르게 패치됩니다.
+
+---
+
 ## 옵션과 공격의 매핑 — 한 표로 보기
 
-| 공격 시나리오 | 1 capabilities | 2 prev | 3 attest | 4 panelIp | 5 replay | 6 ADL | 8 tenant | 9 authz | 10 webauthn | 11 CSP |
+| 공격 시나리오 | 1 capabilities | 2 prev | 3 attest | 4 panelIp | 5 replay | 6 ADL | 8 tenant | 9 authz | 10 webauthn | 11 CSP | 12 cspHosts |
 |---|---|---|---|---|---|---|---|---|---|---|
 | A1 권한 분기 점프 | ✅ | | | | | | | (보완) | | |
 | A2 비용 라우트 직접 호출 | ✅ | | | | | | | | | |

@@ -23,6 +23,7 @@ Short summary of options users toggle in `dokkebi.config.js`. For behavior and l
 | `authorization` | SQL ignoring role, JWT forgery | off |
 | `webauthn` | Sensitive actions after session theft | off |
 | `strictCsp` | Post-XSS follow-up attacks | off |
+| `cspExtraHosts` | Allowlist external image/API/iframe hosts while keeping baseline CSP | `{}` |
 
 ---
 
@@ -222,6 +223,28 @@ security: { strictCsp: true }
 ```
 
 > Some third-party scripts (ad SDKs, etc.) may need extra domains.
+
+---
+
+## 12. `cspExtraHosts` — Per-app CSP allowlist (external images / APIs / iframes)
+
+**Purpose**: Keep the baseline CSP strict, but allowlist legitimate external resources (e.g. Dicebear avatar CDN, payment widget) per app.
+
+```js
+security: {
+  cspExtraHosts: {
+    imgSrc:     ['https://api.dicebear.com'],
+    connectSrc: ['https://api.openai.com'],
+    frameSrc:   ['https://embed.partner.com'],
+  },
+}
+```
+
+- `imgSrc` → `img-src` (applied by deploy / serve / dev)
+- `connectSrc` → `connect-src` (applied by deploy)
+- `frameSrc` → `frame-src` (applied by deploy)
+- `dok build` does **not** write `_headers` — CSP changes require **re-running `dok deploy`**.
+- Use full origins (`https://...`); wildcards (`https://*.example.com`) are supported.
 
 ---
 

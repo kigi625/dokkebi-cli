@@ -805,6 +805,12 @@ const _policyMeta: any = __DOKKEBI_PH_POLICY__;
 //   문서: docs/design/AUTHORIZATION.md
 const _authzMeta: any = __DOKKEBI_PH_AUTHZ__;
 
+// ── 워커측 로그인 메타 (C-1, 빌드 타임 임베드) ───────────────────────────
+//   dokkebi.config.js 의 auth.login → normalizeAuthLoginConfig().
+//   { enabled, query, passwordColumn, hash, claims, issuer?, audience?, expiresInSec?, bindTenant? }
+//   비활성(null)이면 _login 명령은 LOGIN_DISABLED 로 거부된다.
+const _authLoginMeta: any = __DOKKEBI_PH_AUTH_LOGIN__;
+
 // JWT HMAC 키 캐시 (아이솔레이트 단위). 비밀값 변경 시 워커 재시작 필요.
 let _authzJwtKey: CryptoKey | null = null;
 let _authzJwtKeyPromise: Promise<CryptoKey> | null = null;
@@ -873,6 +879,75 @@ async function _az_verifyJwtHs256(token: string, env: Env): Promise<{ valid: boo
     }
   }
   return { valid: true, payload };
+}
+
+// ── C-1: 워커측 로그인 — DB 검증 + 워커 전용 시크릿 JWT 서명 ──────────────
+//   클라이언트는 시크릿을 보유하지 않으며, 토큰 발급은 전적으로 워커에서만 일어난다.
+//   비밀번호 저장 형식(hash='pbkdf2'): `pbkdf2$<iterations>$<saltB64url>$<hashB64url>`
+let _authLoginSignKey: CryptoKey | null = null;
+let _authLoginSignKeyPromise: Promise<CryptoKey> | null = null;
+function _login_jwtSecret(env: Env): string {
+  return (typeof (env as any).DOKKEBI_JWT_SECRET === 'string' && (env as any).DOKKEBI_JWT_SECRET) ||
+         (typeof (env as any).JWT_SECRET === 'string' && (env as any).JWT_SECRET) || '';
+}
+async function _login_getSignKey(env: Env): Promise<CryptoKey | null> {
+  const secret = _login_jwtSecret(env);
+  if (!secret) return null;
+  if (_authLoginSignKey) return _authLoginSignKey;
+  if (_authLoginSignKeyPromise) return _authLoginSignKeyPromise;
+  _authLoginSignKeyPromise = crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  ).then((k) => { _authLoginSignKey = k; return k; });
+  return _authLoginSignKeyPromise;
+}
+async function _login_signJwt(env: Env, claims: Record<string, unknown>): Promise<string | null> {
+  const key = await _login_getSignKey(env);
+  if (!key) return null;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const ttl = Number(_authLoginMeta?.expiresInSec) > 0 ? Number(_authLoginMeta.expiresInSec) : 3600;
+  const payload: Record<string, unknown> = { ...claims, iat: nowSec, exp: nowSec + ttl };
+  if (_authLoginMeta?.issuer) payload.iss = _authLoginMeta.issuer;
+  if (_authLoginMeta?.audience) payload.aud = _authLoginMeta.audience;
+  const h64 = _cap_b64url(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
+  const p64 = _cap_b64url(new TextEncoder().encode(JSON.stringify(payload)));
+  const data = new TextEncoder().encode(h64 + '.' + p64);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
+  return h64 + '.' + p64 + '.' + _cap_b64url(sig);
+}
+function _login_b64urlToBytes(s: string): Uint8Array {
+  const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
+  const b64 = (s + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function _login_timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  // 길이가 달라도 끝까지 돌려 타이밍 누출을 줄인다.
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ (b[i] ?? 0);
+  return diff === 0;
+}
+async function _login_verifyPassword(provided: string, stored: string): Promise<boolean> {
+  const scheme = String(_authLoginMeta?.hash || 'pbkdf2').toLowerCase();
+  if (scheme === 'plain') {
+    return _login_timingSafeEqual(new TextEncoder().encode(provided), new TextEncoder().encode(String(stored || '')));
+  }
+  const parts = String(stored || '').split('$');
+  if (parts.length !== 4 || parts[0] !== 'pbkdf2') return false;
+  const iter = Number(parts[1]);
+  if (!Number.isFinite(iter) || iter < 1 || iter > 5_000_000) return false;
+  let salt: Uint8Array, expected: Uint8Array;
+  try { salt = _login_b64urlToBytes(parts[2]); expected = _login_b64urlToBytes(parts[3]); }
+  catch { return false; }
+  if (expected.length === 0) return false;
+  const baseKey = await crypto.subtle.importKey('raw', new TextEncoder().encode(provided), { name: 'PBKDF2' }, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' },
+    baseKey, expected.length * 8,
+  );
+  return _login_timingSafeEqual(new Uint8Array(bits), expected);
 }
 
 function _az_matchRule(op: string, table: string): { spec: any; key: string } | null {
@@ -1975,6 +2050,78 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     let params: unknown[] = Array.isArray(payload.params) ? payload.params : [];
     const _debugSql = payload._debugSql as string | undefined;
     let sql: string | undefined = payload.sql as string | undefined;
+
+    // ── 5-login. 워커측 로그인 (C-1: 클라이언트 JWT 위조 차단) ───────────────
+    //   payload._login: { identifier, password }
+    //   워커가 auth.login.query 로 사용자 조회 → 비밀번호 검증(상수시간) →
+    //   워커 전용 시크릿으로 JWT 서명 → (옵션) 세션 tenant_json 바인딩 → 토큰 반환.
+    const _loginReq: any = payload._login;
+    if (_loginReq !== undefined) {
+      const _cerrL = _enforceMutationCounter();
+      if (_cerrL) return _cerrL;
+      const _loginErr = (code: string, msg: string, status = 401): Response =>
+        new Response(JSON.stringify({ ok: false, code, error: msg }), { status, headers });
+      if (!_authLoginMeta || _authLoginMeta.enabled !== true || !_authLoginMeta.query) {
+        return _loginErr('LOGIN_DISABLED', '워커측 로그인이 설정되지 않았습니다 (dokkebi.config.js auth.login).', 400);
+      }
+      if (!_login_jwtSecret(env)) {
+        return _loginErr('LOGIN_NO_SECRET', 'DOKKEBI_JWT_SECRET 미설정 — 토큰을 서명할 수 없습니다.', 500);
+      }
+      if (!_loginReq || typeof _loginReq !== 'object') return _loginErr('LOGIN_BAD_INPUT', '로그인 입력이 올바르지 않습니다.', 400);
+      const identifier = _loginReq.identifier;
+      const password = _loginReq.password;
+      if (typeof identifier !== 'string' || typeof password !== 'string' || !identifier || !password) {
+        return _loginErr('LOGIN_BAD_INPUT', 'identifier/password 가 필요합니다.', 400);
+      }
+      if (identifier.length > 256 || password.length > 1024) {
+        return _loginErr('LOGIN_BAD_INPUT', '입력이 너무 깁니다.', 400);
+      }
+      let row: Record<string, unknown> | null = null;
+      try {
+        row = (await _userDbForSql(env).prepare(String(_authLoginMeta.query)).bind(identifier).first()) as any;
+      } catch {
+        ctx.waitUntil(logSecurity(_internalDb(env), 'login_error', clientIp, '/api/_dokkebi/db', 'login query failed'));
+        return _loginErr('LOGIN_ERROR', '로그인 처리 중 오류가 발생했습니다.', 500);
+      }
+      const pwCol = String(_authLoginMeta.passwordColumn || 'password_hash');
+      const stored = row ? row[pwCol] : null;
+      // 사용자 부재 시에도 더미 검증을 수행해 타이밍 기반 유저 열거를 줄인다.
+      const pwOk = await _login_verifyPassword(password, typeof stored === 'string' ? stored : 'pbkdf2$100000$AAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+      if (!row || typeof stored !== 'string' || !pwOk) {
+        ctx.waitUntil(logSecurity(_internalDb(env), 'login_fail', clientIp, '/api/_dokkebi/db', 'invalid credentials'));
+        return _loginErr('LOGIN_INVALID', '아이디 또는 비밀번호가 올바르지 않습니다.', 401);
+      }
+      // 클레임 매핑 { claimName: dbColumn } — 예약(`_`) 클레임은 차단(C-2 와 동일 원칙).
+      const claims: Record<string, unknown> = {};
+      const claimMap = (_authLoginMeta.claims && typeof _authLoginMeta.claims === 'object') ? _authLoginMeta.claims : { user_id: 'id' };
+      for (const cName of Object.keys(claimMap)) {
+        if (cName.charCodeAt(0) === 95) continue;
+        const col = String(claimMap[cName]);
+        if (col in (row as object)) claims[cName] = (row as any)[col];
+      }
+      const token = await _login_signJwt(env, claims);
+      if (!token) return _loginErr('LOGIN_NO_SECRET', '토큰 서명 실패.', 500);
+      // 세션 tenant_json 에 클레임 바인딩 (Tenant Policy 연동). 예약키는 위에서 차단됨.
+      if (_authLoginMeta.bindTenant !== false) {
+        const tenantStr = JSON.stringify(claims);
+        try {
+          await _internalDb(env).prepare(`UPDATE _dokkebi_sessions SET tenant_json = ? WHERE session_id = ?`).bind(tenantStr, sid).run();
+        } catch (e: any) {
+          if (String(e?.message || '').includes('tenant_json')) {
+            await _ensureSessionsMigration(_internalDb(env));
+            await _internalDb(env).prepare(`UPDATE _dokkebi_sessions SET tenant_json = ? WHERE session_id = ?`).bind(tenantStr, sid).run();
+          }
+        }
+        cached.tenantJson = tenantStr;
+      }
+      ctx.waitUntil(logSecurity(_internalDb(env), 'login_ok', clientIp, '/api/_dokkebi/db', 'op=LOGIN'));
+      ctx.waitUntil(logRequest(_internalDb(env), 'POST', '/api/_dokkebi/db', 200, Date.now() - reqStart, clientIp));
+      const okPayloadL = JSON.stringify({ ok: true, value: { token, claims } });
+      const resIvL = crypto.getRandomValues(new Uint8Array(12));
+      const resEncL = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: resIvL }, cached.encKey, new TextEncoder().encode(okPayloadL));
+      return new Response(JSON.stringify({ _enc: true, enc: encBytesToB64(resEncL), iv: encBytesToB64(resIvL) }), { headers });
+    }
+
     const setTenant: any = payload._setTenant;
 
     // ── 5-pre. _setTenant 특수 명령 (Stage 1/2 세션 테넌트 설정) ───
@@ -1985,6 +2132,26 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     if (setTenant !== undefined) {
       const _cerr0 = _enforceMutationCounter();
       if (_cerr0) return _cerr0;
+      // ── C-2 방어: 클라이언트가 보낸 테넌트 객체에 예약 키(`_` 접두) 주입 차단 ──
+      //   특히 `_isAdmin` 은 verifyTenantPolicy/injectTenantPolicy 에서 정책 전체를
+      //   우회시키므로, 신뢰 불가한 클라이언트(브라우저 WASM 백엔드) 발신 경로로는
+      //   절대 설정될 수 없어야 한다. 관리자 승격은 워커측 _login(역할 클레임) 으로만.
+      if (setTenant !== null) {
+        if (typeof setTenant !== 'object' || Array.isArray(setTenant)) {
+          logSecurity(_internalDb(env), 'tenant_reject', clientIp, '/api/_dokkebi/db', 'setTenant must be a plain object');
+          return new Response(JSON.stringify({
+            ok: false, code: 'TENANT_INVALID', error: '테넌트 값은 객체여야 합니다.',
+          }), { status: 400, headers });
+        }
+        for (const _tk of Object.keys(setTenant)) {
+          if (_tk.charCodeAt(0) === 95 /* '_' */) {
+            logSecurity(_internalDb(env), 'tenant_reject', clientIp, '/api/_dokkebi/db', 'reserved tenant key: ' + _tk);
+            return new Response(JSON.stringify({
+              ok: false, code: 'TENANT_RESERVED_KEY', error: "테넌트 키에 예약 접두사('_')는 사용할 수 없습니다: " + _tk,
+            }), { status: 400, headers });
+          }
+        }
+      }
       const tenantStr = setTenant === null ? null : JSON.stringify(setTenant);
       try {
         await _internalDb(env).prepare(`UPDATE _dokkebi_sessions SET tenant_json = ? WHERE session_id = ?`).bind(tenantStr, sid).run();
