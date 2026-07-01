@@ -472,6 +472,79 @@ router.post('/api/auth/login', async (req) => {
 Manage JWT signing secret via `JWT_SECRET` env var. Change name via
 `authorization.jwtSecretEnv` in `dokkebi.config.js`.
 
+### 4.5 Worker-only APIs vs WASM routes (auth/billing/payment)
+
+Dokkebi projects have two API planes. Never let auth or payment paths drift between them accidentally.
+
+| Plane | Location | Runtime | Use for |
+|---|---|---|---|
+| WASM router | `backend/controllers/**` (`router.METHOD`) | Browser QuickJS WASM | App business logic and Dokkebi DB DSL calls |
+| Worker API | `worker/api/**` | Cloudflare Pages Functions / `dok serve` | JWT issuance/refresh, payment checkout, webhooks, uploads, external APIs, secrets |
+
+Recurring failure pattern:
+
+1. Frontend calls a relative URL like `/api/auth/me` or `/api/billing/checkout`.
+2. The Dokkebi browser runtime or app API helper routes that call through the WASM router instead of the Worker API.
+3. Auth status, subscription status, checkout, and refresh are now split across different runtimes or token verifiers.
+4. Users see symptoms like refresh logging them out, subscription stuck on loading, `JWT setting is missing`, `BILLING_TOKEN_INVALID`, or checkout saying login is required while the UI still appears logged in.
+
+Rules for auth/billing/payment routes:
+
+1. Treat `/api/auth/**`, `/api/billing/**`, webhooks, uploads, AI provider calls, and other secret-backed integrations as **Worker-only** unless there is a deliberate reason to run them in WASM.
+2. Do not define the same path in both `backend/controllers/**` and `worker/api/**`. If both exist during a migration, make the overlap temporary and keep JWT claims, auth mode, and secret resolution identical.
+3. Frontend Worker-only calls must bypass Dokkebi/WASM routing by using an absolute same-origin URL or a dedicated helper. Do not send payment or login requests through a generic `dokkebi.request()` helper.
+
+Example frontend helper:
+
+```typescript
+const WORKER_ONLY_PREFIXES = [
+  '/api/auth/',
+  '/api/billing/',
+  '/api/media/',
+  '/api/ai/',
+];
+
+export function resolveWorkerApiUrl(path: string): string {
+  const p = path.startsWith('/') ? path : `/${path}`;
+  const isWorkerOnly = WORKER_ONLY_PREFIXES.some((prefix) => p.startsWith(prefix));
+
+  if (!isWorkerOnly) return p;
+
+  if (isLocalDevHost()) {
+    return `http://localhost:8790${p}`;
+  }
+
+  if (typeof window !== 'undefined') {
+    return new URL(p, window.location.origin).toString();
+  }
+
+  return p;
+}
+```
+
+JWT rules:
+
+- Issue and verify payment/auth JWTs in Worker APIs with one shared helper, not ad hoc logic in each route.
+- Include stable claims expected by both frontend state and server middleware: `iss`, `aud`, `auth_v`, `sub`, `userId`, `user_id`, `role`, and `exp`.
+- `/api/auth/me` may return a refreshed Worker-issued token. The frontend must store that refreshed token during session restore and before high-risk Worker-only actions such as checkout, cancellation, or plan changes.
+- Checkout, cancel, status, and `/api/auth/me` must use the same token verification path and accepted secret set.
+
+Environment variable rules:
+
+- Avoid using the same binding name in both `.env` secrets and `wrangler.toml [vars]`; Cloudflare can reject duplicate binding names or shadow the expected runtime value.
+- Prefer namespaced runtime flags such as `DOKKEBI_REQUIRE_AUTH` instead of generic names like `REQUIRE_AUTH`.
+- If local dev supports encrypted or bundled env blobs such as `DOKKEBI_ENV_SECRETS`, runtime config readers must check both direct env bindings and the bundled secret source consistently.
+
+Debug checklist for login or subscription failures:
+
+1. Confirm the browser is loading the latest built asset, not a stale bundle.
+2. Check `/api/auth/config`; if auth should be enabled, it should report `requireAuth: true` and an explicit source.
+3. Log in, then call `/api/auth/me`, `/api/billing/status`, and `/api/billing/checkout` with the exact same bearer token.
+4. Verify `/api/auth/me` refreshes the token when needed and that the frontend stores the refreshed token before checkout.
+5. In the browser console or network panel, verify auth/billing requests use absolute Worker URLs and are not passing through WASM routing.
+6. Search for duplicate route definitions for `/api/auth/**` and `/api/billing/**` in both `backend/controllers/**` and `worker/api/**`.
+7. Confirm Worker routes share the same JWT secret collection and expected claims.
+
 ---
 
 ## 5. Commands (CLI)

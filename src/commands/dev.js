@@ -968,6 +968,8 @@ export async function runDev(src, options = {}) {
         setSecurityHeaders(res, 'dev', {
             allowEmbed,
             imgSrcExtra: Array.isArray(_cspExtraDev.imgSrc) ? _cspExtraDev.imgSrc : [],
+            frameSrcExtra: Array.isArray(_cspExtraDev.frameSrc) ? _cspExtraDev.frameSrc : [],
+            connectSrcExtra: Array.isArray(_cspExtraDev.connectSrc) ? _cspExtraDev.connectSrc : [],
         });
 
         res.setHeader('Access-Control-Allow-Origin', '*');

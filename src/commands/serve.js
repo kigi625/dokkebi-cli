@@ -305,6 +305,8 @@ export async function runServe(src, options = {}) {
         setSecurityHeaders(res, 'serve', {
             allowEmbed,
             imgSrcExtra: Array.isArray(_cspExtraServe.imgSrc) ? _cspExtraServe.imgSrc : [],
+            frameSrcExtra: Array.isArray(_cspExtraServe.frameSrc) ? _cspExtraServe.frameSrc : [],
+            connectSrcExtra: Array.isArray(_cspExtraServe.connectSrc) ? _cspExtraServe.connectSrc : [],
         });
 
         // ── CORS preflight ──────────────────────────────────
@@ -1202,22 +1204,26 @@ export function setSecurityHeaders(res, mode = 'serve', opts = {}) {
     // 'unsafe-inline': dokkebi 부트스트랩이 <script type="module"> 인라인으로 주입됨
     // 'wasm-unsafe-eval': QuickJS WASM VM 컴파일에 필요
     // 'unsafe-eval': iPadOS/Safari 계열은 WebAssembly 컴파일에 아직 이 토큰도 필요
-    const connectSrc = mode === 'dev'
-        ? `connect-src 'self' blob: ws: wss: http://localhost:* https:`
-        : `connect-src 'self' blob: https:`;
-
-    const frameSrc = frameSrcDirective(mode);
-
-    // dev 모드에서는 esbuild-wasm 번들러(esm.sh), sql.js/@webcontainer(jsdelivr) 외부 스크립트 허용
     const scriptSrc = mode === 'dev'
         ? `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://esm.sh https://cdn.jsdelivr.net ${CSP_SCRIPT_SRC_LEMON_SQUEEZY} blob:`
         : `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net ${CSP_SCRIPT_SRC_LEMON_SQUEEZY} blob:`;
 
     const _imgExtraArr = Array.isArray(opts.imgSrcExtra) ? opts.imgSrcExtra : [];
     const _imgExtra = _imgExtraArr.length ? ' ' + _imgExtraArr.join(' ') : '';
+    const _frameExtraArr = Array.isArray(opts.frameSrcExtra) ? opts.frameSrcExtra : [];
+    const _frameExtra = _frameExtraArr.length ? ' ' + _frameExtraArr.join(' ') : '';
+    const _connectExtraArr = Array.isArray(opts.connectSrcExtra) ? opts.connectSrcExtra : [];
+    const _connectExtra = _connectExtraArr.length ? ' ' + _connectExtraArr.join(' ') : '';
     const imgSrc = mode === 'dev'
         ? `img-src 'self' data: blob: https://picsum.photos https://*.picsum.photos https://placehold.co${_imgExtra}`
         : `img-src 'self' data: blob: https://picsum.photos https://*.picsum.photos${_imgExtra}`;
+
+    const connectSrcBase = mode === 'dev'
+        ? `connect-src 'self' blob: ws: wss: http://localhost:* https:`
+        : `connect-src 'self' blob: https:`;
+    const connectSrc = _connectExtra ? `${connectSrcBase}${_connectExtra}` : connectSrcBase;
+
+    const frameSrc = frameSrcDirective(mode) + _frameExtra;
 
     res.setHeader('Content-Security-Policy', [
         `default-src 'self'`,

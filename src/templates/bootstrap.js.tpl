@@ -295,6 +295,22 @@ function _dokkebiScheduleVersionProbeForPath(path) {
     return ei >= mi;
   }
   const _PAYLOAD_WIRE = "__DOKKEBI_PH_PAYLOAD_WIRE__";
+  const _DOKKEBI_VERBOSE_CONSOLE = (() => {
+    try {
+      return globalThis.__DOKKEBI_VERBOSE__ === true
+        || localStorage.getItem('dokkebi:verbose') === '1';
+    } catch (_) {
+      return false;
+    }
+  })();
+  function _dokkebiTrace() {
+    if (!_DOKKEBI_VERBOSE_CONSOLE) return;
+    try { console.log.apply(console, arguments); } catch (_) {}
+  }
+  function _dokkebiDebug() {
+    if (!_DOKKEBI_VERBOSE_CONSOLE) return;
+    try { console.debug.apply(console, arguments); } catch (_) {}
+  }
 
   // ── 개발자 콘솔 배너 ─────────────────────────────────────
   console.log(
@@ -419,7 +435,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
   async function _restoreSessionFromOPFS() {
     var raw = await _opfsReadText('ecdh-session.json');
     if (!raw) {
-      console.debug('[dokkebi] OPFS 세션 복원 생략: ecdh-session.json 없음');
+      _dokkebiDebug('[dokkebi] OPFS 세션 복원 생략: ecdh-session.json 없음');
       return false;
     }
     try {
@@ -435,12 +451,12 @@ function _dokkebiScheduleVersionProbeForPath(path) {
         d = stored;
       }
       if (Date.now() - d.ts > _SESSION_TTL) {
-        console.debug('[dokkebi] OPFS 세션 복원 실패: TTL 초과(8h), ecdh-session.json 삭제 후 재핸드셰이크');
+        _dokkebiDebug('[dokkebi] OPFS 세션 복원 실패: TTL 초과(8h), ecdh-session.json 삭제 후 재핸드셰이크');
         await _opfsDelete('ecdh-session.json');
         return false;
       }
       if (d.bh !== '__DOKKEBI_PH_BUNDLE_HASH__') {
-        console.debug('[dokkebi] OPFS 세션 복원 실패: bundle 해시 불일치', d.bh || '(없음)', 'vs', '__DOKKEBI_PH_BUNDLE_HASH__');
+        _dokkebiDebug('[dokkebi] OPFS 세션 복원 실패: bundle 해시 불일치', d.bh || '(없음)', 'vs', '__DOKKEBI_PH_BUNDLE_HASH__');
         await _opfsDelete('ecdh-session.json');
         return false;
       }
@@ -468,7 +484,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
       }
       return true;
     } catch (e) {
-      console.debug('[dokkebi] OPFS 세션 복원 실패: 복호화/파싱 예외', e && e.message ? e.message : e);
+      _dokkebiDebug('[dokkebi] OPFS 세션 복원 실패: 복호화/파싱 예외', e && e.message ? e.message : e);
       await _opfsDelete('ecdh-session.json');
       return false;
     }
@@ -791,9 +807,9 @@ function _dokkebiScheduleVersionProbeForPath(path) {
         console.warn('[dokkebi:localDb] 마이그레이션 실행 중 일부 오류:', e.message);
       }
       await _persistLocalDb();
-      console.log('[dokkebi] 📦 로컬 DB 마이그레이션 완료');
+      _dokkebiTrace('[dokkebi] 📦 로컬 DB 마이그레이션 완료');
     } else {
-      console.log('[dokkebi] 📦 로컬 DB 복원 완료 (OPFS/IndexedDB)');
+      _dokkebiTrace('[dokkebi] 📦 로컬 DB 복원 완료 (OPFS/IndexedDB)');
     }
 
     window.addEventListener('beforeunload', function() {
@@ -985,7 +1001,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           }
         }
         try { new Uint8Array(_secPlain).fill(0); } catch {}
-        console.log('[dokkebi] 🔐 클라이언트 허용 Secret ' + _storedSecretCount + '개 → Opaque Handle 보호 적용');
+        _dokkebiTrace('[dokkebi] 🔐 클라이언트 허용 Secret ' + _storedSecretCount + '개 → Opaque Handle 보호 적용');
       } catch (e) {
         var _secFail = (e && (e.message || e.name)) ? (e.message || e.name) : String(e);
         console.warn('[dokkebi] ⚠ 클라이언트 Secret 복호화 실패:', _secFail);
@@ -1013,7 +1029,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
     await _saveSessionToOPFS(_sharedB64, _sessionId, _secSnapshot);
     _secSnapshot = null;
     try { _resetReqCounter(); } catch {}
-    console.log('[dokkebi] 🔐 ECDH 핸드셰이크 완료 (Forward Secrecy 활성)');
+    _dokkebiTrace('[dokkebi] 🔐 ECDH 핸드셰이크 완료 (Forward Secrecy 활성)');
   }
 
   async function _performHandshake() {
@@ -1039,7 +1055,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
     } catch (e) {
       _lastErr = e;
       if (!e || e.code !== 'prop_pending') throw e;
-      console.debug('[dokkebi] ⏳ 배포 업데이트 반영 중 — 자동 재시도');
+      _dokkebiDebug('[dokkebi] ⏳ 배포 업데이트 반영 중 — 자동 재시도');
     }
     // 최대 약 5분간 조용히 대기한다. 일반 사용자는 로딩 상태만 보며,
     // 콘솔에도 warning/error 를 남기지 않는다. 그 이상이면 자동 새로고침으로
@@ -1053,12 +1069,12 @@ function _dokkebiScheduleVersionProbeForPath(path) {
       await new Promise(function(r) { setTimeout(r, _wait); });
       try {
         await _performHandshake();
-        console.debug('[dokkebi] ✅ 핸드셰이크 재시도 성공 (' + (_i + 1) + '/' + _maxAttempts + ')');
+        _dokkebiDebug('[dokkebi] ✅ 핸드셰이크 재시도 성공 (' + (_i + 1) + '/' + _maxAttempts + ')');
         return;
       } catch (e) {
         _lastErr = e;
         if (e && e.code === 'prop_pending') {
-          console.debug('[dokkebi] ⏳ 배포 업데이트 반영 대기 (' + (_i + 1) + '/' + _maxAttempts + ')');
+          _dokkebiDebug('[dokkebi] ⏳ 배포 업데이트 반영 대기 (' + (_i + 1) + '/' + _maxAttempts + ')');
         } else {
           throw e;
         }
@@ -2268,14 +2284,14 @@ function _dokkebiScheduleVersionProbeForPath(path) {
                 _hasBoot = _b && Number(_b.v) === 1 && _b.w && _b.n && _b.t;
               } catch (_) {}
               if (!_hasBoot) {
-                console.log('[dokkebi] 🔄 복호화 키 미보유 — 재핸드셰이크 진행');
+                _dokkebiTrace('[dokkebi] 🔄 복호화 키 미보유 — 재핸드셰이크 진행');
                 await _clearSessionOPFS();
                 await _performHandshakeResilient();
               } else {
-                console.log('[dokkebi] 🔐 OPFS 세션 복원 — 번들 키는 HTML BOOT 경로 사용');
+                _dokkebiTrace('[dokkebi] 🔐 OPFS 세션 복원 — 번들 키는 HTML BOOT 경로 사용');
               }
             } else {
-              console.log('[dokkebi] 🔐 OPFS 캐시에서 세션 복원 (핸드셰이크 생략)');
+              _dokkebiTrace('[dokkebi] 🔐 OPFS 캐시에서 세션 복원 (핸드셰이크 생략)');
             }
           } catch (e) {
             console.error('[dokkebi] ⛔ 백그라운드 핸드셰이크 실패:', e && e.message ? e.message : e);
@@ -2722,7 +2738,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           throw new Error(integrityMsg);
         }
         var _srcLabel = _isEncTextMode ? 'backend.bundle.enc' : (_isBytecodeEnc ? 'backend.bytecode.enc' : (_isBytecodeMode ? 'backend.bytecode' : 'backend-bundle.js'));
-        console.log('[dokkebi] ✅ ' + _srcLabel + ' 무결성 검증 통과' + (_cachedBundle ? ' (OPFS 캐시)' : ''));
+        _dokkebiTrace('[dokkebi] ✅ ' + _srcLabel + ' 무결성 검증 통과' + (_cachedBundle ? ' (OPFS 캐시)' : ''));
         if (!_cachedBundle) _saveCachedBundle('__DOKKEBI_PH_BUNDLE_HASH__', _bundleRaw);
       }
 
@@ -2736,7 +2752,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           if (forceHandshake) {
             await _clearSessionOPFS();
             _forgetClientSecret('__DOKKEBI_BC_KEY__');
-            console.log('[dokkebi] 🔄 복호화 키 갱신을 위해 핸드셰이크 재시도');
+            _dokkebiTrace('[dokkebi] 🔄 복호화 키 갱신을 위해 핸드셰이크 재시도');
             await _performHandshake();
           }
           var _bcKeyHex = null;
@@ -2745,7 +2761,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
             var _boot2 = _g2 && _g2.__DOKKEBI_BOOT__;
             _bcKeyHex = await _unwrapBcKeyHexFromBoot(_boot2);
             if (_bcKeyHex) {
-              console.log('[dokkebi] ⚡ 번들 복호화 키: HTML 주입 (__DOKKEBI_BOOT__) — D1 핸드셰이크와 분리');
+              _dokkebiTrace('[dokkebi] ⚡ 번들 복호화 키: HTML 주입 (__DOKKEBI_BOOT__) — D1 핸드셰이크와 분리');
               try { delete _g2.__DOKKEBI_BOOT__; } catch (_) { try { _g2.__DOKKEBI_BOOT__ = undefined; } catch (__) {} }
             }
           } catch (_) {}
@@ -2759,7 +2775,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
             _bcKeyHex = _envSecretMap['__DOKKEBI_BC_KEY__'];
           }
           if (!_bcKeyHex) {
-            console.log('[dokkebi] 🔄 복호화 키 조회를 위해 핸드셰이크 재시도');
+            _dokkebiTrace('[dokkebi] 🔄 복호화 키 조회를 위해 핸드셰이크 재시도');
             await _performHandshake();
             _bcKeyHex = _envSecretMap['__DOKKEBI_BC_KEY__'];
           }
@@ -2792,7 +2808,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           // 60초 가드 만료 시 자동으로 다시 재시도한다.
           var _isPropPending = _decErr && _decErr.code === 'prop_pending';
           if (_isPropPending) {
-            console.debug('[dokkebi] ⏳ 배포 업데이트 반영 중 — 자동 재시도');
+            _dokkebiDebug('[dokkebi] ⏳ 배포 업데이트 반영 중 — 자동 재시도');
           } else {
             console.warn('[dokkebi] ⚠ 번들 복호화 실패 — 배포 전파 안정화를 기다리며 재시도합니다.', _decErr?.name || _decErr?.message || _decErr);
           }
@@ -2809,12 +2825,12 @@ function _dokkebiScheduleVersionProbeForPath(path) {
             try {
               _decrypted = await _decryptBackendBundle(true);
               _retryDecErr = null;
-              console.log('[dokkebi] ✅ 번들 복호화 재시도 성공 (' + (_ri + 1) + '/' + _retryDelays.length + ')');
+              _dokkebiTrace('[dokkebi] ✅ 번들 복호화 재시도 성공 (' + (_ri + 1) + '/' + _retryDelays.length + ')');
               break;
             } catch (e) {
               _retryDecErr = e;
               if (e && e.code === 'prop_pending') {
-                console.debug('[dokkebi] ⏳ 배포 업데이트 반영 대기 (' + (_ri + 1) + '/' + _retryDelays.length + ')');
+                _dokkebiDebug('[dokkebi] ⏳ 배포 업데이트 반영 대기 (' + (_ri + 1) + '/' + _retryDelays.length + ')');
               } else {
                 console.warn('[dokkebi] ⚠ 번들 복호화 재시도 실패 (' + (_ri + 1) + '/' + _retryDelays.length + ')', e?.name || e?.message || e);
               }
@@ -2831,7 +2847,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           }
         }
         _bytecodeData = new Uint8Array(_decrypted);
-        console.log('[dokkebi] 🔓 AES-256-GCM 복호화 완료 (' + (_bytecodeData.byteLength / 1024).toFixed(1) + ' KB)');
+        _dokkebiTrace('[dokkebi] 🔓 AES-256-GCM 복호화 완료 (' + (_bytecodeData.byteLength / 1024).toFixed(1) + ' KB)');
       }
 
       const capabilityGuardResult = _vm.evalCode(
@@ -2855,14 +2871,14 @@ function _dokkebiScheduleVersionProbeForPath(path) {
         var _decryptedText = new TextDecoder().decode(_bytecodeData);
         evalResult = _vm.evalCode(_decryptedText, 'backend-bundle.js');
         _decryptedText = '';
-        console.log('[dokkebi] ✅ 암호화 텍스트 모드 백엔드 로드 완료');
+        _dokkebiTrace('[dokkebi] ✅ 암호화 텍스트 모드 백엔드 로드 완료');
       } else if (_isBytecodeMode) {
         var _bufH = _vm.newArrayBuffer(_bytecodeData.buffer || _bytecodeData);
         var _compiledH = _vm.decodeBinaryJSON(_bufH);
         _bufH.dispose();
         evalResult = _vm.callFunction(_compiledH, _vm.undefined);
         _compiledH.dispose();
-        console.log('[dokkebi] ✅ 바이트코드 모드 백엔드 로드 완료');
+        _dokkebiTrace('[dokkebi] ✅ 바이트코드 모드 백엔드 로드 완료');
       } else {
         evalResult = _vm.evalCode(_bundleRaw, 'backend-bundle.js');
       }
@@ -2912,7 +2928,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
         } else {
           initVal.dispose();
         }
-        console.log('[dokkebi] ✅ DB 핸들 등록 완료 (handle:', DB_HANDLE, ')');
+        _dokkebiTrace('[dokkebi] ✅ DB 핸들 등록 완료 (handle:', DB_HANDLE, ')');
       }
 
       // Step 5: VM에서 handle_request 함수 추출
@@ -3123,7 +3139,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
             return _origUnlock.apply(this, arguments);
           };
         }
-        console.log('[dokkebi] caller guard 활성:', _guardMode);
+        _dokkebiTrace('[dokkebi] caller guard 활성:', _guardMode);
       }
 
       // ── 일회성 handoff: dokkebi:client 가상 모듈이 첫 import 시 소비 ──
@@ -3148,7 +3164,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
         console.warn('[dokkebi] client handoff 설치 실패:', _handoffErr && _handoffErr.message);
       }
 
-      console.log('[dokkebi] ✅ QuickJS WASM 백엔드 초기화 완료 (DB Handle:', DB_HANDLE, _LOCAL_DB_MODE ? ', 📦 로컬 DB' : '', ')');
+      _dokkebiTrace('[dokkebi] ✅ QuickJS WASM 백엔드 초기화 완료 (DB Handle:', DB_HANDLE, _LOCAL_DB_MODE ? ', 📦 로컬 DB' : '', ')');
       _resolveReady(_dokClient);
     } catch (e) {
       const errMsg = e instanceof Error ? e.message + (e.stack ? '\n' + e.stack : '') : String(e);
@@ -3463,7 +3479,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
     }
   }
 
-  console.log('[dokkebi] 부트스트랩 로드 (DB Handle:', DB_HANDLE, _LOCAL_DB_MODE ? '/ 로컬 DB' : '', ')— QuickJS VM 초기화 중...');
+  _dokkebiTrace('[dokkebi] 부트스트랩 로드 (DB Handle:', DB_HANDLE, _LOCAL_DB_MODE ? '/ 로컬 DB' : '', ')— QuickJS VM 초기화 중...');
 
   // ── 빌드 버전 체크 (이벤트 + API/DB 왕복 — 폴링 없음) ───
   // 탭 복귀·포커스 / Same-Origin /api/*·/api/_dokkebi/db 응답 후 build-version.json 비교 → 배너
