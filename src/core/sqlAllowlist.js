@@ -13,7 +13,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { detectOuterOp, outerStatement, detectPrimaryTableOf } from './sqlShape.js';
+import { detectOuterOp, outerStatement, detectPrimaryTableOf, extractTableRefs } from './sqlShape.js';
 
 // ─────────────────────────────────────────────────────────────
 // 내부 시스템 테이블 접근 차단
@@ -545,20 +545,10 @@ function extractAllTables(normalized) {
     const tables = new Set();
     const upper = normalized.toUpperCase();
     const cteNames = extractCteNames(upper);
-    // 식별자 매칭: schema.name 형태를 허용하고, 따옴표/백틱으로 둘러싼 형태도 허용
-    const ident = `["'` + '`' + `]?([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?)["'` + '`' + `]?`;
-    const keywords = ['FROM', 'JOIN', 'INTO', 'UPDATE'];
-    for (const kw of keywords) {
-        const re = new RegExp(`\\b${kw}\\s+${ident}`, 'gi');
-        let m;
-        while ((m = re.exec(normalized)) !== null) {
-            const name = m[1];
-            // 스키마 분리: public.users → users
-            const parts = name.split('.');
-            const baseName = parts[parts.length - 1];
-            if (cteNames.has(baseName.toLowerCase())) continue;
-            tables.add(baseName);
-        }
+    for (const ref of extractTableRefs(normalized)) {
+        const baseName = String(ref.name);
+        if (cteNames.has(baseName.toLowerCase())) continue;
+        tables.add(baseName);
     }
     return [...tables];
 }

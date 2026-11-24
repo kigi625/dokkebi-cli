@@ -29,7 +29,7 @@ export const POLICY_ENGINE_VERSION = 1;
  * 큰따옴표·백틱 식별자는 원형 유지 (SQLite 호환).
  * 작은따옴표 문자열은 ''(빈 문자열) 로 대체 — 토큰 카운팅에는 영향 없음.
  */
-import { detectOuterOp, outerStatement } from './sqlShape.js';
+import { detectOuterOp, outerStatement, extractTableRefs as extractTableRefsRobust } from './sqlShape.js';
 
 export function stripStringsAndComments(sql) {
     let out = '';
@@ -108,32 +108,19 @@ const _RESERVED_AS_ALIAS = new Set([
 
 /**
  * FROM / JOIN / INTO / UPDATE 뒤의 테이블 참조 + 별칭 추출.
+ * (따옴표 식별자 · 스키마 한정 · 콤마 조인 포함 — sqlShape.extractTableRefs 사용)
  * @returns {Array<{name: string, alias: string|null, offset: number, keyword: string}>}
  */
 export function extractTableRefs(normalized) {
-    const refs = [];
-    // 식별자 + 옵션 별칭
-    const identPat = String.raw`["` + '`' + String.raw`]?([a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*)?)["` + '`' + String.raw`]?`;
-    const aliasPat = String.raw`(?:\s+(?:AS\s+)?["` + '`' + String.raw`]?([a-zA-Z_][\w]*)["` + '`' + String.raw`]?)?`;
-    const keywords = ['FROM', 'JOIN', 'INTO', 'UPDATE'];
-    for (const kw of keywords) {
-        const re = new RegExp(String.raw`\b` + kw + String.raw`\s+` + identPat + aliasPat, 'gi');
-        let m;
-        while ((m = re.exec(normalized)) !== null) {
-            const full = m[1];
-            const parts = full.split('.');
-            const baseName = parts[parts.length - 1];
-            const aliasRaw = m[2];
-            const isValidAlias = aliasRaw && !_RESERVED_AS_ALIAS.has(aliasRaw.toUpperCase());
-            refs.push({
-                name: baseName,
-                alias: isValidAlias ? aliasRaw : null,
-                offset: m.index,
-                keyword: kw.toUpperCase(),
-            });
-        }
-    }
-    return refs;
+    const refs = extractTableRefsRobust(normalized);
+    // 동일 (name, alias, keyword) 중복 제거 — 단일 테이블 쿼리가 다중으로 오판되지 않도록.
+    const seen = new Set();
+    return refs.filter((r) => {
+        const k = String(r.name).toLowerCase() + '|' + String(r.alias || '').toLowerCase() + '|' + r.keyword;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+    });
 }
 
 /**
@@ -314,20 +301,29 @@ function peelWrappedConjunct(sub) {
  * @returns {{ index: number, length: number, qIndex: number } | null}
  *   qIndex: whereText 내에서 '?' 가 위치한 문자 인덱스
  */
-function findTenantConditionInUpper(upper, alias, col) {
+function findTenantConditionInUpper(upper, alias, col, tableName = null, requireQualified = false) {
     const colUp = col.toUpperCase();
     const aliasUp = alias ? alias.toUpperCase() : null;
+    const tableUp = tableName ? String(tableName).toUpperCase() : null;
 
-    // 후보 패턴 나열 (우선순위: alias.col → "col" (DSL/SQLite 따옴표 식별자) → col)
+    // 후보 패턴 나열 (우선순위: alias.col / table.col → "col" → col)
     const patterns = [];
     if (aliasUp) {
         patterns.push(new RegExp(String.raw`\b` + aliasUp + String.raw`\.` + colUp + String.raw`\s*=\s*\?`, 'g'));
         patterns.push(new RegExp(String.raw`\b` + aliasUp + String.raw`\.\s*"` + colUp + String.raw`"\s*=\s*\?`, 'g'));
         patterns.push(new RegExp(String.raw`"` + aliasUp + String.raw`"\.\s*"` + colUp + String.raw`"\s*=\s*\?`, 'g'));
     }
-    patterns.push(new RegExp(String.raw`"` + colUp + String.raw`"\s*=\s*\?`, 'g'));
-    // 별칭 없는 col = ? (단, 앞에 점이 없어야 타 테이블 col 과 혼동 X)
-    patterns.push(new RegExp(String.raw`(?:^|[^A-Z0-9_.])` + colUp + String.raw`\s*=\s*\?`, 'g'));
+    if (tableUp) {
+        patterns.push(new RegExp(String.raw`\b` + tableUp + String.raw`\.` + colUp + String.raw`\s*=\s*\?`, 'g'));
+        patterns.push(new RegExp(String.raw`\b` + tableUp + String.raw`\.\s*"` + colUp + String.raw`"\s*=\s*\?`, 'g'));
+        patterns.push(new RegExp(String.raw`"` + tableUp + String.raw`"\.\s*"` + colUp + String.raw`"\s*=\s*\?`, 'g'));
+    }
+    // 다중 테이블에서는 비한정 `col = ?` 가 다른 테이블 컬럼에 바인딩될 수 있어 인정하지 않는다.
+    if (!requireQualified) {
+        patterns.push(new RegExp(String.raw`"` + colUp + String.raw`"\s*=\s*\?`, 'g'));
+        // 별칭 없는 col = ? (단, 앞에 점이 없어야 타 테이블 col 과 혼동 X)
+        patterns.push(new RegExp(String.raw`(?:^|[^A-Z0-9_.])` + colUp + String.raw`\s*=\s*\?`, 'g'));
+    }
 
     for (const re of patterns) {
         let m;
@@ -348,9 +344,9 @@ function findTenantConditionInUpper(upper, alias, col) {
     return null;
 }
 
-export function findTenantCondition(whereText, alias, col) {
+export function findTenantCondition(whereText, alias, col, tableName = null, requireQualified = false) {
     const upper = whereText.toUpperCase();
-    let r = findTenantConditionInUpper(upper, alias, col);
+    let r = findTenantConditionInUpper(upper, alias, col, tableName, requireQualified);
     if (r) return r;
     for (const sp of splitTopLevelAndWhere(whereText, upper)) {
         const sub = whereText.slice(sp.start, sp.end);
@@ -362,7 +358,7 @@ export function findTenantCondition(whereText, alias, col) {
         // (tenant = ? OR ...) 처럼 OR 로 느슨해진 conjunct 는 인정하지 않는다.
         if (hasTopLevelOr(inner)) continue;
         const innerUpper = subUpper.slice(relOffset, relOffset + inner.length);
-        r = findTenantConditionInUpper(innerUpper, alias, col);
+        r = findTenantConditionInUpper(innerUpper, alias, col, tableName, requireQualified);
         if (r) {
             const shift = sp.start + relOffset;
             return {
@@ -500,6 +496,7 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
     if (op === 'CREATE') return { ok: true };
 
     const refs = extractTableRefs(normalized);
+    const requireQualified = refs.length > 1;
     for (const ref of refs) {
         const tp = findTablePolicy(policy.tables, ref.name);
         if (!tp) continue; // 선언 안 된 테이블은 스킵 (defaultMode='none' 과 동일)
@@ -588,7 +585,7 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
                     table: ref.name,
                 };
             }
-            const cond = findTenantCondition(where.text, ref.alias, tenantCol);
+            const cond = findTenantCondition(where.text, ref.alias, tenantCol, ref.name, requireQualified);
             if (!cond) {
                 return {
                     ok: false,
@@ -760,8 +757,9 @@ function _rewriteOne(sql, params, op, ref, tenantCol, expected, failingCode) {
     // 주입 대상이 주 테이블인지 판단. INSERT 는 INTO 만, UPDATE 는 UPDATE 뒤, DELETE/SELECT 는 FROM.
     const allowedKeywordByOp = {
         SELECT: new Set(['FROM', 'JOIN']),
-        UPDATE: new Set(['UPDATE']),
-        DELETE: new Set(['FROM']),
+        // UPDATE ... FROM users 처럼 보조 테이블은 FROM 으로 등장한다.
+        UPDATE: new Set(['UPDATE', 'FROM', 'JOIN']),
+        DELETE: new Set(['FROM', 'JOIN']),
         INSERT: new Set(['INTO']),
     };
     const allowed = allowedKeywordByOp[op];
@@ -819,8 +817,9 @@ function _injectInsert(sql, params, ref, tenantCol, expected) {
 }
 
 function _injectWhere(sql, params, op, ref, tenantCol, expected) {
-    // ref.alias 가 있으면 `alias.tenantCol = ?`, 없으면 `tenantCol = ?`
-    const colExpr = (ref.alias ? ref.alias + '.' : '') + tenantCol;
+    // 항상 테이블/별칭으로 한정한다 — 콤마 조인에서 비한정 컬럼이 다른 테이블에
+    // 바인딩되어 필터가 무력화되는 것을 방지.
+    const colExpr = ((ref.alias || ref.name) ? (ref.alias || ref.name) + '.' : '') + tenantCol;
     const cond = colExpr + ' = ?';
 
     // 바깥 문장의 WHERE 만 대상으로 한다 (서브쿼리 WHERE 오삽입 방지).

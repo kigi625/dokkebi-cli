@@ -133,7 +133,7 @@ test('C2 inject: DELETE 에서 서브쿼리 뒤가 아닌 바깥 WHERE 에 AND �
         ['5', 'u1'], ctx, p, { strict: true },
     );
     assert.equal(r.ok, true);
-    assert.match(r.sql, /AND \(user_id = \?\)\s*$/);
+    assert.match(r.sql, /AND \(posts\.user_id = \?\)\s*$/);
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -198,4 +198,59 @@ test('C3: optional 은 모호한 매핑(site_id ← user_id)을 강제하지 않
         verifyTenantPolicy('SELECT * FROM inquiries WHERE site_id = ?', ['s1'], { site_id: 's1' }, explicit, { strict: true }).ok,
         true,
     );
+});
+
+// ─────────────────────────────────────────────────────────────
+// C4. 콤마 조인 (`FROM a, b`) 테이블 추출
+// ─────────────────────────────────────────────────────────────
+
+test('C4: 콤마 조인으로 보호 테이블을 숨길 수 없다', () => {
+    const allow = { version: 1, rawAllowed: false, tables: [{ name: 'posts', ops: ['SELECT'] }] };
+    assert.equal(validateSqlAllowlist('SELECT * FROM posts', allow).allowed, true);
+    for (const sql of [
+        'SELECT * FROM posts, users',
+        'SELECT * FROM posts p, "users" u',
+        'SELECT * FROM posts, main.users',
+        'SELECT * FROM posts, [users]',
+        'SELECT * FROM posts JOIN [users] ON 1=1',
+        'SELECT * FROM posts, (SELECT * FROM [users])',
+        'SELECT * FROM "main"."users"',
+        'SELECT * FROM posts, [main].[users]',
+        'SELECT * FROM posts, (users)',
+        'SELECT * FROM (posts) p, users u',
+        'SELECT * FROM ((users))',
+        'UPDATE posts SET x = 1 FROM [users] WHERE users.id = posts.id',
+    ]) {
+        assert.equal(validateSqlAllowlist(sql, allow).allowed, false, sql);
+        const t = extractOpAndTables(sql);
+        assert.ok(t.tables.includes('users'), sql + ' -> ' + t.tables.join(','));
+    }
+
+    const authz = normalizeAuthorizationConfig({
+        enabled: true, mode: 'strict',
+        rules: {
+            'SELECT:posts': { public: true },
+            'SELECT:users': { roles: ['admin'] },
+            '*': { deny: true },
+        },
+    });
+    const user = { valid: true, payload: { role: 'user' } };
+    assert.equal(evaluateSqlAuthorization(authz, 'SELECT * FROM posts, users', user).ok, false);
+
+    const p = normalizePolicyConfig({
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: {
+            posts: { tenantColumn: 'user_id', mode: 'enforce' },
+            users: { tenantColumn: 'user_id', mode: 'enforce' },
+        },
+    });
+    const ctx = { user_id: 'u1' };
+    // 다중 테이블에서 비한정 user_id 는 다른 테이블 컬럼일 수 있으므로 인정하지 않는다.
+    assert.equal(verifyTenantPolicy('SELECT * FROM posts, users WHERE user_id = ?', ['u1'], ctx, p, { strict: true }).ok, false);
+    assert.equal(verifyTenantPolicy('SELECT * FROM posts, users WHERE posts.user_id = ? AND users.user_id = ?', ['u1', 'u1'], ctx, p, { strict: true }).ok, true);
+
+    const inj = injectTenantPolicy('SELECT * FROM posts, users', [], ctx, normalizePolicyConfig({ ...p, mode: 'inject' }), { strict: true });
+    assert.equal(inj.ok, true);
+    assert.match(inj.sql, /posts\.user_id = \?/);
+    assert.match(inj.sql, /users\.user_id = \?/);
 });

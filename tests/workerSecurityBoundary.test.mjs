@@ -157,7 +157,7 @@ test('워커 템플릿: 테넌트 서브쿼리/OR 우회 차단 (C2)', () => {
     const inj = { ...p, mode: 'inject' };
     const r = worker.injectTenantPolicy('UPDATE posts SET x = (SELECT 1 FROM posts WHERE user_id = ?) WHERE id = ?', ['u1', '5'], ctx, inj, { strict: true });
     assert.equal(r.ok, true);
-    assert.match(r.sql, /WHERE id = \? AND \(user_id = \?\)/);
+    assert.match(r.sql, /WHERE id = \? AND \(posts\.user_id = \?\)/);
 });
 
 test('워커 템플릿: optional 은 클레임이 있을 때만 격리 (C3)', () => {
@@ -215,4 +215,49 @@ test('워커 템플릿: CORS allowedOrigins 를 강제 (H4/4번)', () => {
 
     const noOrigin = worker._corsHeadersFor(req(''));
     assert.equal(noOrigin['Access-Control-Allow-Origin'], undefined);
+});
+
+test('워커 템플릿: 콤마 조인 보호 테이블 우회 차단 (C4)', async () => {
+    // users 는 allowlist 에 포함되어 있으므로, 미등록 테이블(secrets)로 확인한다.
+    for (const sql of [
+        'SELECT * FROM posts, secrets',
+        'SELECT * FROM posts p, "secrets" u',
+        'SELECT * FROM posts, main.secrets',
+        // 대괄호/따옴표 스키마 표기 우회
+        'SELECT * FROM posts, [secrets]',
+        'SELECT * FROM posts JOIN [secrets] ON 1=1',
+        'SELECT * FROM posts, (SELECT * FROM [secrets])',
+        'SELECT * FROM "main"."secrets"',
+        'SELECT * FROM posts, [main].[secrets]',
+        'SELECT * FROM posts, (secrets)',
+        'SELECT * FROM (posts) p, secrets s',
+        'SELECT * FROM ((secrets))',
+        'UPDATE posts SET x = 1 FROM [secrets] WHERE secrets.id = posts.id',
+    ]) {
+        assert.equal(worker.validateSqlAllowlist(sql, { strict: true }).allowed, false, sql);
+    }
+    assert.equal(worker.validateSqlAllowlist('SELECT * FROM posts, users', { strict: true }).allowed, true);
+
+    const req = { headers: new Headers() };
+    const env = { DOKKEBI_JWT_SECRET: JWT_SECRET };
+    const user = signJwt({ role: 'user', user_id: 'u1' });
+    const admin = signJwt({ role: 'admin', user_id: 'a1' });
+    assert.equal((await worker._az_checkSql('SELECT * FROM posts, users', req, { _jwt: user }, env)).ok, false);
+    assert.equal((await worker._az_checkSql('SELECT * FROM posts, users', req, { _jwt: admin }, env)).ok, true);
+
+    const p = {
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: {
+            posts: { tenantColumn: 'user_id', mode: 'enforce' },
+            users: { tenantColumn: 'user_id', mode: 'enforce' },
+        },
+    };
+    const ctx = { user_id: 'u1' };
+    assert.equal(worker.verifyTenantPolicy('SELECT * FROM posts, users WHERE user_id = ?', ['u1'], ctx, p, { strict: true }).ok, false);
+    assert.equal(worker.verifyTenantPolicy('SELECT * FROM posts, users WHERE posts.user_id = ? AND users.user_id = ?', ['u1', 'u1'], ctx, p, { strict: true }).ok, true);
+
+    const inj = worker.injectTenantPolicy('SELECT * FROM posts, users', [], ctx, { ...p, mode: 'inject' }, { strict: true });
+    assert.equal(inj.ok, true);
+    assert.match(inj.sql, /posts\.user_id = \?/);
+    assert.match(inj.sql, /users\.user_id = \?/);
 });

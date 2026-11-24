@@ -37,7 +37,7 @@
  *   - 프론트엔드 권한 UI → 클라이언트 판단은 UX 용도일 뿐
  */
 
-import { detectOuterOp, outerStatement, detectPrimaryTableOf } from './sqlShape.js';
+import { detectOuterOp, outerStatement, detectPrimaryTableOf, extractTableRefs } from './sqlShape.js';
 
 // ─────────────────────────────────────────────────────────────
 // Config 정규화 — dokkebi.config.js 의 authorization 섹션 검증/정규화
@@ -411,15 +411,9 @@ function _extractAllTableRefs(normalized) {
     const tables = new Set();
     const upper = normalized.toUpperCase();
     const cteNames = _extractCteNames(upper);
-    const ident = '["\'`]?([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?)["\'`]?';
-    for (const kw of ['FROM', 'JOIN', 'INTO', 'UPDATE']) {
-        const re = new RegExp('\\b' + kw + '\\s+' + ident, 'gi');
-        let m;
-        while ((m = re.exec(normalized)) !== null) {
-            const base = m[1].split('.').pop();
-            if (cteNames.has(base.toLowerCase())) continue;
-            tables.add(base);
-        }
+    for (const ref of extractTableRefs(normalized)) {
+        if (cteNames.has(String(ref.name).toLowerCase())) continue;
+        tables.add(ref.name);
     }
     return [...tables];
 }

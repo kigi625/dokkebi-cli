@@ -103,3 +103,214 @@ export function detectPrimaryTableOf(outerUpper, op) {
     const parts = m[1].split('.');
     return parts[parts.length - 1];
 }
+
+/**
+ * SQL 이 참조하는 테이블(FROM/JOIN/INTO/UPDATE) + 별칭을 추출한다.
+ *
+ * 문자열/주석이 제거된 정규화 SQL 을 받는다. 다음을 모두 처리한다:
+ *  - `FROM a, b` 콤마 조인 (기존 FROM/JOIN 정규식이 첫 테이블만 잡던 우회)
+ *  - `"schema"."table"`, `` `table` ``, `[table]` 따옴표 식별자
+ *  - 서브쿼리 내부 FROM (전체 스캔)
+ *
+ * @param {string} normalized - 주석/문자열 제거 + 원본 대소문자 유지
+ * @returns {Array<{name: string, alias: string|null, offset: number, keyword: string}>}
+ */
+export function extractTableRefs(normalized) {
+    const s = String(normalized || '');
+    const n = s.length;
+    const out = [];
+    const TABLE_KW = new Set(['FROM', 'JOIN', 'INTO', 'UPDATE']);
+    const RESERVED = new Set([
+        'WHERE', 'SET', 'VALUES', 'ON', 'GROUP', 'ORDER', 'LIMIT', 'HAVING',
+        'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'WINDOW', 'INNER', 'LEFT',
+        'RIGHT', 'FULL', 'CROSS', 'OUTER', 'NATURAL', 'JOIN', 'USING', 'AS',
+        'AND', 'OR', 'FROM', 'INTO', 'UPDATE', 'SELECT', 'INSERT', 'DELETE',
+        'INDEXED', 'NOT', 'BY', 'WITH', 'RECURSIVE',
+    ]);
+
+    function readIdent(i, limit = n) {
+        if (i >= limit) return null;
+        const ch = s[i];
+        if (ch === '"' || ch === '`') {
+            let j = i + 1;
+            let value = '';
+            while (j < limit) {
+                if (s[j] === ch) {
+                    if (s[j + 1] === ch) { value += ch; j += 2; continue; }
+                    j++;
+                    break;
+                }
+                value += s[j];
+                j++;
+            }
+            return { value, end: j, quoted: true };
+        }
+        if (ch === '[') {
+            let j = i + 1;
+            let value = '';
+            while (j < limit && s[j] !== ']') { value += s[j]; j++; }
+            if (j < limit) j++;
+            return { value, end: j, quoted: true };
+        }
+        if (!/[A-Za-z_]/.test(ch)) return null;
+        let j = i;
+        while (j < limit && /[A-Za-z0-9_$]/.test(s[j])) j++;
+        return { value: s.slice(i, j), end: j, quoted: false };
+    }
+
+    function skipWs(i, limit = n) {
+        while (i < limit && /\s/.test(s[i])) i++;
+        return i;
+    }
+
+    function matchParen(i, limit = n) {
+        // i 는 '(' 위치. 따옴표 식별자를 건너뛰며 짝이 맞는 ')' 위치를 찾는다.
+        let depth = 0;
+        for (let j = i; j < limit; j++) {
+            const ch = s[j];
+            if (ch === '"' || ch === '`' || ch === '[') {
+                const t = readIdent(j, limit);
+                j = (t ? t.end : j + 1) - 1;
+                continue;
+            }
+            if (ch === "'") {
+                let k = j + 1;
+                while (k < limit) {
+                    if (s[k] === "'" && s[k + 1] === "'") { k += 2; continue; }
+                    if (s[k] === "'") { k++; break; }
+                    k++;
+                }
+                j = k - 1;
+                continue;
+            }
+            if (ch === '(') depth++;
+            else if (ch === ')') {
+                depth--;
+                if (depth === 0) return j;
+            }
+        }
+        return -1;
+    }
+
+    function hasQueryKeyword(text) {
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            if (ch === '"' || ch === '`' || ch === '[') {
+                const t = readIdent(i);
+                i = (t ? t.end : i + 1) - 1;
+                continue;
+            }
+            if (!/[A-Za-z_]/.test(ch)) continue;
+            let j = i;
+            while (j < text.length && /[A-Za-z0-9_]/.test(text[j])) j++;
+            const w = text.slice(i, j).toUpperCase();
+            if (w === 'SELECT' || w === 'VALUES' || w === 'WITH') return true;
+            i = j - 1;
+        }
+        return false;
+    }
+
+    function readRef(i, limit = n) {
+        const first = readIdent(i, limit);
+        if (!first) return null;
+        if (!first.quoted && RESERVED.has(first.value.toUpperCase())) return null;
+        let name = first.value;
+        let end = first.end;
+        // schema-qualified: a.b.c (따옴표 혼용 허용)
+        for (;;) {
+            let k = skipWs(end, limit);
+            if (s[k] !== '.') break;
+            k = skipWs(k + 1, limit);
+            const seg = readIdent(k, limit);
+            if (!seg) break;
+            name = seg.value;
+            end = seg.end;
+        }
+        // alias: `AS x` 또는 `x` (예약어 제외)
+        let alias = null;
+        let k = skipWs(end, limit);
+        if (/^AS\b/i.test(s.slice(k, k + 3)) && !/[A-Za-z0-9_]/.test(s[k + 2] || '')) {
+            k = skipWs(k + 2, limit);
+            const a = readIdent(k, limit);
+            if (a) { alias = a.value; end = a.end; }
+        } else {
+            const a = readIdent(k, limit);
+            if (a && !(!a.quoted && RESERVED.has(a.value.toUpperCase()))) {
+                alias = a.value;
+                end = a.end;
+            }
+        }
+        return { name, alias, offset: i, end };
+    }
+
+    // 콤마로 나열된 테이블 참조 목록. `(table)` / `(a, b)` / `(SELECT ...)` 처리.
+    function readList(start, limit = n) {
+        const refs = [];
+        let pos = start;
+        for (;;) {
+            pos = skipWs(pos, limit);
+            if (pos >= limit) break;
+            if (s[pos] === '(') {
+                const close = matchParen(pos, limit);
+                if (close < 0) break;
+                const inner = s.slice(pos + 1, close);
+                if (!hasQueryKeyword(inner)) {
+                    const sub = readList(pos + 1, close);
+                    for (const r of sub.refs) refs.push(r);
+                }
+                pos = close + 1;
+                // `(posts) p` / `(posts) AS p` — 괄호 뒤 별칭은 건너뛴다.
+                let k = skipWs(pos, limit);
+                if (/^AS\b/i.test(s.slice(k, k + 3)) && !/[A-Za-z0-9_]/.test(s[k + 2] || '')) {
+                    k = skipWs(k + 2, limit);
+                    const a = readIdent(k, limit);
+                    if (a) pos = a.end;
+                } else {
+                    const a = readIdent(k, limit);
+                    if (a && !(!a.quoted && RESERVED.has(a.value.toUpperCase()))) pos = a.end;
+                }
+            } else {
+                const r = readRef(pos, limit);
+                if (!r) break;
+                refs.push({ name: r.name, alias: r.alias, offset: r.offset });
+                pos = r.end;
+            }
+            let next = skipWs(pos, limit);
+            if (next >= limit || s[next] !== ',') break;
+            pos = next + 1;
+        }
+        return { refs, end: pos };
+    }
+
+    for (let i = 0; i < n; i++) {
+        const ch = s[i];
+        if (ch === '"' || ch === '`' || ch === '[') {
+            const t = readIdent(i);
+            i = (t ? t.end : i + 1) - 1;
+            continue;
+        }
+        if (ch === "'") {
+            let j = i + 1;
+            while (j < n) {
+                if (s[j] === "'" && s[j + 1] === "'") { j += 2; continue; }
+                if (s[j] === "'") { j++; break; }
+                j++;
+            }
+            i = j - 1;
+            continue;
+        }
+        if (!/[A-Za-z_]/.test(ch)) continue;
+        let j = i;
+        while (j < n && /[A-Za-z0-9_]/.test(s[j])) j++;
+        const kw = s.slice(i, j).toUpperCase();
+        if (!TABLE_KW.has(kw)) { i = j - 1; continue; }
+        const start = skipWs(j);
+        const list = readList(start);
+        if (list.refs.length === 0) { i = j - 1; continue; }
+        for (const r of list.refs) {
+            out.push({ name: r.name, alias: r.alias, offset: r.offset, keyword: kw });
+        }
+        i = j - 1;
+    }
+    return out;
+}

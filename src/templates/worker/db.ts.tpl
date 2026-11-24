@@ -693,22 +693,212 @@ function extractCteNames(normalizedUpper: string): Set<string> {
   return names;
 }
 
+// SQL 이 참조하는 테이블(FROM/JOIN/INTO/UPDATE) + 별칭을 추출한다.
+//  - `FROM a, b` 콤마 조인 / `FROM (a), b` 괄호 테이블 참조
+//  - `"schema"."table"`, `` `table` ``, `[table]` 따옴표 식별자
+//  - 서브쿼리 내부 FROM (전체 스캔)
+function extractTableRefs(normalized: string): Array<{ name: string; alias: string | null; offset: number; keyword: string }> {
+  const s = String(normalized || '');
+  const n = s.length;
+  const out: Array<{ name: string; alias: string | null; offset: number; keyword: string }> = [];
+  const TABLE_KW = new Set(['FROM', 'JOIN', 'INTO', 'UPDATE']);
+  const RESERVED = new Set([
+    'WHERE', 'SET', 'VALUES', 'ON', 'GROUP', 'ORDER', 'LIMIT', 'HAVING',
+    'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'WINDOW', 'INNER', 'LEFT',
+    'RIGHT', 'FULL', 'CROSS', 'OUTER', 'NATURAL', 'JOIN', 'USING', 'AS',
+    'AND', 'OR', 'FROM', 'INTO', 'UPDATE', 'SELECT', 'INSERT', 'DELETE',
+    'INDEXED', 'NOT', 'BY', 'WITH', 'RECURSIVE',
+  ]);
+
+  function readIdent(i: number, limit: number = n): { value: string; end: number; quoted: boolean } | null {
+    if (i >= limit) return null;
+    const ch = s[i];
+    if (ch === '"' || ch === '`') {
+      let j = i + 1;
+      let value = '';
+      while (j < limit) {
+        if (s[j] === ch) {
+          if (s[j + 1] === ch) { value += ch; j += 2; continue; }
+          j++;
+          break;
+        }
+        value += s[j];
+        j++;
+      }
+      return { value, end: j, quoted: true };
+    }
+    if (ch === '[') {
+      let j = i + 1;
+      let value = '';
+      while (j < limit && s[j] !== ']') { value += s[j]; j++; }
+      if (j < limit) j++;
+      return { value, end: j, quoted: true };
+    }
+    if (!/[A-Za-z_]/.test(ch)) return null;
+    let j = i;
+    while (j < limit && /[A-Za-z0-9_$]/.test(s[j])) j++;
+    return { value: s.slice(i, j), end: j, quoted: false };
+  }
+
+  function skipWs(i: number, limit: number = n): number {
+    while (i < limit && /\s/.test(s[i])) i++;
+    return i;
+  }
+
+  function matchParen(i: number, limit: number = n): number {
+    let depth = 0;
+    for (let j = i; j < limit; j++) {
+      const ch = s[j];
+      if (ch === '"' || ch === '`' || ch === '[') {
+        const t = readIdent(j, limit);
+        j = (t ? t.end : j + 1) - 1;
+        continue;
+      }
+      if (ch === "'") {
+        let k = j + 1;
+        while (k < limit) {
+          if (s[k] === "'" && s[k + 1] === "'") { k += 2; continue; }
+          if (s[k] === "'") { k++; break; }
+          k++;
+        }
+        j = k - 1;
+        continue;
+      }
+      if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        if (depth === 0) return j;
+      }
+    }
+    return -1;
+  }
+
+  function hasQueryKeyword(text: string): boolean {
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '"' || ch === '`' || ch === '[') {
+        const t = readIdent(i);
+        i = (t ? t.end : i + 1) - 1;
+        continue;
+      }
+      if (!/[A-Za-z_]/.test(ch)) continue;
+      let j = i;
+      while (j < text.length && /[A-Za-z0-9_]/.test(text[j])) j++;
+      const w = text.slice(i, j).toUpperCase();
+      if (w === 'SELECT' || w === 'VALUES' || w === 'WITH') return true;
+      i = j - 1;
+    }
+    return false;
+  }
+
+  function readRef(i: number, limit: number = n): { name: string; alias: string | null; offset: number; end: number } | null {
+    const first = readIdent(i, limit);
+    if (!first) return null;
+    if (!first.quoted && RESERVED.has(first.value.toUpperCase())) return null;
+    let name = first.value;
+    let end = first.end;
+    for (;;) {
+      let k = skipWs(end, limit);
+      if (s[k] !== '.') break;
+      k = skipWs(k + 1, limit);
+      const seg = readIdent(k, limit);
+      if (!seg) break;
+      name = seg.value;
+      end = seg.end;
+    }
+    let alias: string | null = null;
+    let k = skipWs(end, limit);
+    if (/^AS\b/i.test(s.slice(k, k + 3)) && !/[A-Za-z0-9_]/.test(s[k + 2] || '')) {
+      k = skipWs(k + 2, limit);
+      const a = readIdent(k, limit);
+      if (a) { alias = a.value; end = a.end; }
+    } else {
+      const a = readIdent(k, limit);
+      if (a && !(!a.quoted && RESERVED.has(a.value.toUpperCase()))) {
+        alias = a.value;
+        end = a.end;
+      }
+    }
+    return { name, alias, offset: i, end };
+  }
+
+  function readList(start: number, limit: number = n): { refs: Array<{ name: string; alias: string | null; offset: number }>; end: number } {
+    const refs: Array<{ name: string; alias: string | null; offset: number }> = [];
+    let pos = start;
+    for (;;) {
+      pos = skipWs(pos, limit);
+      if (pos >= limit) break;
+      if (s[pos] === '(') {
+        const close = matchParen(pos, limit);
+        if (close < 0) break;
+        const inner = s.slice(pos + 1, close);
+        if (!hasQueryKeyword(inner)) {
+          const sub = readList(pos + 1, close);
+          for (const r of sub.refs) refs.push(r);
+        }
+        pos = close + 1;
+        let k = skipWs(pos, limit);
+        if (/^AS\b/i.test(s.slice(k, k + 3)) && !/[A-Za-z0-9_]/.test(s[k + 2] || '')) {
+          k = skipWs(k + 2, limit);
+          const a = readIdent(k, limit);
+          if (a) pos = a.end;
+        } else {
+          const a = readIdent(k, limit);
+          if (a && !(!a.quoted && RESERVED.has(a.value.toUpperCase()))) pos = a.end;
+        }
+      } else {
+        const r = readRef(pos, limit);
+        if (!r) break;
+        refs.push({ name: r.name, alias: r.alias, offset: r.offset });
+        pos = r.end;
+      }
+      const next = skipWs(pos, limit);
+      if (next >= limit || s[next] !== ',') break;
+      pos = next + 1;
+    }
+    return { refs, end: pos };
+  }
+
+  for (let i = 0; i < n; i++) {
+    const ch = s[i];
+    if (ch === '"' || ch === '`' || ch === '[') {
+      const t = readIdent(i);
+      i = (t ? t.end : i + 1) - 1;
+      continue;
+    }
+    if (ch === "'") {
+      let j = i + 1;
+      while (j < n) {
+        if (s[j] === "'" && s[j + 1] === "'") { j += 2; continue; }
+        if (s[j] === "'") { j++; break; }
+        j++;
+      }
+      i = j - 1;
+      continue;
+    }
+    if (!/[A-Za-z_]/.test(ch)) continue;
+    let j = i;
+    while (j < n && /[A-Za-z0-9_]/.test(s[j])) j++;
+    const kw = s.slice(i, j).toUpperCase();
+    if (!TABLE_KW.has(kw)) { i = j - 1; continue; }
+    const start = skipWs(j);
+    const list = readList(start);
+    if (list.refs.length === 0) { i = j - 1; continue; }
+    for (const r of list.refs) {
+      out.push({ name: r.name, alias: r.alias, offset: r.offset, keyword: kw });
+    }
+    i = j - 1;
+  }
+  return out;
+}
+
 function extractAllTables(normalized: string): string[] {
   const tables = new Set<string>();
   const upper = normalized.toUpperCase();
   const cteNames = extractCteNames(upper);
-  const ident = '["\'`]?([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?)["\'`]?';
-  const keywords = ['FROM', 'JOIN', 'INTO', 'UPDATE'];
-  for (const kw of keywords) {
-    const re = new RegExp('\\b' + kw + '\\s+' + ident, 'gi');
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(normalized)) !== null) {
-      const name = m[1];
-      const parts = name.split('.');
-      const baseName = parts[parts.length - 1];
-      if (cteNames.has(baseName.toLowerCase())) continue;
-      tables.add(baseName);
-    }
+  for (const ref of extractTableRefs(normalized)) {
+    if (cteNames.has(String(ref.name).toLowerCase())) continue;
+    tables.add(ref.name);
   }
   return [...tables];
 }
@@ -1333,23 +1523,15 @@ function _pe_detectOp(upper: string): string | null {
 }
 const _PE_RESERVED = new Set(['WHERE','SET','VALUES','ON','GROUP','ORDER','LIMIT','HAVING','UNION','INNER','LEFT','RIGHT','FULL','CROSS','OUTER','NATURAL','AS','USING','AND','OR','RETURNING','INTERSECT','EXCEPT','FROM','JOIN','INTO','UPDATE','SELECT','INSERT','DELETE']);
 function _pe_extractTableRefs(normalized: string): any[] {
-  const refs: any[] = [];
-  const identPat = '["\'`]?([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?)["\'`]?';
-  const aliasPat = '(?:\\s+(?:AS\\s+)?["\'`]?([a-zA-Z_][\\w]*)["\'`]?)?';
-  const keywords = ['FROM', 'JOIN', 'INTO', 'UPDATE'];
-  for (const kw of keywords) {
-    const re = new RegExp('\\b' + kw + '\\s+' + identPat + aliasPat, 'gi');
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(normalized)) !== null) {
-      const full = m[1];
-      const parts = full.split('.');
-      const baseName = parts[parts.length - 1];
-      const aliasRaw = m[2];
-      const isValidAlias = aliasRaw && !_PE_RESERVED.has(aliasRaw.toUpperCase());
-      refs.push({ name: baseName, alias: isValidAlias ? aliasRaw : null, offset: m.index, keyword: kw.toUpperCase() });
-    }
-  }
-  return refs;
+  const refs = extractTableRefs(normalized);
+  // 동일 (name, alias, keyword) 중복 제거 — 단일 테이블 쿼리가 다중으로 오판되지 않도록.
+  const seen = new Set<string>();
+  return refs.filter((r) => {
+    const k = String(r.name).toLowerCase() + '|' + String(r.alias || '').toLowerCase() + '|' + r.keyword;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 // 괄호 밖(depth 0)의 WHERE 와 tail 키워드 위치를 찾는다. raw SQL 에도 사용 가능.
 function _pe_scanOuterWhere(sql: string): { whereEnd: number; tailStart: number } {
@@ -1459,17 +1641,26 @@ function _pe_peelWrappedConjunct(sub: string): { inner: string; relOffset: numbe
   }
   return { inner: s, relOffset: rel };
 }
-function _pe_findTenantCondInUpper(upper: string, alias: string | null, col: string): { index: number; length: number; qIndex: number } | null {
+function _pe_findTenantCondInUpper(upper: string, alias: string | null, col: string, tableName: string | null = null, requireQualified = false): { index: number; length: number; qIndex: number } | null {
   const colUp = col.toUpperCase();
   const aliasUp = alias ? alias.toUpperCase() : null;
+  const tableUp = tableName ? String(tableName).toUpperCase() : null;
   const patterns: RegExp[] = [];
   if (aliasUp) {
     patterns.push(new RegExp('\\b' + aliasUp + '\\.' + colUp + '\\s*=\\s*\\?', 'g'));
     patterns.push(new RegExp('\\b' + aliasUp + '\\.\\s*"' + colUp + '"\\s*=\\s*\\?', 'g'));
     patterns.push(new RegExp('"' + aliasUp + '"\\.\\s*"' + colUp + '"\\s*=\\s*\\?', 'g'));
   }
-  patterns.push(new RegExp('"' + colUp + '"\\s*=\\s*\\?', 'g'));
-  patterns.push(new RegExp('(?:^|[^A-Z0-9_.])' + colUp + '\\s*=\\s*\\?', 'g'));
+  if (tableUp) {
+    patterns.push(new RegExp('\\b' + tableUp + '\\.' + colUp + '\\s*=\\s*\\?', 'g'));
+    patterns.push(new RegExp('\\b' + tableUp + '\\.\\s*"' + colUp + '"\\s*=\\s*\\?', 'g'));
+    patterns.push(new RegExp('"' + tableUp + '"\\.\\s*"' + colUp + '"\\s*=\\s*\\?', 'g'));
+  }
+  // 다중 테이블에서는 비한정 `col = ?` 가 다른 테이블 컬럼에 바인딩될 수 있어 인정하지 않는다.
+  if (!requireQualified) {
+    patterns.push(new RegExp('"' + colUp + '"\\s*=\\s*\\?', 'g'));
+    patterns.push(new RegExp('(?:^|[^A-Z0-9_.])' + colUp + '\\s*=\\s*\\?', 'g'));
+  }
   for (const re of patterns) {
     let m: RegExpExecArray | null;
     while ((m = re.exec(upper)) !== null) {
@@ -1486,9 +1677,9 @@ function _pe_findTenantCondInUpper(upper: string, alias: string | null, col: str
   }
   return null;
 }
-function _pe_findTenantCond(whereText: string, alias: string | null, col: string): { index: number; length: number; qIndex: number } | null {
+function _pe_findTenantCond(whereText: string, alias: string | null, col: string, tableName: string | null = null, requireQualified = false): { index: number; length: number; qIndex: number } | null {
   const upper = whereText.toUpperCase();
-  let r = _pe_findTenantCondInUpper(upper, alias, col);
+  let r = _pe_findTenantCondInUpper(upper, alias, col, tableName, requireQualified);
   if (r) return r;
   for (const sp of _pe_splitTopLevelAndWhere(whereText, upper)) {
     const sub = whereText.slice(sp.start, sp.end);
@@ -1499,7 +1690,7 @@ function _pe_findTenantCond(whereText: string, alias: string | null, col: string
     if (/\bSELECT\b/i.test(inner)) continue;
     if (_pe_hasTopLevelOr(inner)) continue;
     const innerUpper = subUpper.slice(relOffset, relOffset + inner.length);
-    r = _pe_findTenantCondInUpper(innerUpper, alias, col);
+    r = _pe_findTenantCondInUpper(innerUpper, alias, col, tableName, requireQualified);
     if (r) {
       const shift = sp.start + relOffset;
       return { index: shift + r.index, length: r.length, qIndex: shift + r.qIndex };
@@ -1561,6 +1752,7 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
   if (!op) return strict ? { ok: false, code: 'UNPARSEABLE', reason: 'SQL 연산을 파싱할 수 없습니다.' } : { ok: true };
   if (op === 'CREATE') return { ok: true };
   const refs = _pe_extractTableRefs(normalized);
+  const requireQualified = refs.length > 1;
   for (const ref of refs) {
     const tp = _pe_findTablePolicy(policy.tables, ref.name);
     if (!tp) continue;
@@ -1592,7 +1784,7 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
       const where = _pe_extractWhere(normalized);
       if (!where) return { ok: false, code: 'NO_WHERE', reason: op + ' 문에 WHERE 절이 없어 ' + ref.name + '.' + tenantCol + ' 조건을 확인할 수 없습니다.', table: ref.name };
       if (_pe_hasTopLevelOr(where.text)) return { ok: false, code: 'LOOSE_OR', reason: 'WHERE 최상단에 OR 가 있어 테넌트 필터가 느슨합니다.', table: ref.name };
-      const cond = _pe_findTenantCond(where.text, ref.alias, tenantCol);
+      const cond = _pe_findTenantCond(where.text, ref.alias, tenantCol, ref.name, requireQualified);
       if (!cond) return { ok: false, code: 'NO_TENANT_FILTER', reason: 'WHERE 절에 ' + (ref.alias ? ref.alias + '.' : '') + tenantCol + ' = ? 조건이 없습니다.', table: ref.name };
       const absQOffset = where.start + cond.qIndex;
       const paramIdx = _pe_countQMarks(normalized, absQOffset);
@@ -1620,7 +1812,9 @@ function _pe_injectInsert(sql: string, params: unknown[], _ref: any, tenantCol: 
   return { sql: newSql, params: [...params, expected] };
 }
 function _pe_injectWhere(sql: string, params: unknown[], _op: string, ref: any, tenantCol: string, expected: any): any {
-  const colExpr = (ref.alias ? ref.alias + '.' : '') + tenantCol;
+  // 항상 테이블/별칭으로 한정 — 콤마 조인에서 비한정 컬럼이 다른 테이블에
+  // 바인딩되어 필터가 무력화되는 것을 방지.
+  const colExpr = ((ref.alias || ref.name) ? (ref.alias || ref.name) + '.' : '') + tenantCol;
   const cond = colExpr + ' = ?';
   // 바깥 문장의 WHERE 만 대상으로 한다 (서브쿼리 WHERE 오삽입 방지).
   const { whereEnd, tailStart } = _pe_scanOuterWhere(sql);
