@@ -91,6 +91,8 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 | **Tenant Policy** | Row-level 격리 — `WHERE user_id = ?` 검증(verify) 또는 자동 주입(inject). top-level `OR`, 누락 WHERE, aliased column 감지. **테넌트 신분은 검증된 JWT 에서만 (`requireJwtTenant`, authorization/auth.login 활성 시 기본 ON). 세션 `tenant_json` 은 클라이언트 주장값** | opt-in |
 | **Authorization** | 연산-레벨 권한 — "DELETE posts 는 role=admin 만" — JWT 서명 검증 + role 매칭. **참조된 모든 테이블**에 대해 평가(JOIN / `INSERT ... SELECT` 포함, 주 연산 대상이 아닌 참조는 SELECT 로 취급) | opt-in |
 
+테넌트 정책은 테넌트 경계를 넘을 수 있는 쓰기 형태도 차단한다: `REPLACE` / `INSERT OR REPLACE` / `UPDATE OR REPLACE`(충돌 행 암묵 삭제), 테넌트 컬럼이 conflict target 에 없는 `ON CONFLICT ... DO UPDATE`, 그리고 테넌트 컬럼을 검증된 값이 아닌 다른 값으로 바꾸는 `SET`(`UPSERT_TENANT_RISK`, `TENANT_COLUMN_REASSIGN`).
+
 테이블 참조는 따옴표/괄호를 인식하는 파서(`sqlShape.extractTableRefs`)로 추출한다: `'…'` 문자열, `"…"`/`` `…` ``/`[…]` 식별자, 스키마 한정, 괄호로 묶인 테이블 목록, 콤마 조인, `INDEXED BY`/`NOT INDEXED`/`ON`/`USING` 제약, `UPDATE OR <conflict>` 대상까지 포함한다. 참조된 모든 테이블을 검사하므로 등록되지 않은 테이블을 조인 뒤에 숨길 수 없다. 다중 테이블 문장에서는 테넌트 필터를 반드시 한정해야 하며(`alias.col` 또는 `table.col`), 비한정 `col = ?` 는 다른 테이블 컬럼에 바인딩될 수 있어 거부한다.
 
 파라미터 바인딩은 D1/Supabase/Appwrite SDK 가 `prepare().bind()` 로 처리. 프록시는 raw SQL 을 절대 문자열 보간하지 않음.

@@ -1797,8 +1797,206 @@ function _pe_countQMarks(normalized: string, offset: number): number {
   for (let i = 0; i < end; i++) if (normalized[i] === '?') c++;
   return c;
 }
+// 테넌트 컬럼 재할당(SET user_id = ?) 검사
+function _pe_topLevelWords(text: string): Array<{ word: string; start: number; end: number }> {
+  const words: Array<{ word: string; start: number; end: number }> = [];
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const close = ch === '[' ? ']' : ch;
+      i++;
+      while (i < text.length) {
+        if (text[i] === close) {
+          if (ch !== '[' && text[i + 1] === close) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') { if (depth > 0) depth--; continue; }
+    if (depth !== 0 || !/[A-Za-z_]/.test(ch)) continue;
+    let j = i;
+    while (j < text.length && /[A-Za-z0-9_]/.test(text[j])) j++;
+    words.push({ word: text.slice(i, j).toUpperCase(), start: i, end: j });
+    i = j - 1;
+  }
+  return words;
+}
+function _pe_topLevelChar(text: string, target: string): number {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const close = ch === '[' ? ']' : ch;
+      i++;
+      while (i < text.length) {
+        if (text[i] === close) {
+          if (ch !== '[' && text[i + 1] === close) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') { if (depth > 0) depth--; continue; }
+    if (depth === 0 && ch === target) return i;
+  }
+  return -1;
+}
+function _pe_countPlaceholders(text: string, offset: number): number {
+  let count = 0;
+  for (let i = 0; i < offset && i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const close = ch === '[' ? ']' : ch;
+      i++;
+      while (i < text.length) {
+        if (text[i] === close) {
+          if (ch !== '[' && text[i + 1] === close) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '?') count++;
+  }
+  return count;
+}
+function _pe_detectTenantColumnReassign(normalized: string, upper: string, op: string | null, ref: any, tenantCol: string, expected: any, params: unknown[]): string | null {
+  if (op !== 'UPDATE' && op !== 'INSERT') return null;
+  const { index } = _detectOuterOp(upper);
+  const base = index >= 0 ? index : 0;
+  const stmt = normalized.slice(base);
+  const words = _pe_topLevelWords(stmt);
+
+  let setIdx = -1;
+  if (op === 'UPDATE') {
+    setIdx = words.findIndex((w) => w.word === 'SET');
+  } else {
+    const du = words.findIndex((w, i) => w.word === 'DO' && words[i + 1] && words[i + 1].word === 'UPDATE');
+    if (du >= 0) setIdx = words.findIndex((w, i) => i > du && w.word === 'SET');
+  }
+  if (setIdx < 0 || !words[setIdx]) return null;
+
+  const start = words[setIdx].end;
+  const stops = new Set<string>(op === 'UPDATE'
+    ? ['WHERE', 'FROM', 'RETURNING', 'ORDER', 'LIMIT']
+    : ['WHERE', 'RETURNING', 'ORDER', 'LIMIT']);
+  let end = stmt.length;
+  for (let k = setIdx + 1; k < words.length; k++) {
+    if (stops.has(words[k].word)) { end = words[k].start; break; }
+  }
+
+  const clause = stmt.slice(start, end);
+  const clauseOffset = base + start;
+  const segs: Array<{ start: number; end: number }> = [];
+  let depth = 0;
+  let segStart = 0;
+  for (let i = 0; i < clause.length; i++) {
+    const ch = clause[i];
+    if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const close = ch === '[' ? ']' : ch;
+      i++;
+      while (i < clause.length) {
+        if (clause[i] === close) {
+          if (ch !== '[' && clause[i + 1] === close) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') { if (depth > 0) depth--; }
+    else if (ch === ',' && depth === 0) {
+      segs.push({ start: segStart, end: i });
+      segStart = i + 1;
+    }
+  }
+  segs.push({ start: segStart, end: clause.length });
+
+  const t = String(tenantCol || '').toLowerCase();
+  const targetNames = new Set(
+    [String(ref.name || '').toLowerCase(), String(ref.alias || '').toLowerCase()].filter(Boolean)
+  );
+
+  for (const seg of segs) {
+    const text = clause.slice(seg.start, seg.end);
+    const eq = _pe_topLevelChar(text, '=');
+    if (eq < 0) continue;
+    const lhs = text.slice(0, eq).trim();
+    const col = lhs.split('.').pop()!.trim().replace(/^["'`\[]|["'`\]]$/g, '').toLowerCase();
+    if (col !== t) continue;
+
+    let rhs = text.slice(eq + 1).trim();
+    for (;;) {
+      if (!rhs.startsWith('(') || !rhs.endsWith(')')) break;
+      let d = 0;
+      let balanced = true;
+      for (let i = 0; i < rhs.length; i++) {
+        if (rhs[i] === '(') d++;
+        else if (rhs[i] === ')') {
+          d--;
+          if (d === 0 && i !== rhs.length - 1) { balanced = false; break; }
+        }
+      }
+      if (!balanced || d !== 0) break;
+      rhs = rhs.slice(1, -1).trim();
+    }
+    const rhsLower = rhs.replace(/\s+/g, ' ').toLowerCase();
+
+    if (rhsLower === t) continue;
+    let safe = false;
+    for (const nm of targetNames) {
+      if (rhsLower === nm + '.' + t) { safe = true; break; }
+    }
+    if (safe) continue;
+    if (rhsLower === 'excluded.' + t) continue;
+    if (rhsLower === '?') {
+      const qRel = text.slice(eq + 1).indexOf('?');
+      if (qRel >= 0) {
+        const qAbs = clauseOffset + seg.start + eq + 1 + qRel;
+        const pi = _pe_countPlaceholders(normalized, qAbs);
+        if (String(params[pi]) === String(expected)) continue;
+      }
+    }
+    return 'TENANT_COLUMN_REASSIGN';
+  }
+  return null;
+}
+
+// 테넌트 테이블 upsert 위험 감지
+//  - REPLACE / INSERT OR REPLACE: 충돌하는 타 테넌트 행을 삭제할 수 있음
+//  - ON CONFLICT ... DO UPDATE: conflict target 에 테넌트 컬럼이 없으면 타 테넌트 행 갱신 가능
+function _pe_detectUnsafeUpsert(normalized: string, tenantCol: string): string | null {
+  const { index } = _detectOuterOp(normalized.toUpperCase());
+  const stmt = index >= 0 ? normalized.slice(index) : normalized;
+  const stmtUp = stmt.toUpperCase();
+  if (/^\s*REPLACE\b/.test(stmtUp)) return 'REPLACE';
+  if (/^\s*INSERT\s+OR\s+REPLACE\b/.test(stmtUp)) return 'INSERT_OR_REPLACE';
+  // UPDATE OR REPLACE 는 unique 충돌 시 다른 테넌트 행을 삭제할 수 있다.
+  if (/^\s*UPDATE\s+OR\s+REPLACE\b/.test(stmtUp)) return 'UPDATE_OR_REPLACE';
+  const oc = stmtUp.indexOf('ON CONFLICT');
+  if (oc < 0) return null;
+  const doUpd = stmtUp.indexOf('DO UPDATE', oc);
+  if (doUpd < 0) return null;
+  const target = stmt.slice(oc + 'ON CONFLICT'.length, doUpd);
+  const m = /^\s*\(([^)]*)\)/.exec(target);
+  if (!m) return 'UPSERT_NO_TARGET';
+  const cols = m[1]
+    .split(',')
+    .map((c) => c.trim().replace(/^["'`\[]|["'`\]]$/g, '').toLowerCase())
+    .filter(Boolean);
+  if (!cols.includes(String(tenantCol || '').toLowerCase())) return 'UPSERT_TENANT_NOT_IN_TARGET';
+  return null;
+}
 function _pe_extractInsertCols(normalized: string): { cols: string[] } | null {
-  const re = /\bINSERT\s+INTO\s+(?:["`]?[\w]+["`]?(?:\.[\w]+)?)\s*\(([^)]*)\)\s*VALUES\s*\(/i;
+  const re = /\bINSERT\s+(?:OR\s+(?:REPLACE|ROLLBACK|ABORT|FAIL|IGNORE)\s+)?INTO\s+(?:["`]?[\w]+["`]?(?:\.[\w]+)?)\s*\(([^)]*)\)\s*VALUES\s*\(/i;
   const m = re.exec(normalized);
   if (!m) return null;
   const cols = m[1].split(',').map((s) => s.trim().replace(/^["`]|["`]$/g, ''));
@@ -1862,7 +2060,25 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
       return { ok: false, code: 'TENANT_MISSING', reason: '테넌트 클레임 "' + claim + '" 가 세션에 없습니다.', table: ref.name };
     }
     if (op === 'INSERT') {
+      const unsafeUpsert = _pe_detectUnsafeUpsert(normalized, tenantCol);
+      if (unsafeUpsert) {
+        return {
+          ok: false,
+          code: 'UPSERT_TENANT_RISK',
+          reason: '테넌트 테이블 ' + ref.name + ' 에 대한 위험한 upsert 입니다(' + unsafeUpsert + '). ON CONFLICT 대상에 "' + tenantCol + '" 를 포함하거나 REPLACE 대신 INSERT OR IGNORE 를 사용하세요.',
+          table: ref.name,
+        };
+      }
       if (ref.keyword === 'INTO') {
+        const reassign = _pe_detectTenantColumnReassign(normalized, upper, op, ref, tenantCol, expected, params);
+        if (reassign) {
+          return {
+            ok: false,
+            code: reassign,
+            reason: '테넌트 테이블 ' + ref.name + ' 의 테넌트 컬럼 "' + tenantCol + '" 를 다른 값으로 변경할 수 없습니다.',
+            table: ref.name,
+          };
+        }
         const ci = _pe_extractInsertCols(normalized);
         if (!ci) return { ok: false, code: 'INSERT_NO_COLUMNS', reason: 'INSERT 문에 컬럼 리스트가 없습니다.', table: ref.name };
         const idx = ci.cols.findIndex((c: string) => c.toLowerCase() === tenantCol.toLowerCase());
@@ -1874,6 +2090,26 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
         return { ok: false, code: 'UNSUPPORTED_INSERT_SUBQUERY', reason: 'INSERT ... SELECT 형태는 아직 지원하지 않습니다.', table: ref.name };
       }
     } else {
+      if (op === 'UPDATE' && ref.keyword === 'UPDATE') {
+        const unsafeUpsert = _pe_detectUnsafeUpsert(normalized, tenantCol);
+        if (unsafeUpsert) {
+          return {
+            ok: false,
+            code: 'UPSERT_TENANT_RISK',
+            reason: '테넌트 테이블 ' + ref.name + ' 에 대한 위험한 UPDATE 입니다(' + unsafeUpsert + ').',
+            table: ref.name,
+          };
+        }
+        const reassign = _pe_detectTenantColumnReassign(normalized, upper, op, ref, tenantCol, expected, params);
+        if (reassign) {
+          return {
+            ok: false,
+            code: reassign,
+            reason: '테넌트 테이블 ' + ref.name + ' 의 테넌트 컬럼 "' + tenantCol + '" 를 다른 값으로 변경할 수 없습니다.',
+            table: ref.name,
+          };
+        }
+      }
       const where = _pe_extractWhere(normalized);
       if (!where) return { ok: false, code: 'NO_WHERE', reason: op + ' 문에 WHERE 절이 없어 ' + ref.name + '.' + tenantCol + ' 조건을 확인할 수 없습니다.', table: ref.name };
       if (_pe_hasTopLevelOr(where.text)) return { ok: false, code: 'LOOSE_OR', reason: 'WHERE 최상단에 OR 가 있어 테넌트 필터가 느슨합니다.', table: ref.name };

@@ -269,3 +269,57 @@ test('워커 템플릿: 콤마 조인 보호 테이블 우회 차단 (C4)', asyn
     assert.match(inj.sql, /posts\.user_id = \?/);
     assert.match(inj.sql, /users\.user_id = \?/);
 });
+
+
+test('워커 템플릿: 테넌트 테이블의 위험한 upsert 차단', () => {
+    const p = {
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    };
+    const ctx = { user_id: 'u1' };
+    const base = 'INSERT INTO posts (id,user_id,title) VALUES (?,?,?)';
+    const params = ['victim-post', 'u1', 'x'];
+
+    assert.equal(worker.verifyTenantPolicy(base, params, ctx, p).ok, true);
+    assert.equal(worker.verifyTenantPolicy(base + ' ON CONFLICT DO NOTHING', params, ctx, p).ok, true);
+    assert.equal(worker.verifyTenantPolicy(base + ' ON CONFLICT(id,user_id) DO UPDATE SET title=excluded.title', params, ctx, p).ok, true);
+    assert.equal(worker.verifyTenantPolicy('INSERT OR IGNORE INTO posts (id,user_id,title) VALUES (?,?,?)', params, ctx, p).ok, true);
+
+    for (const sql of [
+        base + ' ON CONFLICT(id) DO UPDATE SET title=excluded.title',
+        base + ' ON CONFLICT DO UPDATE SET title=excluded.title',
+        'INSERT OR REPLACE INTO posts (id,user_id,title) VALUES (?,?,?)',
+        'REPLACE INTO posts (id,user_id,title) VALUES (?,?,?)',
+        'UPDATE OR REPLACE posts SET title = ? WHERE posts.user_id = ?',
+    ]) {
+        const r = worker.verifyTenantPolicy(sql, params, ctx, p);
+        assert.equal(r.ok, false, sql);
+        assert.equal(r.code, 'UPSERT_TENANT_RISK', sql);
+    }
+});
+
+
+test('워커 템플릿: 테넌트 컬럼 재할당(SET user_id) 차단', () => {
+    const p = {
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    };
+    const ctx = { user_id: 'u1' };
+
+    assert.equal(worker.verifyTenantPolicy('UPDATE posts SET title = ? WHERE posts.user_id = ?', ['x', 'u1'], ctx, p).ok, true);
+    assert.equal(worker.verifyTenantPolicy('UPDATE posts SET user_id = ? WHERE posts.user_id = ?', ['u1', 'u1'], ctx, p).ok, true);
+    assert.equal(worker.verifyTenantPolicy('UPDATE posts SET user_id = posts.user_id WHERE posts.user_id = ?', ['u1'], ctx, p).ok, true);
+
+    for (const [sql, params] of [
+        ['UPDATE posts SET user_id = ? WHERE posts.user_id = ?', ['victim', 'u1']],
+        ['UPDATE posts SET "user_id" = ? WHERE posts.user_id = ?', ['victim', 'u1']],
+        ['UPDATE posts SET posts.user_id = ? WHERE posts.user_id = ?', ['victim', 'u1']],
+        ["UPDATE posts SET user_id = 'victim' WHERE posts.user_id = ?", ['u1']],
+        ['UPDATE posts SET title = ?, user_id = ? WHERE posts.user_id = ?', ['x', 'victim', 'u1']],
+        ['UPDATE posts SET user_id = (SELECT user_id FROM posts WHERE id = ?) WHERE posts.user_id = ?', ['victim', 'u1']],
+    ]) {
+        const r = worker.verifyTenantPolicy(sql, params, ctx, p);
+        assert.equal(r.ok, false, sql);
+        assert.equal(r.code, 'TENANT_COLUMN_REASSIGN', sql);
+    }
+});

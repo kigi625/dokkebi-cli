@@ -389,7 +389,7 @@ export function countQMarksBefore(normalized, offset) {
  */
 export function extractInsertColumns(normalized) {
     // INSERT INTO tbl (c1, c2) VALUES (?, ?)
-    const re = /\bINSERT\s+INTO\s+(?:["`]?[\w]+["`]?(?:\.[\w]+)?)\s*\(([^)]*)\)\s*VALUES\s*\(/i;
+    const re = /\bINSERT\s+(?:OR\s+(?:REPLACE|ROLLBACK|ABORT|FAIL|IGNORE)\s+)?INTO\s+(?:["`]?[\w]+["`]?(?:\.[\w]+)?)\s*\(([^)]*)\)\s*VALUES\s*\(/i;
     const m = re.exec(normalized);
     if (!m) return null;
     const raw = m[1];
@@ -461,6 +461,236 @@ export function _resolveTenantClaim(tenantContext, tableClaim, globalClaim, tena
 // verifyTenantPolicy (Stage 1)
 // ─────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────
+// 테넌트 컬럼 재할당(SET user_id = ?) 검사
+//   UPDATE/upsert 의 SET 절에서 테넌트 컬럼을 다른 값으로 바꾸면
+//   행이 다른 테넌트로 이동해 격리가 깨진다.
+// ─────────────────────────────────────────────────────────────
+
+/** 따옴표/괄호를 건너뛰고 depth 0 의 단어 위치를 수집 */
+function _topLevelWords(text) {
+    const words = [];
+    let depth = 0;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+            const close = ch === '[' ? ']' : ch;
+            i++;
+            while (i < text.length) {
+                if (text[i] === close) {
+                    if (ch !== '[' && text[i + 1] === close) { i += 2; continue; }
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '(') { depth++; continue; }
+        if (ch === ')') { if (depth > 0) depth--; continue; }
+        if (depth !== 0 || !/[A-Za-z_]/.test(ch)) continue;
+        let j = i;
+        while (j < text.length && /[A-Za-z0-9_]/.test(text[j])) j++;
+        words.push({ word: text.slice(i, j).toUpperCase(), start: i, end: j });
+        i = j - 1;
+    }
+    return words;
+}
+
+/** depth 0 의 특정 문자 위치 (없으면 -1) */
+function _topLevelChar(text, target) {
+    let depth = 0;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+            const close = ch === '[' ? ']' : ch;
+            i++;
+            while (i < text.length) {
+                if (text[i] === close) {
+                    if (ch !== '[' && text[i + 1] === close) { i += 2; continue; }
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '(') { depth++; continue; }
+        if (ch === ')') { if (depth > 0) depth--; continue; }
+        if (depth === 0 && ch === target) return i;
+    }
+    return -1;
+}
+
+/** offset 이전의 실제 placeholder(?) 개수 — 따옴표 안의 ? 는 제외 */
+function _countPlaceholders(text, offset) {
+    let count = 0;
+    for (let i = 0; i < offset && i < text.length; i++) {
+        const ch = text[i];
+        if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+            const close = ch === '[' ? ']' : ch;
+            i++;
+            while (i < text.length) {
+                if (text[i] === close) {
+                    if (ch !== '[' && text[i + 1] === close) { i += 2; continue; }
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '?') count++;
+    }
+    return count;
+}
+
+/**
+ * UPDATE 또는 INSERT ... ON CONFLICT DO UPDATE 의 SET 절에서
+ * 테넌트 컬럼을 안전하지 않은 값으로 재할당하는지 검사한다.
+ * 안전한 형태: self 참조, 대상 테이블/별칭 한정 self 참조,
+ * `excluded.<tenant>`, 그리고 세션 테넌트와 같은 `?`.
+ *
+ * @returns {string|null} 위반 코드
+ */
+function detectTenantColumnReassign(normalized, upper, op, ref, tenantCol, expected, params) {
+    if (op !== 'UPDATE' && op !== 'INSERT') return null;
+    const { index } = detectOuterOp(upper);
+    const base = index >= 0 ? index : 0;
+    const stmt = normalized.slice(base);
+    const words = _topLevelWords(stmt);
+
+    let setIdx = -1;
+    if (op === 'UPDATE') {
+        setIdx = words.findIndex((w) => w.word === 'SET');
+    } else {
+        const du = words.findIndex((w, i) => w.word === 'DO' && words[i + 1] && words[i + 1].word === 'UPDATE');
+        if (du >= 0) setIdx = words.findIndex((w, i) => i > du && w.word === 'SET');
+    }
+    if (setIdx < 0 || !words[setIdx]) return null;
+
+    const start = words[setIdx].end;
+    const stops = new Set(op === 'UPDATE'
+        ? ['WHERE', 'FROM', 'RETURNING', 'ORDER', 'LIMIT']
+        : ['WHERE', 'RETURNING', 'ORDER', 'LIMIT']);
+    let end = stmt.length;
+    for (let k = setIdx + 1; k < words.length; k++) {
+        if (stops.has(words[k].word)) { end = words[k].start; break; }
+    }
+
+    const clause = stmt.slice(start, end);
+    const clauseOffset = base + start;
+    const segs = [];
+    let depth = 0;
+    let segStart = 0;
+    for (let i = 0; i < clause.length; i++) {
+        const ch = clause[i];
+        if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+            const close = ch === '[' ? ']' : ch;
+            i++;
+            while (i < clause.length) {
+                if (clause[i] === close) {
+                    if (ch !== '[' && clause[i + 1] === close) { i += 2; continue; }
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '(') depth++;
+        else if (ch === ')') { if (depth > 0) depth--; }
+        else if (ch === ',' && depth === 0) {
+            segs.push({ start: segStart, end: i });
+            segStart = i + 1;
+        }
+    }
+    segs.push({ start: segStart, end: clause.length });
+
+    const t = String(tenantCol || '').toLowerCase();
+    const targetNames = new Set(
+        [String(ref.name || '').toLowerCase(), String(ref.alias || '').toLowerCase()].filter(Boolean)
+    );
+
+    for (const seg of segs) {
+        const text = clause.slice(seg.start, seg.end);
+        const eq = _topLevelChar(text, '=');
+        if (eq < 0) continue;
+        const lhs = text.slice(0, eq).trim();
+        const col = lhs.split('.').pop().trim().replace(/^["'`\[]|["'`\]]$/g, '').toLowerCase();
+        if (col !== t) continue;
+
+        let rhs = text.slice(eq + 1).trim();
+        // 불필요한 바깥 괄호 제거
+        for (;;) {
+            if (!rhs.startsWith('(') || !rhs.endsWith(')')) break;
+            let d = 0;
+            let balanced = true;
+            for (let i = 0; i < rhs.length; i++) {
+                if (rhs[i] === '(') d++;
+                else if (rhs[i] === ')') {
+                    d--;
+                    if (d === 0 && i !== rhs.length - 1) { balanced = false; break; }
+                }
+            }
+            if (!balanced || d !== 0) break;
+            rhs = rhs.slice(1, -1).trim();
+        }
+        const rhsLower = rhs.replace(/\s+/g, ' ').toLowerCase();
+
+        if (rhsLower === t) continue; // 자기 참조
+        let safe = false;
+        for (const nm of targetNames) {
+            if (rhsLower === nm + '.' + t) { safe = true; break; }
+        }
+        if (safe) continue;
+        if (rhsLower === 'excluded.' + t) continue; // 삽입값(이미 검증됨)
+        if (rhsLower === '?') {
+            const qRel = text.slice(eq + 1).indexOf('?');
+            if (qRel >= 0) {
+                const qAbs = clauseOffset + seg.start + eq + 1 + qRel;
+                const pi = _countPlaceholders(normalized, qAbs);
+                if (String(params[pi]) === String(expected)) continue;
+            }
+        }
+        return 'TENANT_COLUMN_REASSIGN';
+    }
+    return null;
+}
+
+/**
+ * 테넌트 테이블에 대한 위험한 upsert 형태를 감지한다.
+ *
+ * - `INSERT OR REPLACE` / `REPLACE INTO`: 충돌하는 다른 테넌트 행을 삭제하고
+ *   새 행을 넣으므로, 삽입 값의 테넌트가 일치해도 타 테넌트 행을 탈취할 수 있다.
+ * - `ON CONFLICT ... DO UPDATE`: 충돌 대상(conflict target)에 테넌트 컬럼이
+ *   없으면 다른 테넌트의 기존 행을 갱신할 수 있다.
+ *
+ * @returns {string|null} 위험 사유 코드 (안전하면 null)
+ */
+function detectUnsafeTenantUpsert(normalized, tenantCol) {
+    const upper = String(normalized || '').toUpperCase();
+    const { index } = detectOuterOp(upper);
+    const stmt = index >= 0 ? normalized.slice(index) : normalized;
+    const stmtUp = stmt.toUpperCase();
+
+    if (/^\s*REPLACE\b/.test(stmtUp)) return 'REPLACE';
+    if (/^\s*INSERT\s+OR\s+REPLACE\b/.test(stmtUp)) return 'INSERT_OR_REPLACE';
+    // UPDATE OR REPLACE 는 unique 충돌 시 다른 테넌트 행을 삭제할 수 있다.
+    if (/^\s*UPDATE\s+OR\s+REPLACE\b/.test(stmtUp)) return 'UPDATE_OR_REPLACE';
+
+    const oc = stmtUp.indexOf('ON CONFLICT');
+    if (oc < 0) return null;
+    const doUpd = stmtUp.indexOf('DO UPDATE', oc);
+    if (doUpd < 0) return null; // DO NOTHING 등 쓰기 없는 동작
+
+    const target = stmt.slice(oc + 'ON CONFLICT'.length, doUpd);
+    const m = /^\s*\(([^)]*)\)/.exec(target);
+    if (!m) return 'UPSERT_NO_TARGET';
+    const cols = m[1]
+        .split(',')
+        .map((c) => c.trim().replace(/^["'`\[]|["'`\]]$/g, '').toLowerCase())
+        .filter(Boolean);
+    if (!cols.includes(String(tenantCol || '').toLowerCase())) return 'UPSERT_TENANT_NOT_IN_TARGET';
+    return null;
+}
+
 /**
  * SQL 이 테넌트 정책을 준수하는지 검증.
  *
@@ -527,8 +757,27 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
         }
 
         if (op === 'INSERT') {
+            const unsafeUpsert = detectUnsafeTenantUpsert(normalized, tenantCol);
+            if (unsafeUpsert) {
+                return {
+                    ok: false,
+                    code: 'UPSERT_TENANT_RISK',
+                    reason: '테넌트 테이블 ' + ref.name + ' 에 대한 위험한 upsert 입니다(' + unsafeUpsert + '). '
+                        + 'ON CONFLICT 대상에 "' + tenantCol + '" 를 포함하거나, REPLACE 대신 INSERT OR IGNORE 를 사용하세요.',
+                    table: ref.name,
+                };
+            }
             // INSERT 의 주 대상 테이블 (INTO) 에만 컬럼 리스트 검사 적용
             if (ref.keyword === 'INTO') {
+                const reassign = detectTenantColumnReassign(normalized, upper, op, ref, tenantCol, expected, params);
+                if (reassign) {
+                    return {
+                        ok: false,
+                        code: reassign,
+                        reason: '테넌트 테이블 ' + ref.name + ' 의 테넌트 컬럼 "' + tenantCol + '" 를 다른 값으로 변경할 수 없습니다.',
+                        table: ref.name,
+                    };
+                }
                 const ci = extractInsertColumns(normalized);
                 if (!ci) {
                     return {
@@ -568,6 +817,26 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
             }
         } else {
             // SELECT / UPDATE / DELETE
+            if (op === 'UPDATE' && ref.keyword === 'UPDATE') {
+                const unsafeUpsert = detectUnsafeTenantUpsert(normalized, tenantCol);
+                if (unsafeUpsert) {
+                    return {
+                        ok: false,
+                        code: 'UPSERT_TENANT_RISK',
+                        reason: '테넌트 테이블 ' + ref.name + ' 에 대한 위험한 UPDATE 입니다(' + unsafeUpsert + ').',
+                        table: ref.name,
+                    };
+                }
+                const reassign = detectTenantColumnReassign(normalized, upper, op, ref, tenantCol, expected, params);
+                if (reassign) {
+                    return {
+                        ok: false,
+                        code: reassign,
+                        reason: '테넌트 테이블 ' + ref.name + ' 의 테넌트 컬럼 "' + tenantCol + '" 를 다른 값으로 변경할 수 없습니다.',
+                        table: ref.name,
+                    };
+                }
+            }
             const where = extractWhereClause(normalized);
             if (!where) {
                 return {
