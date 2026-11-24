@@ -403,6 +403,36 @@ test('워커 템플릿: UNION/INTERSECT/EXCEPT 브랜치별 테넌트 필터 검
     assert.equal(nested.code, 'COMPOUND_SELECT_UNSUPPORTED');
 });
 
+test('워커 템플릿: 중첩 서브쿼리도 자체 테넌트 필터를 요구', () => {
+    const p = {
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    };
+    const ctx = { user_id: 'u1' };
+
+    for (const [sql, params] of [
+        ['SELECT * FROM posts WHERE posts.user_id = ? AND id IN (SELECT id FROM posts)', ['u1']],
+        ['SELECT * FROM posts WHERE posts.user_id = ? AND (SELECT COUNT(*) FROM posts) > 0', ['u1']],
+        ['SELECT * FROM posts WHERE posts.user_id = ? AND EXISTS (SELECT 1 FROM posts WHERE title LIKE ?)', ['u1', 'secret%']],
+        ['SELECT (SELECT group_concat(title) FROM posts) FROM posts WHERE user_id = ?', ['u1']],
+        ['WITH x AS (SELECT * FROM posts) SELECT * FROM x WHERE user_id = ?', ['u1']],
+        ['SELECT * FROM (SELECT * FROM posts) p WHERE p.user_id = ?', ['u1']],
+    ]) {
+        const r = worker.verifyTenantPolicy(sql, params, ctx, p);
+        assert.equal(r.ok, false, sql);
+        assert.ok(r.code === 'NO_WHERE' || r.code === 'NO_TENANT_FILTER', sql + ' → ' + r.code);
+    }
+
+    for (const [sql, params] of [
+        ['SELECT * FROM posts WHERE posts.user_id = ? AND id IN (SELECT id FROM posts WHERE posts.user_id = ?)', ['u1', 'u1']],
+        ['SELECT (SELECT group_concat(title) FROM posts WHERE posts.user_id = ?) FROM posts WHERE posts.user_id = ?', ['u1', 'u1']],
+        ['WITH x AS (SELECT * FROM posts WHERE posts.user_id = ?) SELECT * FROM x WHERE user_id = ?', ['u1', 'u1']],
+        ['SELECT * FROM (SELECT * FROM posts WHERE posts.user_id = ?) p', ['u1']],
+    ]) {
+        assert.equal(worker.verifyTenantPolicy(sql, params, ctx, p).ok, true, sql);
+    }
+});
+
 test('워커 템플릿: 위치 기반 외 파라미터(?2/:name) 거부', () => {
     const p = {
         enabled: true, mode: 'verify', strict: true, claim: 'user_id',

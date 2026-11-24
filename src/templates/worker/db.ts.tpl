@@ -2190,6 +2190,97 @@ function _pe_resolveClaim(tenantContext: any, tableClaim: string | undefined, gl
   }
   return [candidates[0], undefined];
 }
+
+// ── 중첩 서브쿼리 범위 탐지 ──────────────────────────────────
+// 바깥 WHERE 조건이 내부 SELECT 의 행 필터로 오인되지 않도록,
+// parentheses 안의 SELECT/WITH 를 찾아 재귀 검증한다.
+const _PE_MAX_SUBQUERY_DEPTH = 16;
+function _pe_skipWsAndCommentsAt(s: string, i: number, limit: number): number {
+  let k = i;
+  while (k < limit) {
+    const ch = s[k];
+    if (/\s/.test(ch)) { k++; continue; }
+    if (ch === '-' && s[k + 1] === '-') {
+      k += 2;
+      while (k < limit && s[k] !== '\n') k++;
+      continue;
+    }
+    if (ch === '/' && s[k + 1] === '*') {
+      k += 2;
+      while (k < limit && !(s[k] === '*' && s[k + 1] === '/')) k++;
+      k = Math.min(limit, k + 2);
+      continue;
+    }
+    break;
+  }
+  return k;
+}
+function _pe_findTopLevelSubqueryRanges(normalized: string): any[] {
+  const s = String(normalized || '');
+  const n = s.length;
+  const stack: number[] = [];
+  const parens: any[] = [];
+  let i = 0;
+  while (i < n) {
+    const ch = s[i];
+    const nx = s[i + 1];
+    if (ch === '-' && nx === '-') {
+      i += 2;
+      while (i < n && s[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '/' && nx === '*') {
+      i += 2;
+      while (i < n && !(s[i] === '*' && s[i + 1] === '/')) i++;
+      i = Math.min(n, i + 2);
+      continue;
+    }
+    if (ch === "'") {
+      i++;
+      while (i < n) {
+        if (s[i] === "'" && s[i + 1] === "'") { i += 2; continue; }
+        if (s[i] === "'") { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === '`' || ch === '[') {
+      const q = ch === '[' ? ']' : ch;
+      i++;
+      while (i < n) {
+        if (s[i] === q) {
+          if (q !== ']' && s[i + 1] === q) { i += 2; continue; }
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '(') { stack.push(i); i++; continue; }
+    if (ch === ')') {
+      const open = stack.pop();
+      if (open !== undefined) {
+        const contentStart = _pe_skipWsAndCommentsAt(s, open + 1, i);
+        const m = /^[A-Za-z_]+/.exec(s.slice(contentStart, i));
+        const firstWord = m ? m[0].toUpperCase() : '';
+        parens.push({ open, close: i, contentStart, firstWord });
+      }
+      i++;
+      continue;
+    }
+    i++;
+  }
+  const subs = parens.filter((p) => p.firstWord === 'SELECT' || p.firstWord === 'WITH');
+  return subs.filter((p) => !subs.some((q) => q !== p && q.open < p.open && q.close > p.close));
+}
+function _pe_offsetInSubquery(offset: number, ranges: any[]): boolean {
+  for (const r of ranges) {
+    if (offset > r.open && offset < r.close) return true;
+  }
+  return false;
+}
+
 function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, policy: any, opts: any = {}): any {
   if (!policy || !policy.tables || Object.keys(policy.tables).length === 0) return { ok: true };
   const strict = opts.strict ?? (policy.strict !== false);
@@ -2204,7 +2295,12 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
   if (!op) return strict ? { ok: false, code: 'UNPARSEABLE', reason: 'SQL 연산을 파싱할 수 없습니다.' } : { ok: true };
   if (op === 'CREATE') return { ok: true };
   const refs = _pe_extractTableRefs(normalized);
-  const requireQualified = refs.length > 1;
+  // 서브쿼리 안의 테이블은 바깥 WHERE 로 검증할 수 없다 — 별도 재귀 검증.
+  const nestedRanges = _pe_findTopLevelSubqueryRanges(normalized);
+  const outerRefs = nestedRanges.length
+    ? refs.filter((ref: any) => !_pe_offsetInSubquery(ref.offset, nestedRanges))
+    : refs;
+  const requireQualified = outerRefs.length > 1;
 
   // 복합 SELECT 는 브랜치별로 테넌트 WHERE 를 검증한다.
   const tenantActive = refs.some((ref: any) => {
@@ -2236,7 +2332,7 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
     }
   }
 
-  for (const ref of refs) {
+  for (const ref of outerRefs) {
     const tp = _pe_findTablePolicy(policy.tables, ref.name);
     if (!tp) continue;
     const mode = tp.mode;
@@ -2314,6 +2410,33 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
       }
     }
   }
+  // ── 중첩 서브쿼리 재귀 검증 ────────────────────────────────
+  if (nestedRanges.length > 0) {
+    const curDepth = Number(opts._subqueryDepth || 0);
+    if (curDepth >= _PE_MAX_SUBQUERY_DEPTH) {
+      return {
+        ok: false,
+        code: 'SUBQUERY_TOO_DEEP',
+        reason: '서브쿼리 중첩이 너무 깊어 테넌트 격리를 검증할 수 없습니다.',
+      };
+    }
+    for (const range of nestedRanges) {
+      const inner = normalized.slice(range.contentStart, range.close);
+      const before = _pe_countQMarksRaw(normalized, range.contentStart);
+      const inside = _pe_countQMarksRaw(normalized, range.close) - before;
+      const r = verifyTenantPolicy(
+        inner,
+        params.slice(before, before + inside),
+        tenantContext,
+        policy,
+        { ...opts, _subqueryDepth: curDepth + 1 },
+      );
+      if (!r.ok) {
+        return { ...r, reason: '서브쿼리: ' + (r.reason || '') };
+      }
+    }
+  }
+
   return { ok: true };
 }
 function _pe_injectInsert(sql: string, params: unknown[], _ref: any, tenantCol: string, expected: any): any {

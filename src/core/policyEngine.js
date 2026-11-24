@@ -493,6 +493,105 @@ export function _resolveTenantClaim(tenantContext, tableClaim, globalClaim, tena
 // ─────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────
+
+// ── 서브쿼리 범위 탐지 ───────────────────────────────────────
+// 바깥 WHERE 조건이 내부 SELECT 의 행 필터로 오인되지 않도록,
+// parentheses 안의 SELECT/WITH 를 찾아 재귀 검증한다.
+const _MAX_SUBQUERY_DEPTH = 16;
+
+function _skipWsAndCommentsAt(s, i, limit) {
+    let k = i;
+    while (k < limit) {
+        const ch = s[k];
+        if (/\s/.test(ch)) { k++; continue; }
+        if (ch === '-' && s[k + 1] === '-') {
+            k += 2;
+            while (k < limit && s[k] !== '\n') k++;
+            continue;
+        }
+        if (ch === '/' && s[k + 1] === '*') {
+            k += 2;
+            while (k < limit && !(s[k] === '*' && s[k + 1] === '/')) k++;
+            k = Math.min(limit, k + 2);
+            continue;
+        }
+        break;
+    }
+    return k;
+}
+
+function _findTopLevelSubqueryRanges(normalized) {
+    const s = String(normalized || '');
+    const n = s.length;
+    const stack = [];
+    const parens = [];
+    let i = 0;
+    while (i < n) {
+        const ch = s[i];
+        const nx = s[i + 1];
+        if (ch === '-' && nx === '-') {
+            i += 2;
+            while (i < n && s[i] !== '\n') i++;
+            continue;
+        }
+        if (ch === '/' && nx === '*') {
+            i += 2;
+            while (i < n && !(s[i] === '*' && s[i + 1] === '/')) i++;
+            i = Math.min(n, i + 2);
+            continue;
+        }
+        if (ch === "'") {
+            i++;
+            while (i < n) {
+                if (s[i] === "'" && s[i + 1] === "'") { i += 2; continue; }
+                if (s[i] === "'") { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '"' || ch === '`' || ch === '[') {
+            const q = ch === '[' ? ']' : ch;
+            i++;
+            while (i < n) {
+                if (s[i] === q) {
+                    if (q !== ']' && s[i + 1] === q) { i += 2; continue; }
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '(') {
+            stack.push(i);
+            i++;
+            continue;
+        }
+        if (ch === ')') {
+            const open = stack.pop();
+            if (open !== undefined) {
+                const contentStart = _skipWsAndCommentsAt(s, open + 1, i);
+                const m = /^[A-Za-z_]+/.exec(s.slice(contentStart, i));
+                const firstWord = m ? m[0].toUpperCase() : '';
+                parens.push({ open, close: i, contentStart, firstWord });
+            }
+            i++;
+            continue;
+        }
+        i++;
+    }
+    const subs = parens.filter((p) => p.firstWord === 'SELECT' || p.firstWord === 'WITH');
+    // 가장 바깥 서브쿼리만 반환 — 내부 중첩은 재귀에서 다시 찾는다.
+    return subs.filter((p) => !subs.some((q) => q !== p && q.open < p.open && q.close > p.close));
+}
+
+function _offsetInSubquery(offset, ranges) {
+    for (const r of ranges) {
+        if (offset > r.open && offset < r.close) return true;
+    }
+    return false;
+}
+
 // 테넌트 컬럼 재할당(SET user_id = ?) 검사
 //   UPDATE/upsert 의 SET 절에서 테넌트 컬럼을 다른 값으로 바꾸면
 //   행이 다른 테넌트로 이동해 격리가 깨진다.
@@ -846,7 +945,12 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
     if (op === 'CREATE') return { ok: true };
 
     const refs = extractTableRefs(normalized);
-    const requireQualified = refs.length > 1;
+    // 서브쿼리 안의 테이블은 바깥 WHERE 로 검증할 수 없다 — 별도 재귀 검증.
+    const nestedRanges = _findTopLevelSubqueryRanges(normalized);
+    const outerRefs = nestedRanges.length
+        ? refs.filter((ref) => !_offsetInSubquery(ref.offset, nestedRanges))
+        : refs;
+    const requireQualified = outerRefs.length > 1;
 
     // 복합 SELECT(UNION/INTERSECT/EXCEPT) 는 브랜치별로 WHERE 를 검증한다.
     // (첫 브랜치의 테넌트 조건이 다른 브랜치까지 통과시키는 우회 방지)
@@ -887,7 +991,7 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
         }
     }
 
-    for (const ref of refs) {
+    for (const ref of outerRefs) {
         const tp = findTablePolicy(policy.tables, ref.name);
         if (!tp) continue; // 선언 안 된 테이블은 스킵 (defaultMode='none' 과 동일)
         const mode = tp.mode;
@@ -1034,6 +1138,34 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
                     reason: ref.name + '.' + tenantCol + ' 값이 세션 테넌트와 일치하지 않습니다.',
                     table: ref.name,
                 };
+            }
+        }
+    }
+
+    // ── 중첩 서브쿼리 재귀 검증 ────────────────────────────────
+    // 스칼라 서브쿼리/IN/EXISTS 안에서 다른 테넌트 행을 읽는 우회를 차단한다.
+    if (nestedRanges.length > 0) {
+        const curDepth = Number(opts._subqueryDepth || 0);
+        if (curDepth >= _MAX_SUBQUERY_DEPTH) {
+            return {
+                ok: false,
+                code: 'SUBQUERY_TOO_DEEP',
+                reason: '서브쿼리 중첩이 너무 깊어 테넌트 격리를 검증할 수 없습니다.',
+            };
+        }
+        for (const range of nestedRanges) {
+            const inner = normalized.slice(range.contentStart, range.close);
+            const before = _countQMarksRaw(normalized, range.contentStart);
+            const inside = _countQMarksRaw(normalized, range.close) - before;
+            const r = verifyTenantPolicy(
+                inner,
+                params.slice(before, before + inside),
+                tenantContext,
+                policy,
+                { ...opts, _subqueryDepth: curDepth + 1 },
+            );
+            if (!r.ok) {
+                return { ...r, reason: '서브쿼리: ' + (r.reason || '') };
             }
         }
     }

@@ -570,6 +570,51 @@ test('verifyTenantPolicy: UNION/INTERSECT/EXCEPT 브랜치별 테넌트 필터 �
     assert.equal(nested.code, 'COMPOUND_SELECT_UNSUPPORTED');
 });
 
+test('verifyTenantPolicy: 중첩 서브쿼리도 자체 테넌트 필터를 요구', () => {
+    const policy = normalizePolicyConfig({
+        enabled: true,
+        mode: 'verify',
+        strict: true,
+        claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    });
+    const ctx = { user_id: 'u1' };
+
+    for (const [sql, params] of [
+        ['SELECT * FROM posts WHERE posts.user_id = ? AND id IN (SELECT id FROM posts)', ['u1']],
+        ['SELECT * FROM posts WHERE posts.user_id = ? AND (SELECT COUNT(*) FROM posts) > 0', ['u1']],
+        ['SELECT * FROM posts WHERE posts.user_id = ? AND EXISTS (SELECT 1 FROM posts WHERE title LIKE ?)', ['u1', 'secret%']],
+        ['SELECT (SELECT group_concat(title) FROM posts) FROM posts WHERE user_id = ?', ['u1']],
+        ['WITH x AS (SELECT * FROM posts) SELECT * FROM x WHERE user_id = ?', ['u1']],
+        ['SELECT * FROM (SELECT * FROM posts) p WHERE p.user_id = ?', ['u1']],
+    ]) {
+        const r = verifyTenantPolicy(sql, params, ctx, policy);
+        assert.equal(r.ok, false, sql);
+        assert.ok(r.code === 'NO_WHERE' || r.code === 'NO_TENANT_FILTER', sql + ' → ' + r.code);
+    }
+
+    for (const [sql, params] of [
+        ['SELECT * FROM posts WHERE posts.user_id = ? AND id IN (SELECT id FROM posts WHERE posts.user_id = ?)', ['u1', 'u1']],
+        ['SELECT (SELECT group_concat(title) FROM posts WHERE posts.user_id = ?) FROM posts WHERE posts.user_id = ?', ['u1', 'u1']],
+        ['WITH x AS (SELECT * FROM posts WHERE posts.user_id = ?) SELECT * FROM x WHERE user_id = ?', ['u1', 'u1']],
+        ['SELECT * FROM (SELECT * FROM posts WHERE posts.user_id = ?) p', ['u1']],
+    ]) {
+        assert.equal(verifyTenantPolicy(sql, params, ctx, policy).ok, true, sql);
+    }
+});
+
+test('injectTenantPolicy: 필터 없는 중첩 서브쿼리는 주입 후에도 실패 (fail closed)', () => {
+    const policy = normalizePolicyConfig({
+        enabled: true, mode: 'inject', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'inject' } },
+    });
+    const r = injectTenantPolicy(
+        'SELECT (SELECT group_concat(title) FROM posts) FROM posts WHERE posts.user_id = ?',
+        ['u1'], { user_id: 'u1' }, policy, { strict: true }
+    );
+    assert.equal(r.ok, false);
+});
+
 test('injectTenantPolicy: 복합 SELECT 는 브랜치별 주입을 보장하지 못하면 실패', () => {
     const policy = normalizePolicyConfig({
         enabled: true, mode: 'inject', strict: true, claim: 'user_id',
