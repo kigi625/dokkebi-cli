@@ -41,6 +41,10 @@ const AUTHZ = normalizeAuthorizationConfig({
         'SELECT:users': { roles: ['admin'] },
         'INSERT:posts': { auth: true },
         'INSERT:users': { roles: ['admin'] },
+        'UPDATE:posts': { roles: ['admin'] },
+        'DELETE:posts': { roles: ['admin'] },
+        'UPDATE:users': { roles: ['admin'] },
+        'DELETE:users': { roles: ['admin'] },
         '*': { deny: true },
     },
 });
@@ -120,6 +124,29 @@ test('워커 템플릿: Authorization 이 JOIN/INSERT..SELECT 의 보호 테이�
 
     // public 단일 테이블은 JWT 없이 허용
     assert.equal((await worker._az_checkSql('SELECT * FROM posts', req, {}, env)).ok, true);
+});
+
+test('워커 템플릿: upsert/REPLACE 는 부수 쓰기 권한까지 요구', async () => {
+    const req = { headers: new Headers() };
+    const env = { DOKKEBI_JWT_SECRET: JWT_SECRET };
+    const user = signJwt({ role: 'user', user_id: 'u1' });
+    const admin = signJwt({ role: 'admin', user_id: 'a1' });
+
+    const upsert = 'INSERT INTO posts (id,user_id,title) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET title=?';
+    assert.equal((await worker._az_checkSql(upsert, req, { _jwt: user }, env)).ok, false);
+    assert.equal((await worker._az_checkSql(upsert, req, { _jwt: admin }, env)).ok, true);
+
+    const doNothing = 'INSERT INTO posts (id,user_id,title) VALUES (?,?,?) ON CONFLICT(id) DO NOTHING';
+    assert.equal((await worker._az_checkSql(doNothing, req, { _jwt: user }, env)).ok, true);
+
+    for (const sql of [
+        'INSERT OR REPLACE INTO posts (id,user_id,title) VALUES (?,?,?)',
+        'REPLACE INTO posts (id,user_id,title) VALUES (?,?,?)',
+        'UPDATE OR REPLACE posts SET title=? WHERE id=?',
+    ]) {
+        assert.equal((await worker._az_checkSql(sql, req, { _jwt: user }, env)).ok, false, sql);
+        assert.equal((await worker._az_checkSql(sql, req, { _jwt: admin }, env)).ok, true, sql);
+    }
 });
 
 test('워커 템플릿: WITH-DML 을 SELECT 로 오판하지 않음 (C1)', async () => {

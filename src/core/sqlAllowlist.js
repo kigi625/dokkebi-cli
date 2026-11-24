@@ -13,7 +13,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { detectOuterOp, outerStatement, detectPrimaryTableOf, extractTableRefs, hasNonPositionalParameters } from './sqlShape.js';
+import { detectOuterOp, outerStatement, detectPrimaryTableOf, extractTableRefs, hasNonPositionalParameters , detectSecondaryWriteOps } from './sqlShape.js';
 
 // ─────────────────────────────────────────────────────────────
 // 내부 시스템 테이블 접근 차단
@@ -674,6 +674,15 @@ export function validateSqlAllowlist(sql, allowlist, opts = {}) {
                 allowed: false,
                 reason: `테이블 "${primaryTable}"에 대한 ${op} 연산이 허용되지 않습니다. (허용: ${entry?.ops.join(', ') || '(없음)'})`,
             };
+        }
+        // 부수 쓰기 효과 (upsert UPDATE / REPLACE DELETE) 도 allowlist 연산이 필요하다.
+        for (const secondaryOp of detectSecondaryWriteOps(normalized, op)) {
+            if (!entry.ops.includes(secondaryOp)) {
+                return {
+                    allowed: false,
+                    reason: `테이블 "${primaryTable}"에 대한 ${secondaryOp} 연산이 허용되지 않습니다. (허용: ${entry.ops.join(', ') || '(없음)'})`,
+                };
+            }
         }
     }
 

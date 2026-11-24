@@ -93,7 +93,8 @@ export function detectPrimaryTableOf(outerUpper, op) {
     const patterns = {
         SELECT: new RegExp('\\bFROM\\s+' + ident),
         INSERT: new RegExp('\\bINTO\\s+' + ident),
-        UPDATE: new RegExp('\\bUPDATE\\s+' + ident),
+        // `UPDATE OR REPLACE|ROLLBACK|ABORT|FAIL|IGNORE <table>` 의 conflict 절을 건너뛴다.
+        UPDATE: new RegExp('\\bUPDATE\\s+(?:OR\\s+(?:REPLACE|ROLLBACK|ABORT|FAIL|IGNORE)\\s+)?' + ident),
         DELETE: new RegExp('\\bFROM\\s+' + ident),
     };
     const p = patterns[String(op || '').toUpperCase()];
@@ -495,4 +496,29 @@ export function extractTableRefs(normalized) {
         i = j - 1;
     }
     return out;
+}
+
+/**
+ * 외부 연산(op) 외에 **추가 쓰기 효과**를 일으키는 SQL 형태를 감지한다.
+ * (Authorization / Allowlist 가 INSERT 하나만 보고 통과시키는 우회 방지)
+ *
+ * - `INSERT ... ON CONFLICT ... DO UPDATE` → UPDATE
+ * - `INSERT OR REPLACE`, `REPLACE INTO`    → DELETE (충돌 행 삭제 후 삽입)
+ * - `UPDATE OR REPLACE`                    → DELETE (충돌 행 삭제)
+ *
+ * @param {string} normalized - 주석/문자열 제거된 SQL
+ * @param {string|null} op - 바깥 문장 연산
+ * @returns {string[]} 추가로 요구되는 연산 목록
+ */
+export function detectSecondaryWriteOps(normalized, op) {
+    const s = maskQuotedNonIdentifiers(String(normalized || '')).replace(/\s+/g, ' ');
+    const u = s.toUpperCase();
+    const out = new Set();
+    if (!op) return [];
+    if (op === 'INSERT') {
+        if (/\bINSERT\s+OR\s+REPLACE\b/.test(u) || /\bREPLACE\s+INTO\b/.test(u)) out.add('DELETE');
+        if (/\bON\s+CONFLICT\b[\s\S]*\bDO\s+UPDATE\b/.test(u)) out.add('UPDATE');
+    }
+    if (op === 'UPDATE' && /\bUPDATE\s+OR\s+REPLACE\b/.test(u)) out.add('DELETE');
+    return [...out];
 }

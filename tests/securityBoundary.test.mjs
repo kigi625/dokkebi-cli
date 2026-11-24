@@ -185,6 +185,75 @@ test('evaluateSqlAuthorization: JOIN 으로 보호 테이블 읽기 차단', () 
     assert.equal(evaluateSqlAuthorization(AUTHZ, 'SELECT * FROM posts', null).ok, true);
 });
 
+test('evaluateSqlAuthorization: upsert/REPLACE 는 부수 쓰기 권한까지 요구', () => {
+    const policy = normalizeAuthorizationConfig({
+        enabled: true,
+        mode: 'strict',
+        rules: {
+            'SELECT:posts': { public: true },
+            'INSERT:posts': { auth: true },
+            'UPDATE:posts': { roles: ['admin'] },
+            'DELETE:posts': { roles: ['admin'] },
+            '*': { deny: true },
+        },
+    });
+    const user = { valid: true, payload: { role: 'user', user_id: 'u1' } };
+    const admin = { valid: true, payload: { role: 'admin', user_id: 'a1' } };
+
+    const upsert = 'INSERT INTO posts (id,user_id,title) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET title=?';
+    assert.equal(evaluateSqlAuthorization(policy, upsert, user).ok, false);
+    assert.equal(evaluateSqlAuthorization(policy, upsert, admin).ok, true);
+
+    const doNothing = 'INSERT INTO posts (id,user_id,title) VALUES (?,?,?) ON CONFLICT(id) DO NOTHING';
+    assert.equal(evaluateSqlAuthorization(policy, doNothing, user).ok, true);
+
+    for (const sql of [
+        'INSERT OR REPLACE INTO posts (id,user_id,title) VALUES (?,?,?)',
+        'REPLACE INTO posts (id,user_id,title) VALUES (?,?,?)',
+        'UPDATE OR REPLACE posts SET title=? WHERE id=?',
+    ]) {
+        assert.equal(evaluateSqlAuthorization(policy, sql, user).ok, false, sql);
+        assert.equal(evaluateSqlAuthorization(policy, sql, admin).ok, true, sql);
+    }
+
+    const meta = extractOpAndTables(upsert);
+    assert.equal(meta.op, 'INSERT');
+    assert.equal(meta.primary, 'posts');
+    assert.deepEqual(meta.secondary, ['UPDATE']);
+});
+
+test('validateSqlAllowlist: 부수 쓰기 연산도 allowlist ops 를 요구', () => {
+    const insertOnly = {
+        version: 1,
+        tables: [{ name: 'posts', ops: ['SELECT', 'INSERT'] }],
+        rawAllowed: false,
+    };
+    const allOps = {
+        version: 1,
+        tables: [{ name: 'posts', ops: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] }],
+        rawAllowed: false,
+    };
+    const upsert = 'INSERT INTO posts (id,user_id,title) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET title=?';
+    assert.equal(validateSqlAllowlist(upsert, insertOnly).allowed, false);
+    assert.equal(validateSqlAllowlist(upsert, allOps).allowed, true);
+    assert.equal(
+        validateSqlAllowlist('INSERT INTO posts (id) VALUES (?) ON CONFLICT(id) DO NOTHING', insertOnly).allowed,
+        true,
+    );
+    for (const sql of [
+        'INSERT OR REPLACE INTO posts (id) VALUES (?)',
+        'REPLACE INTO posts (id) VALUES (?)',
+    ]) {
+        assert.equal(validateSqlAllowlist(sql, insertOnly).allowed, false, sql);
+    }
+    const updateOnly = {
+        version: 1,
+        tables: [{ name: 'posts', ops: ['SELECT', 'UPDATE'] }],
+        rawAllowed: false,
+    };
+    assert.equal(validateSqlAllowlist('UPDATE OR REPLACE posts SET title=? WHERE id=?', updateOnly).allowed, false);
+});
+
 test('evaluateSqlAuthorization: INSERT..SELECT 로 보호 테이블 값 빼돌리기 차단', () => {
     const sql = 'INSERT INTO posts (user_id, title) SELECT user_id, password_hash FROM users';
     const user = evaluateSqlAuthorization(AUTHZ, sql, USER_JWT);

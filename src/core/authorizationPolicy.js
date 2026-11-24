@@ -37,7 +37,7 @@
  *   - 프론트엔드 권한 UI → 클라이언트 판단은 UX 용도일 뿐
  */
 
-import { detectOuterOp, outerStatement, detectPrimaryTableOf, extractTableRefs } from './sqlShape.js';
+import { detectOuterOp, outerStatement, detectPrimaryTableOf, extractTableRefs, detectSecondaryWriteOps } from './sqlShape.js';
 
 // ─────────────────────────────────────────────────────────────
 // Config 정규화 — dokkebi.config.js 의 authorization 섹션 검증/정규화
@@ -425,10 +425,12 @@ function _extractAllTableRefs(normalized) {
  */
 export function extractOpAndTables(sql) {
     const { op, table } = extractOpAndTable(sql);
-    if (!op) return { op: null, tables: [], primary: null };
+    if (!op) return { op: null, tables: [], primary: null, secondary: [] };
     const normalized = _stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
     const tables = [...new Set(_extractAllTableRefs(normalized).map((t) => t.toLowerCase()))];
-    return { op, tables, primary: table ? table.toLowerCase() : null };
+    const primary = table ? table.toLowerCase() : null;
+    const secondary = detectSecondaryWriteOps(normalized, op);
+    return { op, tables, primary, secondary };
 }
 
 /**
@@ -444,10 +446,16 @@ export function extractOpAndTables(sql) {
  */
 export function evaluateSqlAuthorization(policy, sql, jwt = null) {
     if (!policy || !policy.enabled) return { ok: true };
-    const { op, tables, primary } = extractOpAndTables(sql);
+    const { op, tables, primary, secondary } = extractOpAndTables(sql);
     const targets = tables.length > 0
         ? tables.map((t) => ({ table: t, op: t === primary ? (op || '*') : 'SELECT' }))
         : [{ table: '', op: op || '*' }];
+    // INSERT ... ON CONFLICT DO UPDATE / REPLACE 는 부수 쓰기 권한도 요구한다.
+    if (primary) {
+        for (const secondaryOp of secondary) {
+            targets.push({ table: primary, op: secondaryOp });
+        }
+    }
 
     for (const t of targets) {
         const matched = matchRule(policy, t.op, t.table);

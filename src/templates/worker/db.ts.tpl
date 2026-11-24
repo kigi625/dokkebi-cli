@@ -1074,7 +1074,8 @@ function detectPrimaryTable(normalizedUpper: string, op: string): string | null 
   const patterns: Record<string, RegExp> = {
     SELECT: new RegExp('\\bFROM\\s+' + ident),
     INSERT: new RegExp('\\bINTO\\s+' + ident),
-    UPDATE: new RegExp('\\bUPDATE\\s+' + ident),
+    // `UPDATE OR REPLACE|ROLLBACK|ABORT|FAIL|IGNORE <table>` 의 conflict 절을 건너뛴다.
+    UPDATE: new RegExp('\\bUPDATE\\s+(?:OR\\s+(?:REPLACE|ROLLBACK|ABORT|FAIL|IGNORE)\\s+)?' + ident),
     DELETE: new RegExp('\\bFROM\\s+' + ident),
   };
   const p = patterns[op];
@@ -1393,12 +1394,8 @@ async function _az_checkSql(
   const normalized = stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
   const upper = normalized.toUpperCase();
 
-  let op: string | null = null;
-  if (upper.startsWith('SELECT') || upper.startsWith('WITH')) op = 'SELECT';
-  else if (upper.startsWith('INSERT')) op = 'INSERT';
-  else if (upper.startsWith('UPDATE')) op = 'UPDATE';
-  else if (upper.startsWith('DELETE')) op = 'DELETE';
-  else if (upper.startsWith('CREATE TABLE')) op = 'CREATE';
+  // WITH ... DELETE/UPDATE 를 SELECT 로 오판하지 않도록 바깥 문장 기준으로 판별한다.
+  const op: string | null = _detectOuterOp(upper).op;
 
   const primary = op ? detectPrimaryTable(upper, op) : null;
   const primaryLower = primary ? primary.toLowerCase() : '';
@@ -1407,6 +1404,12 @@ async function _az_checkSql(
   const targets = tables.length > 0
     ? tables.map((t) => ({ table: t, op: t === primaryLower ? (op || '*') : 'SELECT' }))
     : [{ table: '', op: op || '*' }];
+  // INSERT ... ON CONFLICT DO UPDATE / REPLACE 는 부수 쓰기 권한도 요구한다.
+  if (primaryLower) {
+    for (const secondaryOp of _secondaryWriteOps(normalized, op)) {
+      targets.push({ table: primaryLower, op: secondaryOp });
+    }
+  }
 
   const decisions = targets.map((t) => ({ ...t, matched: _az_matchRule(t.op, t.table) }));
   const needsJwt = decisions.some((d) => d.matched && d.matched.spec && d.matched.spec.public !== true);
@@ -2463,6 +2466,21 @@ function injectTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
  * - strict=true (기본): allowlist 가 없으면 전부 거부 (fail-closed)
  * - strict=false (호환): 공통 방어만 통과시키고 통과
  */
+// upsert UPDATE / REPLACE DELETE 같은 부수 쓰기 효과를 감지한다.
+// (Authorization / Allowlist 가 INSERT/UPDATE 하나만 보고 통과시키는 우회 방지)
+function _secondaryWriteOps(normalized: string, op: string | null): string[] {
+  if (!op) return [];
+  const s = _pe_maskQuotedNonIdentifiers(normalized).replace(/\s+/g, ' ');
+  const u = s.toUpperCase();
+  const out = new Set<string>();
+  if (op === 'INSERT') {
+    if (/\bINSERT\s+OR\s+REPLACE\b/.test(u) || /\bREPLACE\s+INTO\b/.test(u)) out.add('DELETE');
+    if (/\bON\s+CONFLICT\b[\s\S]*\bDO\s+UPDATE\b/.test(u)) out.add('UPDATE');
+  }
+  if (op === 'UPDATE' && /\bUPDATE\s+OR\s+REPLACE\b/.test(u)) out.add('DELETE');
+  return [...out];
+}
+
 function validateSqlAllowlist(sql: string, opts: { strict?: boolean } = {}): { allowed: boolean; reason?: string } {
   const strict = opts.strict !== false;
 
@@ -2544,6 +2562,15 @@ function validateSqlAllowlist(sql: string, opts: { strict?: boolean } = {}): { a
         allowed: false,
         reason: `테이블 "${primaryTable}"에 대한 ${op} 연산이 허용되지 않습니다. (허용: ${entry?.ops.join(', ') || '(없음)'})`,
       };
+    }
+    // 부수 쓰기 효과 (upsert UPDATE / REPLACE DELETE) 도 allowlist 연산이 필요하다.
+    for (const secondaryOp of _secondaryWriteOps(normalized, op)) {
+      if (!entry.ops.includes(secondaryOp)) {
+        return {
+          allowed: false,
+          reason: `테이블 "${primaryTable}"에 대한 ${secondaryOp} 연산이 허용되지 않습니다. (허용: ${entry.ops.join(', ') || '(없음)'})`,
+        };
+      }
     }
   }
 
