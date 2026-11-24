@@ -115,6 +115,43 @@ export function detectPrimaryTableOf(outerUpper, op) {
  * @param {string} normalized - 주석/문자열 제거 + 원본 대소문자 유지
  * @returns {Array<{name: string, alias: string|null, offset: number, keyword: string}>}
  */
+/**
+ * 따옴표로 감싼 "문자열/비식별자" 영역을 공백으로 마스킹한다.
+ *
+ * SQLite 는 double-quoted 토큰이 컬럼명으로 해석되지 않으면 문자열 리터럴로
+ * 취급(DQS)한다. 정책 검사가 그 내부의 `user_id = ?` 같은 텍스트를 실제
+ * 조건으로 오인하지 않도록, 단순 식별자(`"user_id"`)만 남기고 나머지
+ * quoted 영역은 같은 길이의 공백으로 바꾼다. (오프셋 유지)
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function maskQuotedNonIdentifiers(text) {
+    const s = String(text || '');
+    const n = s.length;
+    let out = '';
+    for (let i = 0; i < n; i++) {
+        const ch = s[i];
+        if (ch !== '"' && ch !== '`' && ch !== '[') { out += ch; continue; }
+        const close = ch === '[' ? ']' : ch;
+        let j = i + 1;
+        let content = '';
+        while (j < n) {
+            if (s[j] === close) {
+                if (ch !== '[' && s[j + 1] === close) { content += close; j += 2; continue; }
+                break;
+            }
+            content += s[j];
+            j++;
+        }
+        const end = Math.min(j + 1, n);
+        const isIdent = /^[A-Za-z_][A-Za-z0-9_]*$/.test(content);
+        out += isIdent ? s.slice(i, end) : ' '.repeat(end - i);
+        i = j;
+    }
+    return out;
+}
+
 export function extractTableRefs(normalized) {
     const s = String(normalized || '');
     const n = s.length;

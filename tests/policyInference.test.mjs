@@ -581,3 +581,29 @@ test('injectTenantPolicy: 복합 SELECT 는 브랜치별 주입을 보장하지 
     assert.equal(r.ok, false);
     assert.equal(r.code, 'INJECT_INCOMPLETE');
 });
+
+test('verifyTenantPolicy: 따옴표 내부 ? 로 placeholder 인덱스를 흔들 수 없음', () => {
+    const policy = normalizePolicyConfig({
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    });
+    const ctx = { user_id: 'u1' };
+
+    // double-quoted DQS 문자열 안의 ? 는 placeholder 가 아니다.
+    // (수정 전에는 params[2]='u1' 을 검사해 victim 행을 통과시켰다)
+    const exploit = 'SELECT * FROM posts WHERE "x?y" = ? AND posts.user_id = ? AND title = ?';
+    const bad = verifyTenantPolicy(exploit, ['x?y', 'victim', 'u1'], ctx, policy);
+    assert.equal(bad.ok, false);
+    assert.equal(bad.code, 'TENANT_MISMATCH');
+
+    // 정상 파라미터 순서는 통과
+    assert.equal(verifyTenantPolicy(exploit, ['x?y', 'u1', 'u1'], ctx, policy).ok, true);
+
+    // 따옴표로 감싼 정상 식별자는 계속 허용
+    assert.equal(verifyTenantPolicy('SELECT * FROM posts WHERE "user_id" = ?', ['u1'], ctx, policy).ok, true);
+
+    // quoted 영역 내부의 가짜 조건 텍스트는 조건으로 인정하지 않는다.
+    const fake = verifyTenantPolicy('SELECT * FROM posts WHERE "posts.user_id = ?" = ?', ['u1', 'u1'], ctx, policy);
+    assert.equal(fake.ok, false);
+    assert.equal(fake.code, 'NO_TENANT_FILTER');
+});

@@ -1611,6 +1611,33 @@ function _pe_stripStringsAndComments(sql: string): string {
 function _pe_normalize(sql: string): string {
   return _pe_stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
 }
+// DQS(double-quoted string) 내부의 가짜 조건 텍스트를 무시하기 위한 마스킹.
+// 단순 식별자("user_id")만 남기고 나머지 quoted 영역은 같은 길이의 공백으로 바꾼다.
+function _pe_maskQuotedNonIdentifiers(text: string): string {
+  const s = String(text || '');
+  const n = s.length;
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    const ch = s[i];
+    if (ch !== '"' && ch !== '`' && ch !== '[') { out += ch; continue; }
+    const close = ch === '[' ? ']' : ch;
+    let j = i + 1;
+    let content = '';
+    while (j < n) {
+      if (s[j] === close) {
+        if (ch !== '[' && s[j + 1] === close) { content += close; j += 2; continue; }
+        break;
+      }
+      content += s[j];
+      j++;
+    }
+    const end = Math.min(j + 1, n);
+    const isIdent = /^[A-Za-z_][A-Za-z0-9_]*$/.test(content);
+    out += isIdent ? s.slice(i, end) : ' '.repeat(end - i);
+    i = j;
+  }
+  return out;
+}
 function _pe_detectOp(upper: string): string | null {
   return detectPrimaryOp(upper);
 }
@@ -1643,9 +1670,16 @@ function _pe_scanOuterWhere(sql: string): { whereEnd: number; tailStart: number 
       while (i < n) { if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; } if (sql[i] === "'") break; i++; }
       continue;
     }
-    if (ch === '"' || ch === '`') {
-      const q = ch; i++;
-      while (i < n) { if (sql[i] === q) { if (sql[i + 1] === q) { i += 2; continue; } break; } i++; }
+    if (ch === '"' || ch === '`' || ch === '[') {
+      const q = ch === '[' ? ']' : ch;
+      i++;
+      while (i < n) {
+        if (sql[i] === q) {
+          if (ch !== '[' && sql[i + 1] === q) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
       continue;
     }
     if (ch === '(') { depth++; continue; }
@@ -1771,7 +1805,7 @@ function _pe_findTenantCondInUpper(upper: string, alias: string | null, col: str
   return null;
 }
 function _pe_findTenantCond(whereText: string, alias: string | null, col: string, tableName: string | null = null, requireQualified = false): { index: number; length: number; qIndex: number } | null {
-  const upper = whereText.toUpperCase();
+  const upper = _pe_maskQuotedNonIdentifiers(whereText).toUpperCase();
   let r = _pe_findTenantCondInUpper(upper, alias, col, tableName, requireQualified);
   if (r) return r;
   for (const sp of _pe_splitTopLevelAndWhere(whereText, upper)) {
@@ -1792,10 +1826,8 @@ function _pe_findTenantCond(whereText: string, alias: string | null, col: string
   return null;
 }
 function _pe_countQMarks(normalized: string, offset: number): number {
-  let c = 0;
-  const end = Math.min(offset, normalized.length);
-  for (let i = 0; i < end; i++) if (normalized[i] === '?') c++;
-  return c;
+  // 따옴표/주석 내부의 '?' 는 placeholder 가 아니므로 제외한다.
+  return _pe_countQMarksRaw(normalized, offset);
 }
 // 테넌트 컬럼 재할당(SET user_id = ?) 검사
 function _pe_topLevelWords(text: string): Array<{ word: string; start: number; end: number }> {
@@ -2278,7 +2310,18 @@ function _pe_countQMarksRaw(sql: string, offset: number): number {
     if (ch === '-' && nx === '-') { while (i < n && sql[i] !== '\n') i++; continue; }
     if (ch === '/' && nx === '*') { i += 2; while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i++; i++; continue; }
     if (ch === "'") { i++; while (i < n) { if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; } if (sql[i] === "'") break; i++; } continue; }
-    if (ch === '"' || ch === '`') { const q = ch; i++; while (i < n) { if (sql[i] === q) { if (sql[i + 1] === q) { i += 2; continue; } break; } i++; } continue; }
+    if (ch === '"' || ch === '`' || ch === '[') {
+      const q = ch === '[' ? ']' : ch;
+      i++;
+      while (i < n) {
+        if (sql[i] === q) {
+          if (ch !== '[' && sql[i + 1] === q) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
     if (ch === '?') count++;
   }
   return count;

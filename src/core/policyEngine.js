@@ -29,7 +29,7 @@ export const POLICY_ENGINE_VERSION = 1;
  * 큰따옴표·백틱 식별자는 원형 유지 (SQLite 호환).
  * 작은따옴표 문자열은 ''(빈 문자열) 로 대체 — 토큰 카운팅에는 영향 없음.
  */
-import { detectOuterOp, outerStatement, extractTableRefs as extractTableRefsRobust } from './sqlShape.js';
+import { detectOuterOp, outerStatement, extractTableRefs as extractTableRefsRobust, maskQuotedNonIdentifiers } from './sqlShape.js';
 
 export function stripStringsAndComments(sql) {
     let out = '';
@@ -150,10 +150,14 @@ function _scanOuterWhere(sql) {
             }
             continue;
         }
-        if (ch === '"' || ch === '`') {
-            const q = ch; i++;
+        if (ch === '"' || ch === '`' || ch === '[') {
+            const q = ch === '[' ? ']' : ch;
+            i++;
             while (i < n) {
-                if (sql[i] === q) { if (sql[i + 1] === q) { i += 2; continue; } break; }
+                if (sql[i] === q) {
+                    if (ch !== '[' && sql[i + 1] === q) { i += 2; continue; }
+                    break;
+                }
                 i++;
             }
             continue;
@@ -345,7 +349,8 @@ function findTenantConditionInUpper(upper, alias, col, tableName = null, require
 }
 
 export function findTenantCondition(whereText, alias, col, tableName = null, requireQualified = false) {
-    const upper = whereText.toUpperCase();
+    // double-quoted 문자열(DQS) 내부의 가짜 조건 텍스트를 무시한다.
+    const upper = maskQuotedNonIdentifiers(whereText).toUpperCase();
     let r = findTenantConditionInUpper(upper, alias, col, tableName, requireQualified);
     if (r) return r;
     for (const sp of splitTopLevelAndWhere(whereText, upper)) {
@@ -375,12 +380,8 @@ export function findTenantCondition(whereText, alias, col, tableName = null, req
  * 주어진 오프셋 앞쪽의 '?' 개수를 센다. normalized SQL 기준.
  */
 export function countQMarksBefore(normalized, offset) {
-    let count = 0;
-    const end = Math.min(offset, normalized.length);
-    for (let i = 0; i < end; i++) {
-        if (normalized[i] === '?') count++;
-    }
-    return count;
+    // 따옴표/주석 내부의 '?' 는 placeholder 가 아니므로 제외한다.
+    return _countQMarksRaw(normalized, offset);
 }
 
 /**

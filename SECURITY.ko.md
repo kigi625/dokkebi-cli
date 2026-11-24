@@ -95,7 +95,7 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 
 테넌트 정책은 테넌트 경계를 넘을 수 있는 쓰기 형태도 차단한다: `REPLACE` / `INSERT OR REPLACE` / `UPDATE OR REPLACE`(충돌 행 암묵 삭제), 테넌트 컬럼이 conflict target 에 없는 `ON CONFLICT ... DO UPDATE`, 그리고 테넌트 컬럼을 검증된 값이 아닌 다른 값으로 바꾸는 `SET`(`UPSERT_TENANT_RISK`, `TENANT_COLUMN_REASSIGN`).
 
-테이블 참조는 따옴표/괄호를 인식하는 파서(`sqlShape.extractTableRefs`)로 추출한다: `'…'` 문자열, `"…"`/`` `…` ``/`[…]` 식별자, 스키마 한정, 괄호로 묶인 테이블 목록, 콤마 조인, `INDEXED BY`/`NOT INDEXED`/`ON`/`USING` 제약, `UPDATE OR <conflict>` 대상까지 포함한다. 참조된 모든 테이블을 검사하므로 등록되지 않은 테이블을 조인 뒤에 숨길 수 없다. 다중 테이블 문장에서는 테넌트 필터를 반드시 한정해야 하며(`alias.col` 또는 `table.col`), 비한정 `col = ?` 는 다른 테이블 컬럼에 바인딩될 수 있어 거부한다.
+테이블 참조는 따옴표/괄호를 인식하는 파서(`sqlShape.extractTableRefs`)로 추출한다: `'…'` 문자열, `"…"`/`` `…` ``/`[…]` 식별자, 스키마 한정, 괄호로 묶인 테이블 목록, 콤마 조인, `INDEXED BY`/`NOT INDEXED`/`ON`/`USING` 제약, `UPDATE OR <conflict>` 대상까지 포함한다. 참조된 모든 테이블을 검사하므로 등록되지 않은 테이블을 조인 뒤에 숨길 수 없다. 다중 테이블 문장에서는 테넌트 필터를 반드시 한정해야 하며(`alias.col` 또는 `table.col`), 비한정 `col = ?` 는 다른 테이블 컬럼에 바인딩될 수 있어 거부한다. 플레이스홀더 인덱스는 주석·따옴표 내부의 `?` 를 제외하고 세며, double-quoted 문자열(DQS) 내부의 `user_id = ?` 같은 텍스트를 실제 테넌트 조건으로 인정하지 않는다.
 
 파라미터 바인딩은 D1/Supabase/Appwrite SDK 가 `prepare().bind()` 로 처리. 프록시는 raw SQL 을 절대 문자열 보간하지 않음.
 

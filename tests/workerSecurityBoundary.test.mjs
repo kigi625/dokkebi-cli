@@ -299,6 +299,20 @@ test('워커 템플릿: 테넌트 테이블의 위험한 upsert 차단', () => {
 });
 
 
+test('워커 템플릿: 따옴표 내부 ? 로 placeholder 인덱스를 흔들 수 없음', () => {
+    const policy = normalizePolicyConfig({
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    });
+    const ctx = { user_id: 'u1' };
+    const sql = 'SELECT * FROM posts WHERE "x?y" = ? AND posts.user_id = ? AND title = ?';
+    const r = worker.verifyTenantPolicy(sql, ['x?y', 'victim', 'u1'], ctx, policy, { strict: true });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'TENANT_MISMATCH');
+    assert.equal(worker.verifyTenantPolicy(sql, ['x?y', 'u1', 'u1'], ctx, policy, { strict: true }).ok, true);
+    assert.equal(worker.verifyTenantPolicy('SELECT * FROM posts WHERE "user_id" = ?', ['u1'], ctx, policy, { strict: true }).ok, true);
+});
+
 test('워커 템플릿: 테넌트 컬럼 재할당(SET user_id) 차단', () => {
     const p = {
         enabled: true, mode: 'verify', strict: true, claim: 'user_id',
