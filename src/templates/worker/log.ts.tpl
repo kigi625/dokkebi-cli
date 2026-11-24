@@ -17,11 +17,21 @@ export interface Env {
   DB?: D1Database;
 }
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-};
+const _CORS_ORIGINS: string[] = __DOKKEBI_PH_CORS__;
+function _corsHeadersFor(req: Request): Record<string, string> {
+  const out: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Vary': 'Origin',
+  };
+  const origin = req.headers.get('Origin') || '';
+  if (_CORS_ORIGINS.length === 0 || _CORS_ORIGINS.includes('*')) {
+    out['Access-Control-Allow-Origin'] = '*';
+  } else if (origin && _CORS_ORIGINS.includes(origin)) {
+    out['Access-Control-Allow-Origin'] = origin;
+  }
+  return out;
+}
 
 const LEVEL_ICON: Record<string, string> = {
   error: '✗',
@@ -78,7 +88,7 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
   const { request, env } = ctx;
 
   if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS });
+    return new Response(null, { status: 204, headers: _corsHeadersFor(request) });
   }
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
@@ -88,19 +98,19 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     const _ip = _logIp(request);
     if (_logRateLimited(_ip)) {
       return new Response(JSON.stringify({ ok: false, code: 'LOG_RATE_LIMIT', error: '로그 전송량이 너무 많습니다.' }), {
-        status: 429, headers: { 'Content-Type': 'application/json', ...CORS },
+        status: 429, headers: { 'Content-Type': 'application/json', ..._corsHeadersFor(request) },
       });
     }
     const _len = Number(request.headers.get('content-length') || 0);
     if (Number.isFinite(_len) && _len > _LOG_BODY_MAX) {
       return new Response(JSON.stringify({ ok: false, code: 'PAYLOAD_TOO_LARGE', error: '로그 본문이 너무 큽니다.' }), {
-        status: 413, headers: { 'Content-Type': 'application/json', ...CORS },
+        status: 413, headers: { 'Content-Type': 'application/json', ..._corsHeadersFor(request) },
       });
     }
 
     const parsed: any = await request.json<any>().catch(() => null);
     if (!parsed || typeof parsed !== 'object') {
-      return new Response('ok', { headers: { 'Content-Type': 'text/plain', ...CORS } });
+      return new Response('ok', { headers: { 'Content-Type': 'text/plain', ..._corsHeadersFor(request) } });
     }
     const level = (typeof parsed.level === 'string' && Object.prototype.hasOwnProperty.call(LEVEL_ICON, parsed.level)) ? parsed.level : 'log';
     const tag = (typeof parsed.tag === 'string' ? parsed.tag : 'wasm').slice(0, 64);
@@ -136,6 +146,6 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
   } catch { /* 무시 */ }
 
   return new Response('ok', {
-    headers: { 'Content-Type': 'text/plain', ...CORS },
+    headers: { 'Content-Type': 'text/plain', ..._corsHeadersFor(request) },
   });
 };

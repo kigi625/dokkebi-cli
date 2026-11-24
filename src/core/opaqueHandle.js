@@ -46,7 +46,7 @@ import { renderTemplate } from './templateLoader.js';
  * @returns {string} HTML에 주입할 <script> 블록
  */
 export function generateBootstrapScript(config) {
-    const { dbType, bundleHash = '', bundleAssetName = '', localDbMode = false, migrationSql = '', buildVer = '',
+    const { dbType, bundleHash = '', bundleAssetName = '', localDbMode = false, migrationSql = '', buildVer = '', sqljsBase = '',
             pluginHostCode = '', pluginVmBridge = '',
             queryLearn = false, capabilityGuards = { enabled: false, routes: [] },
             bytecodeMode = false, bytecodeEncrypted = false, encryptedTextMode = false,
@@ -116,6 +116,7 @@ export function generateBootstrapScript(config) {
         { find: '"__DOKKEBI_PH_CALLER_CHECK__"',                  replace: JSON.stringify(callerCheckMode) },
         { find: '"__DOKKEBI_PH_ALLOWED_SCRIPTS__"',               replace: allowedScriptsJson },
         { find: '"__DOKKEBI_PH_CALLER_AUDIT_URL__"',              replace: JSON.stringify(callerCheckAuditUrlStr) },
+        { find: '"__DOKKEBI_PH_SQLJS_BASE__"',                   replace: JSON.stringify(String(sqljsBase || '')) },
     ]);
 }
 

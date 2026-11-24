@@ -71,11 +71,21 @@ function _hsBodyTooLarge(req: Request, maxBytes = 8 * 1024): boolean {
 }
 
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-};
+const _CORS_ORIGINS: string[] = __DOKKEBI_PH_CORS__;
+function _corsHeadersFor(req: Request): Record<string, string> {
+  const out: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Vary': 'Origin',
+  };
+  const origin = req.headers.get('Origin') || '';
+  if (_CORS_ORIGINS.length === 0 || _CORS_ORIGINS.includes('*')) {
+    out['Access-Control-Allow-Origin'] = '*';
+  } else if (origin && _CORS_ORIGINS.includes(origin)) {
+    out['Access-Control-Allow-Origin'] = origin;
+  }
+  return out;
+}
 
 const EPHEMERAL_TTL_MS = 60_000;
 // 세션 수명 — db.ts.tpl 의 SESSION_TTL_MS 와 동일하게 유지한다.
@@ -145,10 +155,10 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
   const method = request.method;
 
   if (method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS });
+    return new Response(null, { status: 204, headers: _corsHeadersFor(request) });
   }
 
-  const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...CORS };
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ..._corsHeadersFor(request) };
 
   try {
     ctx.waitUntil(ensureSecurityTables(_internalDb(env)).catch(() => {}));

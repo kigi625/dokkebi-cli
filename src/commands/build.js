@@ -25,6 +25,8 @@ import { buildRegistry, writeRegistry } from '../core/queryRegistry.js';
 import { normalizePolicyConfig } from '../core/policyEngine.js';
 import { normalizeAuthorizationConfig, resolveJwtSecret } from '../core/authorizationPolicy.js';
 import { checkProductionPreflight } from '../core/securityAudit.js';
+import { normalizeCorsConfig } from '../core/cors.js';
+import { copySqlJsAssets } from '../core/localDbAssets.js';
 import { inferPolicyFromProject, mergeInferredIntoConfig } from '../core/policyInference.js';
 import { scanPolicyAnnotations, mergeAnnotationsIntoInferred } from '../core/policyAnnotations.js';
 import { workerDb, workerAdmin, workerAdminApi, workerHandshake, workerCapability, workerLog, workerRootMiddleware } from '../core/projectGenerator.js';
@@ -1097,6 +1099,7 @@ export async function runBuild(src, options = {}) {
     const adlMeta = normalizeActiveDefenseConfig(effectiveConfig?.security);
     const capabilityMeta = normalizeCapabilitiesConfig(effectiveConfig?.security, capabilityAnnotations);
     const panelIpGuardMeta = normalizePanelIpGuardConfig(effectiveConfig?.security);
+    const corsMeta = normalizeCorsConfig(effectiveConfig?.security);
 
     // ── security.preset: 'production' preflight ────────────────
     //   "한 줄 프리셋"이 실제로 성립하려면 필수 시크릿/설정이 있어야 한다.
@@ -1362,7 +1365,7 @@ export async function runBuild(src, options = {}) {
                     : (_rawSess && typeof _rawSess === 'object'
                         ? { enabled: _rawSess.enabled !== false, mode: _rawSess.mode === 'first-primary' ? 'first-primary' : 'first-unconstrained' }
                         : { enabled: false, mode: 'first-unconstrained' });
-            const nextSource = workerDb(dbType, allowlist, queryRegistry, policyMeta, authzMeta, replayMeta, buildMeta, adlMeta, capabilityMeta, sessionsMeta, authLoginMeta);
+            const nextSource = workerDb(dbType, allowlist, queryRegistry, policyMeta, authzMeta, replayMeta, buildMeta, adlMeta, capabilityMeta, sessionsMeta, authLoginMeta, corsMeta);
             await fs.writeFile(workerDbPath, nextSource, 'utf-8');
             const parts = ['allowlist'];
             if (queryRegistry) parts.push('query-registry');
@@ -1381,7 +1384,7 @@ export async function runBuild(src, options = {}) {
         const workerHsPath = path.join(sourceRoot, 'worker', 'api', '_dokkebi', 'handshake.ts');
         try {
             await fs.access(workerHsPath);
-            await fs.writeFile(workerHsPath, workerHandshake(), 'utf-8');
+            await fs.writeFile(workerHsPath, workerHandshake(corsMeta), 'utf-8');
             console.log('[dokkebi] handshake.ts 재생성 완료');
         } catch { /* handshake.ts 미존재 → 무시 */ }
 
@@ -1390,7 +1393,7 @@ export async function runBuild(src, options = {}) {
         const workerLogPath = path.join(sourceRoot, 'worker', 'api', '_dokkebi', 'log.ts');
         try {
             await fs.access(workerLogPath);
-            await fs.writeFile(workerLogPath, workerLog(), 'utf-8');
+            await fs.writeFile(workerLogPath, workerLog(corsMeta), 'utf-8');
         } catch { /* log.ts 미존재 → 무시 */ }
 
         // 서버측 capability 검증 헬퍼 — 라우트에서 재검증할 때 import 한다.
@@ -1463,11 +1466,11 @@ export async function runBuild(src, options = {}) {
         const adminApiPath = path.join(sourceRoot, 'worker', 'api', '_dokkebi', '_panel', '[[path]].ts');
         try {
             await fs.access(adminPanelPath);
-            await fs.writeFile(adminPanelPath, workerAdmin(path.basename(sourceRoot), securitySummary, panelIpGuardMeta), 'utf-8');
+            await fs.writeFile(adminPanelPath, workerAdmin(path.basename(sourceRoot), securitySummary, panelIpGuardMeta, corsMeta), 'utf-8');
         } catch { /* 관제 미설정 */ }
         try {
             await fs.access(adminApiPath);
-            await fs.writeFile(adminApiPath, workerAdminApi(path.basename(sourceRoot), securitySummary, panelIpGuardMeta), 'utf-8');
+            await fs.writeFile(adminApiPath, workerAdminApi(path.basename(sourceRoot), securitySummary, panelIpGuardMeta, corsMeta), 'utf-8');
         } catch { /* 관제 미설정 */ }
         console.log(t('build.securityCoverage', {
             score: coverage.score,
@@ -1490,6 +1493,8 @@ export async function runBuild(src, options = {}) {
     );
     const localDbMode = !_hasCreds;
     let migrationSql = '';
+    // sql.js 로컬 번들 — CDN 대신 dist/dokkebi 에서 로드 (same-origin)
+    let sqljsBase = '';
     if (localDbMode) {
         try {
             const migrationPath = path.join(sourceRoot, 'backend', 'db', 'migrations', '001_initial.sql');
@@ -1497,6 +1502,15 @@ export async function runBuild(src, options = {}) {
             console.log(t('build.localDbMode'));
         } catch {
             console.warn(t('build.noMigrationFiles'));
+        }
+        try {
+            const ok = await copySqlJsAssets(path.join(outDir, 'dokkebi'));
+            if (ok) {
+                sqljsBase = '/dokkebi/';
+                console.log('[dokkebi]   📦 sql.js 로컬 번들: /dokkebi/sql-wasm.js (CDN fallback: SRI)');
+            }
+        } catch (e) {
+            console.warn('[dokkebi] ⚠ sql.js 로컬 번들 실패 — CDN(SRI) fallback 사용:', e?.message || e);
         }
     }
 
@@ -1613,6 +1627,7 @@ export async function runBuild(src, options = {}) {
         callerCheck: callerCheckMode,
         allowedScripts: callerAllowedScripts,
         callerCheckAuditUrl: dokkebiConfig?.security?.callerCheckAuditUrl,
+        sqljsBase,
         ...(proxyMode === 'serverless' ? { payloadWireClient: wireRuntimeJson } : {}),
     }).catch((e) => {
         console.warn(t('build.htmlInjectWarn'), e.message);

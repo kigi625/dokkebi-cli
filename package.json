@@ -26,8 +26,8 @@
     "appwrite"
   ],
   "author": {
-    "name":"park yong woo",
-    "url":"(https://notofly.com?page=noto&id=54a144f4-2ac1-41a4-b13d-0269fc265b4f)"
+    "name": "park yong woo",
+    "url": "(https://notofly.com?page=noto&id=54a144f4-2ac1-41a4-b13d-0269fc265b4f)"
   },
   "license": "Elastic-2.0",
   "engines": {
@@ -42,7 +42,8 @@
     "javascript-obfuscator": "^5.4.2",
     "node-fetch": "^3.3.2",
     "quickjs-emscripten": "^0.31.0",
-    "quickjs-emscripten-core": "^0.31.0"
+    "quickjs-emscripten-core": "^0.31.0",
+    "sql.js": "^1.11.0"
   },
   "devDependencies": {
     "mysql2": "^3.11.0"

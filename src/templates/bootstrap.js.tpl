@@ -785,16 +785,35 @@ function _dokkebiScheduleVersionProbeForPath(path) {
   }
 
   async function _initLocalSqlDb() {
-    var script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/npm/sql.js@1.11.0/dist/sql-wasm.js';
-    await new Promise(function(resolve, reject) {
-      script.onload = resolve;
-      script.onerror = function() { reject(new Error('sql.js CDN 로드 실패')); };
-      document.head.appendChild(script);
-    });
+    // sql.js 는 빌드 시 dist/dokkebi 로 복사되어 same-origin 에서 로드된다.
+    // (파일이 없거나 로드 실패 시에만 CDN 으로 fallback, 이때는 SRI 검증)
+    var _SQLJS_CDN = 'https://cdn.jsdelivr.net/npm/sql.js@1.11.0/dist/';
+    var _SQLJS_SRI = 'sha384-1fHJox8K973mCCD3PTAOc0ljrAGXD2VeK8zf+vNIdx55pWPULNlpxKMkU8bF4nUd';
+    var _sqlBase = "__DOKKEBI_PH_SQLJS_BASE__" || _SQLJS_CDN;
+    function _loadSqlJsScript(base, withSri) {
+      return new Promise(function(resolve, reject) {
+        var script = document.createElement('script');
+        script.src = base + 'sql-wasm.js';
+        if (withSri) {
+          script.integrity = _SQLJS_SRI;
+          script.crossOrigin = 'anonymous';
+        }
+        script.onload = resolve;
+        script.onerror = function() { reject(new Error('sql.js 로드 실패: ' + script.src)); };
+        document.head.appendChild(script);
+      });
+    }
+    try {
+      await _loadSqlJsScript(_sqlBase, _sqlBase === _SQLJS_CDN);
+    } catch (e) {
+      if (_sqlBase === _SQLJS_CDN) throw e;
+      console.warn('[dokkebi:localDb] 로컬 sql.js 로드 실패 — CDN(SRI) fallback:', e.message);
+      _sqlBase = _SQLJS_CDN;
+      await _loadSqlJsScript(_SQLJS_CDN, true);
+    }
 
     var SQL = await initSqlJs({
-      locateFile: function(file) { return 'https://cdn.jsdelivr.net/npm/sql.js@1.11.0/dist/' + file; }
+      locateFile: function(file) { return _sqlBase + file; }
     });
 
     var existing = await _loadLocalDbData();

@@ -495,8 +495,11 @@ const _PHASE_B_PH_FULL = [
     { find: '__DOKKEBI_PH_SHARD_BINDINGS__', replace: '[]' },
 ];
 
-export function workerHandshake() {
-    return renderTemplate('worker/handshake.ts.tpl', [..._PHASE_B_PH_INTERNAL]);
+export function workerHandshake(cors = null) {
+    return renderTemplate('worker/handshake.ts.tpl', [
+        ..._PHASE_B_PH_INTERNAL,
+        { find: '__DOKKEBI_PH_CORS__', replace: JSON.stringify(cors?.origins || []) },
+    ]);
 }
 
 /**
@@ -519,7 +522,7 @@ export function workerCapability() {
  * @param {object|null} authz     - normalizeAuthorizationConfig() 결과 (Stage 4)
  * @param {object|null} authLoginCfg - normalizeAuthLoginConfig() 결과 (C-1 워커측 로그인)
  */
-export function workerDb(database, allowlist = null, registry = null, policy = null, authz = null, replayCfg = null, buildMeta = null, adlCfg = null, capabilityCfg = null, sessionsCfg = null, authLoginCfg = null) {
+export function workerDb(database, allowlist = null, registry = null, policy = null, authz = null, replayCfg = null, buildMeta = null, adlCfg = null, capabilityCfg = null, sessionsCfg = null, authLoginCfg = null, cors = null) {
     const d1QueryCode = database === 'd1' ? `
 async function executeD1Query(env: Env, sql: string, params: unknown[]): Promise<DbResult> {
   const stmt = _userDbForSql(env, sql).prepare(sql);
@@ -628,14 +631,18 @@ async function executeD1Query(env: Env, sql: string, params: unknown[]): Promise
         { find: '__DOKKEBI_PH_INTERNAL_BINDING__', replace: internalBinding },
         { find: '__DOKKEBI_PH_SHARD_BINDINGS__',   replace: shardBindings },
         { find: '__DOKKEBI_PH_SESSIONS__',         replace: sessionsEmbedded },
+        { find: '__DOKKEBI_PH_CORS__',             replace: JSON.stringify(cors?.origins || []) },
     ]);
 }
 
 
-export function workerLog() {
-    return renderTemplate('worker/log.ts.tpl', [..._PHASE_B_PH_INTERNAL]);
+export function workerLog(cors = null) {
+    return renderTemplate('worker/log.ts.tpl', [
+        ..._PHASE_B_PH_INTERNAL,
+        { find: '__DOKKEBI_PH_CORS__', replace: JSON.stringify(cors?.origins || []) },
+    ]);
 }
-export function workerAdmin(projectName = 'dokkebi', securitySummary = null, panelIpGuard = null) {
+export function workerAdmin(projectName = 'dokkebi', securitySummary = null, panelIpGuard = null, cors = null) {
     const summaryEmbedded = JSON.stringify(securitySummary || {
         coverage: { score: 0, weights: {}, enabled: {} },
         buildMeta: {},
@@ -659,7 +666,7 @@ export function workerAdmin(projectName = 'dokkebi', securitySummary = null, pan
  *   worker/api/_dokkebi/_panel/[[path]].ts → /api/_dokkebi/_panel/*
  *   (auth, api/overview, api/errors, api/security, api/requests)
  */
-export function workerAdminApi(projectName = 'dokkebi', securitySummary = null, panelIpGuard = null) {
+export function workerAdminApi(projectName = 'dokkebi', securitySummary = null, panelIpGuard = null, cors = null) {
     const summaryEmbedded = JSON.stringify(securitySummary || {
         coverage: { score: 0, weights: {}, enabled: {} },
         buildMeta: {},

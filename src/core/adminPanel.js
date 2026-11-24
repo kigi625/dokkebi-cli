@@ -211,8 +211,21 @@ function _readJson(req, maxBytes = _ADMIN_BODY_LIMITS.default) {
     });
 }
 
+const _PANEL_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+const _PANEL_HEADERS = {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': _PANEL_CSP,
+};
+
 function _json(res, status, data) {
-    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.writeHead(status, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'no-referrer',
+    });
     res.end(JSON.stringify(data));
 }
 
@@ -244,7 +257,7 @@ export async function handleAdminRoute(req, res, opts) {
 
     // 어드민 비밀번호 미설정 시 안내
     if (!adminPassword) {
-        res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', ..._PANEL_HEADERS });
         res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="font-family:monospace;padding:40px;background:#0d1117;color:#e6edf3">
 <h2>⚙️ 도깨비 관제 어드민</h2>
 <p>관제 어드민을 활성화하려면 <code>.env</code>에 아래 항목을 추가하세요:</p>
@@ -255,7 +268,11 @@ export async function handleAdminRoute(req, res, opts) {
 
     // ── 어드민 HTML 서빙 ───────────────────────────────────────
     if ((urlPath === '/_dokkebi/_panel' || urlPath === '/_dokkebi/_panel/') && req.method === 'GET') {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+            ..._PANEL_HEADERS,
+        });
         res.end(generateAdminHtml({ projectName, mode }));
         return true;
     }

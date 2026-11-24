@@ -125,6 +125,15 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 | dev 미디어 업로드 | JWT `exp` 필수, JWT 시크릿 미설정 시 프로세스별 랜덤 시크릿 사용(고정 기본값 제거), `Content-Length` 필수·상한. |
 | 바인드 주소 | `dok serve` / `dok dev` 는 `0.0.0.0` 에 바인딩. 신뢰 네트워크/방화벽 뒤에서만 실행하고, 신뢰 프록시 뒤라면 `DOKKEBI_TRUST_PROXY=1` 설정. |
 
+### 2.6.0 브라우저 정책 · CORS · 로컬 에셋
+
+| 항목 | 동작 |
+|---|---|
+| CORS | `/api/_dokkebi/{db,log,handshake}` 가 `security.cors.allowedOrigins` 를 적용: 목록에 있는 `Origin` 만 echo(+`Vary: Origin`). 비어있거나 `*` 면 기존 `*` 유지. |
+| HSTS | `dok deploy` 가 `_headers` 에 `Strict-Transport-Security: max-age=31536000; includeSubDomains` 추가 (`security.hsts: false` 로 해제). |
+| 관제 패널 | 서버리스/serve 패널 응답에 `Content-Security-Policy`(`frame-ancestors 'none'`), `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` 추가. |
+| 로컬 DB(sql.js) | `localDbMode` 빌드는 `sql-wasm.js/.wasm` 을 `/dokkebi/` 로 복사해 same-origin 로드. CDN fallback 은 SRI(`sha384-…`) 고정. |
+
 ### 2.6 정보 노출
 
 | 구현 | 내용 |
@@ -736,7 +745,7 @@ dokkebi 는 다음 3중 방어로 이 race 를 제거합니다 (모두 자동, �
 | 23 | **무중단 배포 — BC_KEY_MAP** | 빌드/배포 | 항상 ON (v6.x+) | `__DOKKEBI_BC_KEY_MAP__` (최근 5개 빌드 키 FIFO) Worker Secret 등록. 클라가 `bh=<hash12>` 동봉 → `pickClientHandshakeSecrets()` 가 매칭 키로 응답 | 캐시·전파 race로 인한 핸드셰이크 실패 (시나리오 A·B) | ✅ 정상 |
 | 24 | **무중단 배포 — `prop_pending` 흡수** | 빌드/배포 | 항상 ON | `_pickBcKeyForBundle()` 가 `bh` 미매칭 + direct 키도 현재 번들용 아님 시 `status: 'pending'` 반환. 핸드셰이크 핸들러는 잘못된 키로 폴백하지 않고 `200 + { pending: true, code: 'prop_pending', retryAfterMs: 5000 }` 응답 → 클라 SDK 자동 백오프 재시도 | 새 deploy 직후 ~수십초의 Worker Secret 전파 지연 시 사용자에게 빨간 콘솔 에러로 노출되는 문제, 잘못된 키로 복호화 실패 후 무한 재시도 | ✅ 정상 |
 | 25 | **무중단 배포 — 전파 슬립** | 빌드/배포 | 항상 ON | `dok deploy` 순서: Secret 등록 → `DOKKEBI_SECRET_PROPAGATION_MS` (기본 15s) sleep → 정적자산 push | 새 정적 자산 ↔ 옛 Worker Secret race | ✅ 정상 |
-| 26 | **CORS 정책 검증** | 네트워크 | 항상 ON (preflight 경고) | `dok deploy` preflight 가 `security.cors.allowedOrigins` 미설정/`*` 포함 시 경고. 운영자가 실제 프론트 오리진으로 좁혀야 함 (§4.7) | (좁히지 않으면 다른 출처에서 호출 가능) | ✅ 동작 (경고 + 운영자 조치 필요) |
+| 26 | **CORS 정책** | 네트워크 | 항상 ON | `security.cors.allowedOrigins` 가 워커에 임베드되어 `/api/_dokkebi/{db,log,handshake}` 는 목록의 Origin 만 echo(+`Vary: Origin`). 미설정/`*` 면 기존 `*` 유지, `dok deploy` preflight 경고. | 목록에 없는 출처의 교차 읽기 | ✅ 강제 |
 | 27 | **plugin-fetch 도메인 화이트리스트** | 백엔드 로직/외부 호출 | 항상 ON | http/https 강제, TLD 단독 거부, 프로젝트별 화이트리스트 | SSRF, 임의 외부 fetch | ✅ 정상 |
 | 28 | **plugin-ai 빌드 차단** | 빌드 | 항상 ON | `NODE_ENV=production` + `acknowledgeKeyExposure` 미명시 → 빌드 실패 (`pluginLoader.js`) | API 키 브라우저 노출 (구조적 위험) | ✅ 정상 |
 | 29 | **Build-time Advisor** | 빌드/사람 실수 | (opt-out) | OpenAI/Stripe/LemonSqueezy URL, `points.deduct(`, `wallet.charge(`, secret env 직접 사용 라우트 스캔 → capability 미선언 시 경고 | capability 선언 누락 인적 실수 (간접 방어) | ✅ 정상 |
@@ -749,7 +758,7 @@ dokkebi 는 다음 3중 방어로 이 race 를 제거합니다 (모두 자동, �
 | 36 | **Build Artifact Purge** | 빌드/정보 노출 | 항상 ON | `purgeBuildArtifactsFromDist()` — `dist/dokkebi/` 의 민감 JSON 8종 (`env-secrets.json`, `secrets.json`, `query-registry.json`, `sql-allowlist.json`, `wire-runtime.json`, `backend-bundle.chunks.json`, `backend-bundle.sha256`, legacy `env-secrets.js`) 을 `{}` 로 덮어쓰기. 메타는 모두 워커에 인라인 임베드되어 클라가 fetch 안 함. Cloudflare Pages `_redirects` 의 force(`!`) 가 404 미지원 → 비우기가 유일 신뢰 방법 | 정적 자산 fallback 으로 외부 노출 (SQL allowlist·query shape·attestation 매니페스트·env secret) — 허용 테이블·컬럼·번들 내부 구조 정찰 차단 | ✅ 정상 |
 | 37 | **JWT 추가 검증 (alg whitelist + iss/aud/nbf + clockSkew)** | 백엔드 로직/인가 | 항상 ON (Authorization 활성 시) | `authorizationPolicy.js` — `header.typ === 'JWT' && header.alg === 'HS256'` 화이트리스트, `exp` + 30s clockSkew, `nbf` 검사, `iss`/`aud` 옵션 매칭. None alg / alg confusion 차단 | JWT alg=`none` 우회, RS256→HS256 키 혼동 공격, 만료/이른 토큰 사용, 다른 발급자 토큰 재사용 | ✅ 정상 |
 | 38 | **Plaintext Zeroize (best-effort)** | 백엔드 로직/메모리 | 항상 ON | `opaqueHandle` 에서 `_secPlain.fill(0)`, `_bcKeyBytes.fill(0)`, `_bytecodeData.fill(0)`, `sharedBits.fill(0)` 등 복호화·서명·KEK 사용 직후 평문 버퍼 즉시 0 채움 | 메모리 dump / heap 스냅샷에서 만료된 평문 키·바이트코드·세션 비밀 잔존 | ✅ 정상 (best-effort — JS GC 가 사본 복제하면 한계) |
-| 39 | **추가 보안 헤더** (`_headers`) | 네트워크/브라우저 정책 | 항상 ON (deploy 시) | `dist/_headers` 에 `X-Content-Type-Options: nosniff`, `X-XSS-Protection: 1; mode=block`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: camera/microphone/display-capture=(self), geolocation/payment=()`, `index.html/sw.js: no-cache,no-store`, `/dokkebi/*.json: X-Robots-Tag: noindex` | MIME sniffing, 레거시 reflected XSS, clickjacking, referrer 누출, 무권한 권한 요청, SW 캐시 stale, 검색엔진 민감 JSON 인덱싱 | ✅ 정상 |
+| 39 | **추가 보안 헤더** (`_headers`) | 네트워크/브라우저 정책 | 배포 시 항상 ON | `dist/_headers`: `X-Content-Type-Options: nosniff`, `X-XSS-Protection: 1; mode=block`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: strict-origin-when-cross-origin`, **`Strict-Transport-Security: max-age=31536000; includeSubDomains`** (`security.hsts:false` opt-out), `Permissions-Policy`, `no-cache` for index/sw, `noindex` for `/dokkebi/*.json` |
 | 40 | **WebAuthn (Passkey) 요청 서명** | 네트워크/민감행위 인가 | (opt-in) — **런타임 미구현** | 설정 정의(`security.webauthn`) 와 클라 SDK 진입점은 존재하나, **워커 측 assertion 검증 / `requireForOps` 게이트 미구현** (`docs/design/WEBAUTHN.md`: "런타임 SDK 구현은 후속 PR"). `enabled: true` 로 켜도 서버 측 강제 없음 | (구현 시) 비밀번호/세션 탈취 후 결제·관리자 export 등 민감 행위. **현재는 Authorization Policy + Capabilities 로 대체 권장** | ⚠️ 미구현 (§3.3 명시) |
 
 ### 무중단 배포 시나리오 ④ 구현 노트 (v6.x 검증)

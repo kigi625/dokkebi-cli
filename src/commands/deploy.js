@@ -306,7 +306,7 @@ async function _purgeSecretsFromDist(distDir) {
 // Cloudflare Pages _headers 보안 헤더 파일 생성
 // ─────────────────────────────────────────────────────────────
 
-async function _writeSecurityHeaders(distDir, { strictCsp = false, imgSrcExtra = [], connectSrcExtra = [], frameSrcExtra = [] } = {}) {
+async function _writeSecurityHeaders(distDir, { strictCsp = false, imgSrcExtra = [], connectSrcExtra = [], frameSrcExtra = [], hsts = true } = {}) {
     // Phase 2-⑥ — Strict CSP (hash 방식)
     //   strictCsp=true 이면 index.html 의 인라인 <script>/<style> 콘텐츠를 SHA-256
     //   으로 해시해 script-src/style-src 에 'sha256-...' 를 추가하고 'unsafe-inline'
@@ -350,6 +350,7 @@ async function _writeSecurityHeaders(distDir, { strictCsp = false, imgSrcExtra =
   X-XSS-Protection: 1; mode=block
   X-Frame-Options: SAMEORIGIN
   Referrer-Policy: strict-origin-when-cross-origin
+${hsts ? '  Strict-Transport-Security: max-age=31536000; includeSubDomains' : ''}
   Permissions-Policy: camera=(self), microphone=(self), display-capture=(self), geolocation=(), payment=()
   Content-Security-Policy: ${csp}
 
@@ -452,6 +453,7 @@ async function _deployToCloudflarePages(sourceRoot, distDir, projectName, apiTok
         imgSrcExtra: Array.isArray(_cspExtra.imgSrc) ? _cspExtra.imgSrc : [],
         connectSrcExtra: Array.isArray(_cspExtra.connectSrc) ? _cspExtra.connectSrc : [],
         frameSrcExtra: Array.isArray(_cspExtra.frameSrc) ? _cspExtra.frameSrc : [],
+        hsts: opts?.dokkebiConfig?.security?.hsts !== false,
     });
 
     // 배포 전 Secret 등록 시도 (프로젝트가 이미 존재하는 경우 성공)

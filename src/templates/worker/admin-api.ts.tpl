@@ -34,6 +34,19 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
+// 관제 패널은 프레임 삽입/외부 스크립트를 금지한다.
+// (인라인 script/style/onclick 사용 → 'unsafe-inline' 필요)
+const _PANEL_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+const PANEL_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'Content-Security-Policy': _PANEL_CSP,
+};
+const JSON_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+};
 
 const _AUTH_ATTEMPTS = new Map<string, { count: number; resetAt: number; blockUntil: number }>();
 const _AUTH_WINDOW_MS = 5 * 60_000;
@@ -146,7 +159,7 @@ async function verifyToken(token: string, password: string): Promise<boolean> {
   return !isNaN(exp) && Date.now() < exp;
 }
 function json(data: unknown, status = 200) {
-  return new Response(JSON.stringify(data), {status, headers:{'Content-Type':'application/json; charset=utf-8',...CORS}});
+  return new Response(JSON.stringify(data), {status, headers:{'Content-Type':'application/json; charset=utf-8',...CORS,...JSON_HEADERS}});
 }
 async function q(db: D1Database, sql: string, params: unknown[] = []) {
   try { const r = await db.prepare(sql).bind(...params).all(); return {rows:(r.results||[]) as Record<string,unknown>[]}; }
@@ -178,11 +191,11 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     if (!adminPassword) {
       return new Response(
         '<!DOCTYPE html><html><body style="font-family:monospace;padding:40px;background:#0d1117;color:#e6edf3"><h2>⚙️ 도깨비 관제 어드민</h2><p>Cloudflare Worker 시크릿을 설정하세요:</p><pre style="background:#161b22;padding:16px;border-radius:8px">wrangler secret put DOKKEBI_ADMIN_PASSWORD</pre></body></html>',
-        { status: 503, headers: { 'Content-Type': 'text/html' } }
+        { status: 503, headers: { 'Content-Type': 'text/html', ...PANEL_HEADERS } }
       );
     }
     return new Response(PANEL_HTML.replaceAll('__PROJECT__', '__DOKKEBI_PH_PROJECT__').replaceAll('__MODE__', 'serverless'), {
-      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...PANEL_HEADERS },
     });
   }
 

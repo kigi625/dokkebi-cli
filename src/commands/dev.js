@@ -924,10 +924,18 @@ export async function runDev(src, options = {}) {
     // dok build 후 wire-runtime.json 이 있으면 클라이언트에도 동일 wire/PoW 설정을 넣어
     // dev DB 프록시(serverless)와 불일치로 403·재시도 루프가 나지 않게 한다.
     const payloadWireClient = await loadWireRuntimeForLocalProxy(distRoot, proxyMode);
+    let _devSqljsBase = '';
+    if (localDbMode) {
+        try {
+            await fs.access(path.join(distRoot, 'dokkebi', 'sql-wasm.js'));
+            _devSqljsBase = '/dokkebi/';
+        } catch { /* CDN fallback */ }
+    }
     _devBootstrapHtml = generateBootstrapScript({
         dbType,
         bundleHash: '',
         localDbMode,
+        sqljsBase: _devSqljsBase,
         migrationSql,
         pluginHostCode,
         pluginVmBridge,

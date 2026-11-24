@@ -1830,23 +1830,35 @@ function sanitizeError(err: unknown): string {
   return msg.replace(/\/[^\s]+/g, '[경로]').slice(0, 200);
 }
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-};
+const _CORS_ORIGINS: string[] = __DOKKEBI_PH_CORS__;
+// security.cors.allowedOrigins 가 설정되어 있으면 그 오리진만 허용한다.
+// (비어 있거나 '*' 이면 기존 동작과 동일하게 *)
+function _corsHeadersFor(req: Request): Record<string, string> {
+  const out: Record<string, string> = {
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Vary': 'Origin',
+  };
+  const origin = req.headers.get('Origin') || '';
+  if (_CORS_ORIGINS.length === 0 || _CORS_ORIGINS.includes('*')) {
+    out['Access-Control-Allow-Origin'] = '*';
+  } else if (origin && _CORS_ORIGINS.includes(origin)) {
+    out['Access-Control-Allow-Origin'] = origin;
+  }
+  return out;
+}
 
 export const onRequest: PagesFunction<Env> = async (ctx) => {
   const { request, env } = ctx;
 
   if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS });
+    return new Response(null, { status: 204, headers: _corsHeadersFor(request) });
   }
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
   }
 
-  const headers = { 'Content-Type': 'application/json; charset=utf-8', ...CORS };
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', ..._corsHeadersFor(request) };
   const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '';
   const reqStart = Date.now();
 

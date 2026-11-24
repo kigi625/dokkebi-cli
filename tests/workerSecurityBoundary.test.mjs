@@ -51,8 +51,8 @@ const POLICY = normalizePolicyConfig(
 );
 
 async function loadWorkerInternals() {
-    const source = workerDb('d1', ALLOWLIST, null, POLICY, AUTHZ, null)
-        + '\nexport { validateSqlAllowlist, findInternalTableRef, _az_checkSql, verifyTenantPolicy, injectTenantPolicy, _pe_detectOp, _isReadOnlySelectSql, _az_resolveJwtSecret, _az_verifyJwtHs256, _jwtClaimIdentity };\n';
+    const source = workerDb('d1', ALLOWLIST, null, POLICY, AUTHZ, null, null, null, null, null, null, { origins: ['https://app.example.com'] })
+        + '\nexport { validateSqlAllowlist, findInternalTableRef, _az_checkSql, verifyTenantPolicy, injectTenantPolicy, _pe_detectOp, _isReadOnlySelectSql, _az_resolveJwtSecret, _az_verifyJwtHs256, _jwtClaimIdentity, _corsHeadersFor };\n';
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dokkebi-worker-sec-'));
     const tsPath = path.join(dir, 'worker.ts');
     await fs.writeFile(tsPath, source, 'utf-8');
@@ -202,4 +202,17 @@ test('워커 템플릿: JWT claim 을 명시하면 그 claim 을 우선 (H4)', (
     assert.equal(worker._jwtClaimIdentity({ user_id: 'u1', org_id: 'o1' }, 'org_id'), 'o1');
     assert.equal(worker._jwtClaimIdentity({ user_id: 'u1' }, 'org_id'), 'u1');
     assert.equal(worker._jwtClaimIdentity({}, 'org_id'), null);
+});
+
+test('워커 템플릿: CORS allowedOrigins 를 강제 (H4/4번)', () => {
+    const req = (origin) => ({ headers: new Headers(origin ? { origin } : {}) });
+    const ok = worker._corsHeadersFor(req('https://app.example.com'));
+    assert.equal(ok['Access-Control-Allow-Origin'], 'https://app.example.com');
+    assert.equal(ok['Vary'], 'Origin');
+
+    const bad = worker._corsHeadersFor(req('https://evil.example.com'));
+    assert.equal(bad['Access-Control-Allow-Origin'], undefined);
+
+    const noOrigin = worker._corsHeadersFor(req(''));
+    assert.equal(noOrigin['Access-Control-Allow-Origin'], undefined);
 });
