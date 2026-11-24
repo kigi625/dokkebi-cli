@@ -53,6 +53,11 @@ test('C1: allowlist 가 WITH-DML 의 쓰기 권한을 요구', () => {
 });
 
 test('C1: Authorization 이 WITH-DML 을 SELECT 규칙으로 통과시키지 않음', () => {
+    // UPDATE OR REPLACE 대상 테이블도 추출된다.
+    const upd = extractOpAndTables('UPDATE OR REPLACE secrets SET x = 1 FROM posts');
+    assert.ok(upd.tables.includes('secrets'), upd.tables.join(','));
+    assert.ok(upd.tables.includes('posts'), upd.tables.join(','));
+
     const authz = normalizeAuthorizationConfig({
         enabled: true, mode: 'strict',
         rules: {
@@ -220,6 +225,15 @@ test('C4: 콤마 조인으로 보호 테이블을 숨길 수 없다', () => {
         'SELECT * FROM (posts) p, users u',
         'SELECT * FROM ((users))',
         'UPDATE posts SET x = 1 FROM [users] WHERE users.id = posts.id',
+        // JOIN 제약(INDEXED BY / NOT INDEXED / ON / USING) 뒤 콤마로 이어지는 테이블
+        'SELECT * FROM posts INDEXED BY idx, users',
+        'SELECT * FROM posts NOT INDEXED, users',
+        'SELECT * FROM posts JOIN users ON posts.id = users.id, [secrets]',
+        'SELECT * FROM posts JOIN users ON posts.id IN (SELECT id FROM users), [secrets]',
+        'SELECT * FROM posts JOIN users USING(id), [secrets]',
+        // UPDATE OR <conflict> 대상 테이블
+        'UPDATE OR REPLACE [users] SET x = 1',
+        'UPDATE OR IGNORE users SET x = 1 FROM posts',
     ]) {
         assert.equal(validateSqlAllowlist(sql, allow).allowed, false, sql);
         const t = extractOpAndTables(sql);

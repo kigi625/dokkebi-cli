@@ -210,6 +210,60 @@ export function extractTableRefs(normalized) {
         return false;
     }
 
+    function wordAt(i, limit = n) {
+        if (i < 0 || i >= limit || !/[A-Za-z_]/.test(s[i] || '')) return null;
+        let j = i;
+        while (j < limit && /[A-Za-z0-9_]/.test(s[j])) j++;
+        return { value: s.slice(i, j), end: j };
+    }
+
+    function isWordAt(i, word, limit = n) {
+        const w = wordAt(i, limit);
+        return !!w && w.value.toUpperCase() === word;
+    }
+
+    // `JOIN ... ON <expr>` 의 식을 건너뛰고 top-level 콤마 또는 FROM 절 종료 지점을 반환.
+    // (ON 식 안의 함수 호출/서브쿼리 콤마를 테이블 구분자로 오인하지 않도록)
+    function skipJoinOn(i, limit = n) {
+        const END_KW = new Set([
+            'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'HAVING', 'UNION', 'INTERSECT',
+            'EXCEPT', 'RETURNING', 'WINDOW', 'JOIN', 'INNER', 'LEFT', 'RIGHT',
+            'FULL', 'CROSS', 'NATURAL', 'OUTER', 'ON', 'USING',
+        ]);
+        let depth = 0;
+        for (let j = i; j < limit; j++) {
+            const ch = s[j];
+            if (ch === '"' || ch === '`' || ch === '[') {
+                const t = readIdent(j, limit);
+                j = (t ? t.end : j + 1) - 1;
+                continue;
+            }
+            if (ch === "'") {
+                let k = j + 1;
+                while (k < limit) {
+                    if (s[k] === "'" && s[k + 1] === "'") { k += 2; continue; }
+                    if (s[k] === "'") { k++; break; }
+                    k++;
+                }
+                j = k - 1;
+                continue;
+            }
+            if (ch === '(') { depth++; continue; }
+            if (ch === ')') {
+                if (depth > 0) { depth--; continue; }
+                return j;
+            }
+            if (depth !== 0) continue;
+            if (ch === ',' || ch === ';') return j;
+            if (/[A-Za-z_]/.test(ch)) {
+                const w = wordAt(j, limit);
+                if (w && END_KW.has(w.value.toUpperCase())) return j;
+                if (w) j = w.end - 1;
+            }
+        }
+        return limit;
+    }
+
     function readRef(i, limit = n) {
         const first = readIdent(i, limit);
         if (!first) return null;
@@ -275,6 +329,42 @@ export function extractTableRefs(normalized) {
                 refs.push({ name: r.name, alias: r.alias, offset: r.offset });
                 pos = r.end;
             }
+            // JOIN 제약(INDEXED BY / NOT INDEXED / ON ... / USING (...))를 건너뛰고
+            // 뒤따르는 콤마 조인을 계속 수집한다.
+            //   `FROM posts INDEXED BY idx, secrets`
+            //   `FROM posts JOIN users ON ..., secrets`
+            //   `FROM posts JOIN users USING(id), secrets`
+            for (;;) {
+                const k = skipWs(pos, limit);
+                if (isWordAt(k, 'INDEXED', limit)) {
+                    let p = skipWs(k + 7, limit);
+                    if (!isWordAt(p, 'BY', limit)) break;
+                    p = skipWs(p + 2, limit);
+                    const idx = readIdent(p, limit);
+                    if (!idx) break;
+                    pos = idx.end;
+                    continue;
+                }
+                if (isWordAt(k, 'NOT', limit)) {
+                    const p = skipWs(k + 3, limit);
+                    if (!isWordAt(p, 'INDEXED', limit)) break;
+                    pos = p + 7;
+                    continue;
+                }
+                if (isWordAt(k, 'ON', limit)) {
+                    pos = skipJoinOn(k + 2, limit);
+                    continue;
+                }
+                if (isWordAt(k, 'USING', limit)) {
+                    let p = skipWs(k + 5, limit);
+                    if (s[p] !== '(') break;
+                    const close = matchParen(p, limit);
+                    if (close < 0) break;
+                    pos = close + 1;
+                    continue;
+                }
+                break;
+            }
             let next = skipWs(pos, limit);
             if (next >= limit || s[next] !== ',') break;
             pos = next + 1;
@@ -304,7 +394,16 @@ export function extractTableRefs(normalized) {
         while (j < n && /[A-Za-z0-9_]/.test(s[j])) j++;
         const kw = s.slice(i, j).toUpperCase();
         if (!TABLE_KW.has(kw)) { i = j - 1; continue; }
-        const start = skipWs(j);
+        let start = skipWs(j);
+        // `UPDATE OR REPLACE|ROLLBACK|ABORT|FAIL|IGNORE <table>` — 충돌 절을 건너뛰고
+        // 대상 테이블을 읽는다. (건너뛰지 않으면 대상 테이블이 추출되지 않아
+        //  allowlist/tenant/authz 가 모두 우회된다)
+        if (kw === 'UPDATE' && isWordAt(start, 'OR')) {
+            const conflict = wordAt(skipWs(start + 2));
+            if (conflict && ['REPLACE', 'ROLLBACK', 'ABORT', 'FAIL', 'IGNORE'].includes(conflict.value.toUpperCase())) {
+                start = skipWs(conflict.end);
+            }
+        }
         const list = readList(start);
         if (list.refs.length === 0) { i = j - 1; continue; }
         for (const r of list.refs) {

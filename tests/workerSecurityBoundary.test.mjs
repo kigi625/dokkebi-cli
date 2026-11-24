@@ -233,6 +233,14 @@ test('워커 템플릿: 콤마 조인 보호 테이블 우회 차단 (C4)', asyn
         'SELECT * FROM (posts) p, secrets s',
         'SELECT * FROM ((secrets))',
         'UPDATE posts SET x = 1 FROM [secrets] WHERE secrets.id = posts.id',
+        // JOIN 제약(INDEXED BY / NOT INDEXED / ON / USING) 뒤 콤마로 이어지는 테이블
+        'SELECT * FROM posts INDEXED BY idx, secrets',
+        'SELECT * FROM posts NOT INDEXED, secrets',
+        'SELECT * FROM posts JOIN users ON posts.id = users.id, secrets',
+        'SELECT * FROM posts JOIN users USING(id), secrets',
+        // UPDATE OR <conflict> 대상 테이블
+        'UPDATE OR REPLACE secrets SET x = 1',
+        'UPDATE OR IGNORE [secrets] SET x = 1 FROM posts',
     ]) {
         assert.equal(worker.validateSqlAllowlist(sql, { strict: true }).allowed, false, sql);
     }

@@ -86,10 +86,12 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 | 레이어 | 역할 | 커버리지 |
 |---|---|---|
 | **공통 방어** | 다중 문장(`;`), 주석(`-- /**/`), 50KB 초과, 위험 토큰(`ATTACH`, `PRAGMA`, `LOAD_EXTENSION`, `INTO OUTFILE`, `xp_*`, `SLEEP`, `PG_SLEEP`, `BENCHMARK`, `WAITFOR`, `INFORMATION_SCHEMA`) 차단 | 상시 |
-| **SQL Allowlist** | 테이블 × 연산(SELECT/INSERT/UPDATE/DELETE) 단위 허가. 모든 FROM/JOIN/INTO/UPDATE 참조 검사 + 2차 참조(JOIN/서브쿼리/`INSERT ... SELECT`)는 SELECT 권한 필수. 내부 테이블(`_dokkebi_*`, `sqlite_*`)과 클라이언트 DDL 은 항상 차단 | 상시 |
+| **SQL Allowlist** | 테이블 × 연산(SELECT/INSERT/UPDATE/DELETE) 단위 허가. 모든 FROM/JOIN/INTO/UPDATE 참조 검사 — 콤마 조인, 괄호 목록, `INDEXED BY`/`ON`/`USING`, `UPDATE OR …` 대상 포함. 2차 참조(JOIN/서브쿼리/`INSERT ... SELECT`)는 SELECT 권한 필수. 내부 테이블(`_dokkebi_*`, `sqlite_*`)과 클라이언트 DDL 은 항상 차단 | 상시 |
 | **Query Registry** | SQL **shape** 단위 허가 — 컬럼 변경, WHERE 제거, `OR 1=1` 등 구조 변조 차단. 정적 스캐너 + 주석 선언 + dev 학습으로 수집 | 상시 (auto/strict 모드) |
 | **Tenant Policy** | Row-level 격리 — `WHERE user_id = ?` 검증(verify) 또는 자동 주입(inject). top-level `OR`, 누락 WHERE, aliased column 감지. **테넌트 신분은 검증된 JWT 에서만 (`requireJwtTenant`, authorization/auth.login 활성 시 기본 ON). 세션 `tenant_json` 은 클라이언트 주장값** | opt-in |
 | **Authorization** | 연산-레벨 권한 — "DELETE posts 는 role=admin 만" — JWT 서명 검증 + role 매칭. **참조된 모든 테이블**에 대해 평가(JOIN / `INSERT ... SELECT` 포함, 주 연산 대상이 아닌 참조는 SELECT 로 취급) | opt-in |
+
+테이블 참조는 따옴표/괄호를 인식하는 파서(`sqlShape.extractTableRefs`)로 추출한다: `'…'` 문자열, `"…"`/`` `…` ``/`[…]` 식별자, 스키마 한정, 괄호로 묶인 테이블 목록, 콤마 조인, `INDEXED BY`/`NOT INDEXED`/`ON`/`USING` 제약, `UPDATE OR <conflict>` 대상까지 포함한다. 참조된 모든 테이블을 검사하므로 등록되지 않은 테이블을 조인 뒤에 숨길 수 없다. 다중 테이블 문장에서는 테넌트 필터를 반드시 한정해야 하며(`alias.col` 또는 `table.col`), 비한정 `col = ?` 는 다른 테이블 컬럼에 바인딩될 수 있어 거부한다.
 
 파라미터 바인딩은 D1/Supabase/Appwrite SDK 가 `prepare().bind()` 로 처리. 프록시는 raw SQL 을 절대 문자열 보간하지 않음.
 
@@ -726,7 +728,7 @@ dokkebi 는 다음 3중 방어로 이 race 를 제거합니다 (모두 자동, �
 | 4 | **Forward Secrecy (Ephemeral ECDH)** | 네트워크/전송 | 세션키 노출 시에도 과거 트래픽 보호 | 매 핸드셰이크마다 새 키쌍, `_dokkebi_ephemeral_keys` 60s TTL 후 삭제 | 장기 세션키 탈취 후 과거 트래픽 복호화 | ✅ 정상 |
 | 5 | **세션 관리 (FIFO + 토큰 버킷)** | 네트워크/세션 | DoS 방어 | `_dokkebi_sessions` D1 + per-session `bucketTokens`/`bucketRefillAt`; 핸드셰이크 IP 버킷(20/분) + 전역 상한 `DOKKEBI_MAX_SESSIONS`(기본 500, FIFO 축출). 세션 폭탄/요청 폭주 방어 | 세션 폭탄, 단일 세션 다발 공격 | ✅ 정상 |
 | 6 | **Envelope Body 크기 제한 (512KB)** | 네트워크/DoS | body DoS 방어 | `MAX_ENVELOPE_BYTES = 512*1024` + `Content-Length` 선체크 → 413 | 거대 페이로드 DoS, 메모리 고갈 | ✅ 정상 |
-| 7 | **SQL Allowlist (테이블×op)** | 백엔드 로직/DB | 4-레이어 1단계 — 허용된 테이블·op만 통과 | `dist/dokkebi/sql-allowlist.json` 빌드시 추출 → `workerDb` 에 인라인 임베드. SELECT/INSERT/UPDATE/DELETE 단위, 2차 참조는 SELECT 필수. **내부 테이블(`_dokkebi_*`, `sqlite_*`)·클라이언트 DDL 은 항상 차단** (`findInternalTableRef`) | 임의 테이블 SELECT/UPDATE/DELETE, **시스템 테이블 변조 / 세션키 탈취**, 스키마 탐색 | ✅ 정상 |
+| 7 | **SQL Allowlist (테이블×op)** | 백엔드 로직/DB | 4-레이어 1단계 — 허용된 테이블·op만 통과 | `dist/dokkebi/sql-allowlist.json` 빌드시 추출 → `workerDb` 에 인라인 임베드. SELECT/INSERT/UPDATE/DELETE 단위. 참조 추출은 따옴표/괄호를 인식하며 콤마 조인, `INDEXED BY`/`ON`/`USING`, 괄호 목록, `UPDATE OR …` 대상을 포함. 2차 참조는 SELECT 필수. **내부 테이블(`_dokkebi_*`, `sqlite_*`)·클라이언트 DDL 은 항상 차단** (`findInternalTableRef`) | 임의 테이블 SELECT/UPDATE/DELETE, **시스템 테이블 변조 / 세션키 탈취**, 스키마 탐색 | ✅ 정상 |
 | 8 | **Query Registry (SQL shape)** | 백엔드 로직/DB | 4-레이어 2단계 — SQL 구조 변조 차단 | shape 등록·매칭. `OR 1=1`, WHERE 누락, 컬럼 변경 차단. **기본 `auto`** (등록 안된 건 _debugSql 폴백 = 사실상 비활성), `queryRegistry.strict: true` 시 미등록 차단 | SQL 구조 변조, `OR 1=1`, WHERE 제거 | ✅ 정상 (auto 시 방어 약화 — §4.2 참조) |
 | 9 | **공통 SQL 방어** | 백엔드 로직/DB | 4-레이어 0단계 | `hasMultipleStatements` (다중 문장 `;`), `stripStringsAndComments` (주석 `--`/`/* */`), 위험토큰 차단 (`ATTACH`, `DETACH`, `PRAGMA`, `LOAD_EXTENSION`, `INTO OUTFILE`, `INTO DUMPFILE`, `INFORMATION_SCHEMA`, `PG_SLEEP`, `SLEEP(`, `BENCHMARK(`, `WAITFOR`, `XP_`, `SP_EXECUTESQL`) | SQL injection (스택 쿼리, 주석 우회), DB 권한 확장, 시간 기반 blind injection | ✅ 정상 |
 | 10 | **MTD — Payload Field Rotation** | 네트워크/MTD (Moving Target Defense) | 봉투 내부 키명을 빌드별로 회전 (정적 시그니처 방어) | `dok build` 가 `buildId` 기반 SHA-256 으로 `queryId/params/_debugSql/_setTenant/_login/_attest/_capabilityUnlock/_tableExists/sql/_jwt` 10개 키를 `_f<hash20>` 으로 매핑(`PAYLOAD_FIELD_ROTATE_CANONICAL`). `wire-runtime.json` + `_payloadWire.ts` 로 워커·클라 동시 임베드. `denormalizePayload()` 가 active+previous(이전 빌드 호환) 두 매핑 모두 인식 → **무중단 배포 호환**. `DOKKEBI_HARDENING_ROTATE=off` 로 비활성 가능 (기본 ON) | 자동화 도구의 정적 키 시그니처 매칭(`queryId=`/`_debugSql=`), 캡처-재구성 봇, 정적 페이로드 스캐너, 빌드 간 페이로드 다이프 분석 | ✅ 정상 |
