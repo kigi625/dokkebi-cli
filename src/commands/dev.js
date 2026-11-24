@@ -27,7 +27,10 @@ import {
     randomBytes,
 } from 'crypto';
 import { tryDevBlogMediaPost, tryDevBlogMediaGet } from '../core/devBlogMedia.js';
+import { tryDokkebiGifEncode } from '../core/gifEncode.js';
+import { trustProxyFromEnv } from '../core/clientIp.js';
 
+let _devMediaRandomSecret = '';
 let _scatchyDrawingDev = null;
 async function loadScatchyDrawingDev(sourceRoot) {
     if (_scatchyDrawingDev !== null) return _scatchyDrawingDev;
@@ -93,11 +96,21 @@ async function reinjectBootstrap(htmlPath) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 개발 서버 전용 ECDH 세션 (서버 시작 시 1회 생성)
+// 개발 서버 ECDH — 핸드셰이크마다 새 키쌍 (Forward Secrecy)
 // ─────────────────────────────────────────────────────────────
-const serverEcdh = createECDH('prime256v1');
-serverEcdh.generateKeys();
-const SERVER_PUB_KEY_B64 = serverEcdh.getPublicKey('base64');
+const EPHEMERAL_KEY_TTL_MS = 60_000;
+const ephemeralServerKeys = new Map(); // keyId → { ecdh, createdAt }
+function _createEphemeralServerKey() {
+    const now = Date.now();
+    for (const [id, v] of ephemeralServerKeys) {
+        if (now - v.createdAt > EPHEMERAL_KEY_TTL_MS) ephemeralServerKeys.delete(id);
+    }
+    const ecdh = createECDH('prime256v1');
+    ecdh.generateKeys();
+    const keyId = randomBytes(16).toString('hex');
+    ephemeralServerKeys.set(keyId, { ecdh, createdAt: now });
+    return { keyId, serverPubKey: ecdh.getPublicKey('base64') };
+}
 
 const sessionStore  = new Map();
 const nonceCache    = new Map();
@@ -396,16 +409,24 @@ async function handleHandshake(req, res, _envSecrets = {}) {
     try { body = await readJson(req, { maxBytes: BODY_LIMITS.handshake }); }
     catch (e) { handleReadJsonError(res, e); return; }
 
-    const { clientPubKey } = body;
+    const { clientPubKey, keyId } = body;
     if (!clientPubKey) {
         res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'clientPubKey 필드가 없습니다' }));
         return;
     }
+    const _ephEntry = keyId ? ephemeralServerKeys.get(String(keyId)) : null;
+    if (!_ephEntry || Date.now() - _ephEntry.createdAt > EPHEMERAL_KEY_TTL_MS) {
+        if (keyId) ephemeralServerKeys.delete(String(keyId));
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: '키 교환 정보가 만료되었습니다. 페이지를 새로고침하세요.' }));
+        return;
+    }
+    ephemeralServerKeys.delete(String(keyId));
 
     try {
         const clientPubBuf  = Buffer.from(clientPubKey, 'base64');
-        const sharedSecret  = serverEcdh.computeSecret(clientPubBuf);
+        const sharedSecret  = _ephEntry.ecdh.computeSecret(clientPubBuf);
         const encKey = Buffer.from(hkdfSync('sha256', sharedSecret, Buffer.alloc(0), Buffer.from('dokkebi-enc', 'utf-8'), 32));
         const sigKey = Buffer.from(hkdfSync('sha256', sharedSecret, Buffer.alloc(0), Buffer.from('dokkebi-sig', 'utf-8'), 32));
 
@@ -982,8 +1003,14 @@ export async function runDev(src, options = {}) {
             await handleAdminRoute(req, res, {
                 adminPassword, adminAllowedIps, panelIpGuardEnabled, dbType, dbConfig, proxyDbQuery,
                 activeConnections: sseClients.size,
-                projectName, mode: 'dev',
+                projectName, mode: 'dev', trustProxy: trustProxyFromEnv(process.env),
             });
+            return;
+        }
+
+        // ── Local GIF encode (ffmpeg) — sticker editor ────────
+        if (urlPath === '/_dokkebi/gif' || urlPath === '/api/_dokkebi/gif') {
+            await tryDokkebiGifEncode(req, res, { trustProxy: trustProxyFromEnv(process.env) });
             return;
         }
 
@@ -1022,8 +1049,9 @@ export async function runDev(src, options = {}) {
                 res.end(JSON.stringify({ error: '요청이 너무 많습니다.' }));
                 return;
             }
+            const _eph = _createEphemeralServerKey();
             res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-            res.end(JSON.stringify({ serverPubKey: SERVER_PUB_KEY_B64 }));
+            res.end(JSON.stringify({ serverPubKey: _eph.serverPubKey, keyId: _eph.keyId }));
             return;
         }
 
@@ -1069,12 +1097,14 @@ export async function runDev(src, options = {}) {
         const devMediaRoot = path.join(sourceRoot, '.dev-blog-media');
         // 브라우저 WASM: 핸드셰이크로 받은 env-secrets 가 kv 우선(.env는 서버 핸드셰이크에 안 실림)
         const devEnv = { ...envVars, ...process.env };
+        // 시크릿 미설정 시 고정 문자열을 쓰면 누구나 토큰을 위조할 수 있다.
+        // 설정이 없으면 프로세스마다 랜덤 시크릿(검증 불가 → 업로드 차단)으로 동작한다.
         const jwtForMedia =
             envSecrets.DOKKEBI_JWT_SECRET ||
             envSecrets.JWT_SECRET ||
             devEnv.DOKKEBI_JWT_SECRET ||
             devEnv.JWT_SECRET ||
-            'change-this-in-production';
+            (_devMediaRandomSecret || (_devMediaRandomSecret = randomBytes(32).toString('hex')));
         if (await tryDevBlogMediaPost(req, res, { jwtSecret: jwtForMedia, mediaRoot: devMediaRoot })) return;
         if (await tryDevBlogMediaGet(req, res, urlPath, devMediaRoot)) return;
 

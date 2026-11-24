@@ -181,6 +181,10 @@ const sql = '/*!read*/ ' + buildSelectSql(filters);  // replica 우선
 const sql = '/*!write*/ ' + buildUpsertSql(...);     // primary 강제
 ```
 
+> **보안 (H1):** `/*!read*/` 는 **실제 op 가 SELECT 일 때만** 읽기로 인정된다.
+> `/*!read*/ DELETE ...` 처럼 힌트로 쓰기를 읽기로 위장할 수 없으며, 판별이 모호하면
+> 쓰기로 취급한다. `/*!write*/` 는 SELECT 라도 primary 로 보낸다.
+
 ### 정합성 검증 (build / deploy 시 자동)
 
 - 샤딩 모드인데 `strategy.key` 가 비어있으면 **에러**

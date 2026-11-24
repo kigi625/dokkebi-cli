@@ -81,6 +81,35 @@ export async function login(ctx, email, password) {
 
 내부 동작: `ctx.setSessionTenant(obj)` 는 `POST /api/_dokkebi/db` 에 `{_setTenant: obj}` payload 를 전송 → 서버가 `UPDATE _dokkebi_sessions SET tenant_json = ? WHERE session_id = ?` 실행. `obj === null` 이면 로그아웃(클리어).
 
+> **⚠ 보안 경계  — tenant_json 은 클라이언트가 주장하는 값입니다**
+> `tenant_json` 은 클라이언트 payload 로 기록되므로 신분 증명이 아닙니다. 악의적 클라이언트는
+> `_setTenant({ user_id: '<피해자>' })` 를 보내 피해자의 행을 읽을 수 있습니다.
+> 실제 격리를 위해서는 테넌트가 **서버 검증 소스**에서 와야 합니다.
+>
+> - `policy.requireJwtTenant: true` — 테넌트 클레임을 검증된 JWT
+>   (`Authorization: Bearer` 또는 암호화 payload `_jwt`)에서만 가져옵니다.
+>   세션 `tenant_json` 은 무시하며, JWT 에 클레임이 없으면 `TENANT_MISSING` 입니다.
+>   **기본값:** `authorization.enabled` 또는 `auth.login.enabled` 가 켜져 있으면 자동 ON.
+> - Worker 측 로그인(`auth.login`) — 로그인 쿼리 결과로 클레임을 바인딩하고
+>   클라이언트의 `_setTenant` 호출을 거부합니다(`TENANT_SERVER_BOUND`).
+> - 유효한 JWT 가 있으면 `_setTenant` 로 테넌트 클레임을 다른 값으로 바꿀 수 없으며
+>   (`TENANT_CLIENT_OVERRIDE`), 항상 JWT 값이 우선합니다.
+> - JWT 식별자 추출은 설정한 `policy.claim` 을 우선하고, 없을 때만 `userId` / `user_id` 로
+>   fallback 합니다 (`org_id` 자리에 user_id 가 들어가는 오매핑 방지).
+> - 클라이언트 JWT 배선: `__DOKKEBI_LOGIN__()` 이 발급 토큰을 보관해 이후 모든 DB 요청에
+>   자동 첨부합니다. 다른 경로에서 받은 토큰은 `window.__DOKKEBI_DB_JWT__ = () => token` 으로 연결하세요.
+>
+> JWT 없는 익명 해시 ID 테넌시는 UX 용도로는 동작하지만 **인가 경계가 아닙니다**
+> — 어떤 클라이언트든 남의 해시를 주장할 수 있습니다.
+>
+> 시스템 테이블(`_dokkebi_*`, `sqlite_*`)은 allowlist/registry 설정과 무관하게
+> 클라이언트 SQL 에서 항상 차단됩니다.
+>
+> **server 모드(`dok serve`)** 도 같은 테넌트 규칙을 적용합니다. 세션 테넌트는 서버 메모리에
+> 보관되며 `_setTenant` 는 동일한 JWT 고정 / `requireJwtTenant` 가드를 따릅니다.
+> `auth.login`, Signed Unlock Token 은 serverless 전용이며 명시적
+> `LOGIN_UNSUPPORTED` / `CAPABILITY_UNSUPPORTED` 코드를 반환합니다.
+
 ### 테이블별 `sessionClaim` (v5.4+) — JWT 없이 해시 ID 만으로 tenant 격리
 
 Tenant Policy 는 **로그인 / JWT 와 무관**합니다. 세션의 `tenant_json` 은 자유 형태 JSON 이므로, 사용자 식별에 쓰는 **어떤 값**이든 (해시 토큰, 디바이스 ID, 익명 쿠키 등) tenant 로 삼을 수 있습니다.
@@ -118,9 +147,14 @@ await ctx.setSessionTenant({
 
 엔진의 클레임 해석 순서 (테이블 단위로 각각 평가):
 
-1. `tables[X].sessionClaim` — 테이블에서 명시한 세션 키 (가장 명확)
-2. `policy.sessionClaim` — 전역 기본 (하위 호환)
+1. `tables[X].sessionClaim` — 테이블에서 명시한 세션 키. **배타적**: 지정되면 다른 클레임으로
+   fallback 하지 않는다 (user_id 가 site_id 같은 FK 에 들어가는 오매핑 방지).
+2. `policy.sessionClaim` — 전역 기본 (테이블에 sessionClaim 이 없을 때만)
 3. `tenantColumn` 이름 그대로 — 관례 fallback (컬럼명 = 세션 키)
+
+> `mode: 'optional'` 은 **클레임이 해석되고 매핑이 모호하지 않을 때만** 강제된다
+> (`sessionClaim` 명시, 또는 `tenantColumn` == 전역 claim 이름). 그 외에는 공개로 취급한다.
+> 예: `inquiries.site_id` + 전역 `user_id` → `sessionClaim: 'site_id'` 를 추가하기 전까지 공개.
 
 예를 들어 `SELECT * FROM notos WHERE creator_token = ?` 쿼리는 `notos.sessionClaim = 'creator_token'` 을 보고 세션의 `creator_token` 값과 대조합니다. `users.id` 처럼 **컬럼명과 세션 키가 다른 관례 케이스**만 `sessionClaim: 'user_id'` 를 명시해 주면 끝. 나머지는 `dok policy:scaffold` 가 컬럼명을 그대로 세션 키로 자동 배치합니다.
 
@@ -417,8 +451,10 @@ ALTER TABLE _dokkebi_sessions ADD COLUMN tenant_json TEXT;
 for each table T referenced by sql:
   policy = allowlist.policy(T)
   if policy.mode == 'none':         continue
-  if policy.mode == 'optional':     continue
-  if policy.mode == 'enforce':
+  if policy.mode == 'optional':
+    # 클레임이 해석되고 매핑이 모호하지 않을 때만 강제
+    if !claimResolved || ambiguousMapping: continue
+  if policy.mode == 'enforce' || policy.mode == 'optional':
     tenantCol = policy.tenantColumn
     sessionClaim = tenant.claim              # e.g. 'user_id'
     expectedValue = tenantContext[sessionClaim]

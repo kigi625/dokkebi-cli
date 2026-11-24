@@ -16,6 +16,7 @@ export const PAYLOAD_FIELD_ROTATE_CANONICAL = [
     '_login',
     '_attest',
     '_capabilityUnlock',
+    '_tableExists',
     'sql',
     '_jwt',
 ];

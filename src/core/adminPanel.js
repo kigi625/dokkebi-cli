@@ -15,6 +15,7 @@
 
 import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import { renderTemplate } from './templateLoader.js';
+import { resolveClientIp } from './clientIp.js';
 
 // ─────────────────────────────────────────────────────────────
 // /auth Rate Limiting — IP당 5분에 최대 10회, 초과 시 10분 잠금
@@ -49,11 +50,10 @@ function _resetAuthRateLimit(ip) {
     _authAttempts.delete(ip);
 }
 
-function _requestIp(req) {
-    return req.headers['cf-connecting-ip']
-        || (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
-        || req.socket?.remoteAddress
-        || 'unknown';
+function _requestIp(req, trustProxy = false) {
+    // 기본은 소켓 피어만 신뢰. X-Forwarded-For 위조로 패널 IP allowlist /
+    // 로그인 레이트리밋을 우회하지 못하게 한다 (DOKKEBI_TRUST_PROXY=1 로 opt-in).
+    return resolveClientIp(req, { trustProxy });
 }
 
 function _normalizeIp(ip) {
@@ -229,13 +229,13 @@ function _json(res, status, data) {
  * @param {string}   opts.mode              - 'serve' | 'dev'
  */
 export async function handleAdminRoute(req, res, opts) {
-    const { adminPassword, adminAllowedIps = '', panelIpGuardEnabled = false, dbType, dbConfig, proxyDbQuery, activeConnections = 0, projectName = 'dokkebi', mode = 'serve' } = opts;
+    const { adminPassword, adminAllowedIps = '', panelIpGuardEnabled = false, dbType, dbConfig, proxyDbQuery, activeConnections = 0, projectName = 'dokkebi', mode = 'serve', trustProxy = false } = opts;
     const rawPath = req.url?.split('?')[0] || '/';
     // /api/_dokkebi/_panel/... 와 /_dokkebi/_panel/... 모두 동일하게 처리
     const urlPath = rawPath.startsWith('/api/_dokkebi/_panel')
         ? rawPath.slice('/api'.length)
         : rawPath;
-    const clientIp = _requestIp(req);
+    const clientIp = _requestIp(req, trustProxy);
 
     if (panelIpGuardEnabled && !_panelIpAllowed(clientIp, adminAllowedIps)) {
         _json(res, 403, { error: '접근이 허용되지 않은 IP 입니다.' });
@@ -338,8 +338,10 @@ function _parseRow(result) {
 }
 
 async function _handleAdminApi(req, res, sub, qs, { dbType, dbConfig, proxyDbQuery, activeConnections, mode }) {
-    const limit  = Math.min(Number(qs.get('limit')  || 50), 200);
-    const offset = Number(qs.get('offset') || 0);
+    const _rawLimit = Number(qs.get('limit') || 50);
+    const _rawOffset = Number(qs.get('offset') || 0);
+    const limit  = Math.max(1, Math.min(Number.isFinite(_rawLimit) ? Math.trunc(_rawLimit) : 50, 200));
+    const offset = Math.max(0, Number.isFinite(_rawOffset) ? Math.trunc(_rawOffset) : 0);
 
     // ── 개요 ────────────────────────────────────────────────
     if (sub === 'overview') {

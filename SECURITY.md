@@ -86,10 +86,10 @@ Request → [Common defense] → [Allowlist] → [Query Registry] → [Tenant Po
 | Layer | Role | Coverage |
 |---|---|---|
 | **Common defense** | Blocks multiple statements (`;`), comments (`-- /**/`), >50KB, dangerous tokens (`ATTACH`, `PRAGMA`, `LOAD_EXTENSION`, `INTO OUTFILE`, `xp_*`, `SLEEP`, `PG_SLEEP`, `BENCHMARK`, `WAITFOR`, `INFORMATION_SCHEMA`) | always |
-| **SQL Allowlist** | Table × operation (SELECT/INSERT/UPDATE/DELETE) permit. All FROM/JOIN/INTO/UPDATE references checked. `CREATE TABLE` only for `_dokkebi_*` | always |
+| **SQL Allowlist** | Table × operation (SELECT/INSERT/UPDATE/DELETE) permit. All FROM/JOIN/INTO/UPDATE references checked; secondary references (JOIN/subquery/`INSERT ... SELECT`) require `SELECT`. Internal tables (`_dokkebi_*`, `sqlite_*`) and client DDL are always blocked | always |
 | **Query Registry** | SQL **shape** permit — blocks structural tampering (column changes, WHERE removal, `OR 1=1`, etc.). Collected via static scanner + comment declarations + dev learning | always (auto/strict modes) |
-| **Tenant Policy** | Row-level isolation — validates or auto-injects `WHERE user_id = ?`. Detects top-level `OR`, missing WHERE, aliased columns | opt-in |
-| **Authorization** | Operation-level permissions — e.g. "DELETE posts only for role=admin" — JWT signature + role match | opt-in |
+| **Tenant Policy** | Row-level isolation — validates or auto-injects `WHERE user_id = ?`. Detects top-level `OR`, missing WHERE, aliased columns. **Tenant identity must come from a verified JWT (`requireJwtTenant`, default on when authorization/auth.login is enabled); session `tenant_json` is client-asserted** | opt-in |
+| **Authorization** | Operation-level permissions — e.g. "DELETE posts only for role=admin" — JWT signature + role match. Evaluated against **every referenced table** (JOIN / `INSERT ... SELECT` included; non-primary refs treated as SELECT) | opt-in |
 
 Parameter binding is handled by D1/Supabase/Appwrite SDK via `prepare().bind()`. The proxy never interpolates raw SQL as strings.
 
@@ -102,18 +102,28 @@ Parameter binding is handled by D1/Supabase/Appwrite SDK via `prepare().bind()`.
 | Nonce | `crypto.randomUUID()` per request |
 | Plaintext cleanup | `plain.fill(0)` immediately after decrypt (best-effort) |
 | Curve | P-256 (prime256v1) |
-| env secrets | Wrapped with AES-GCM at build time, stored in OPFS. Decrypt only in Host closure |
+| env secrets | **Only the bundle-decryption key (`__DOKKEBI_BC_KEY__`) is delivered to the client.** Other `.env` values never reach the browser; backend `process.env.SECRET` resolves to `''` (build/deploy blocks it, with `DOKKEBI_ALLOW_WASM_SECRETS=true` as an explicit opt-out). Move secrets to `worker/api/**` |
 
 ### 2.5 DoS / resource exhaustion
 
 | Category | Limit |
 |---|---|
-| Handshake | 20/min per IP |
+| Handshake | 20/min per IP per isolate (`DOKKEBI_HANDSHAKE_RPM`) + 8KB body |
 | DB query | 300/min per IP + valid session |
 | Log | 600/min per IP + 64KB body |
 | Body size | handshake 8KB / db 128KB / log 64KB / admin 2KB — `Content-Length` pre-check + abort during streaming |
-| Sessions | max 500 + FIFO |
+| Sessions | max 500 global (`DOKKEBI_MAX_SESSIONS`) + per-IP cap 20 (`DOKKEBI_MAX_SESSIONS_PER_IP`). When over the global cap, the **most crowded IP** is evicted first (not the oldest global session) |
 | Nonce cache | TTL 35s + cleanup every 60s |
+
+### 2.5.1 Client IP trust & local tool endpoints (`dok serve` / `dok dev`)
+
+| Item | Behavior |
+|---|---|
+| Client IP source | Socket peer only by default. `CF-Connecting-IP` / `X-Forwarded-For` are trusted **only** with `DOKKEBI_TRUST_PROXY=1` (set behind a trusted reverse proxy). This prevents header spoofing from bypassing per-IP rate limits and `DOKKEBI_PANEL_ALLOWED_IPS`. |
+| ECDH handshake | A new P-256 keypair per handshake (`keyId`, 60s TTL, single use) — forward secrecy matches the serverless worker. |
+| `/_dokkebi/gif` | Rate-limited (10/min/IP), PNG-signature enforced, frame/body caps, `-nostdin`/`-f image2`. Still a local tool: do not expose `dok serve` to untrusted networks. |
+| Dev media upload | JWT `exp` required; when no JWT secret is configured a random per-process secret is used (no hard-coded default). `Content-Length` required and capped. |
+| Bind address | `dok serve` / `dok dev` listen on `0.0.0.0`. Only run them on trusted networks or behind a firewall; set `DOKKEBI_TRUST_PROXY=1` when a trusted proxy terminates connections. |
 
 ### 2.6 Information disclosure
 
@@ -163,8 +173,11 @@ Parameter binding is handled by D1/Supabase/Appwrite SDK via `prepare().bind()`.
 policy: {
   enabled: true,
   mode: 'inject',        // 'verify' (validate only) | 'inject' (auto-inject)
-  claim: 'user_id',      // field from session tenant_json
+  claim: 'user_id',      // tenant claim (JWT claim when requireJwtTenant)
   strict: true,
+  // 테넌트 신분을 검증된 JWT 에서만 취한다 (세션 tenant_json 무시).
+  // 미설정 시: authorization / auth.login 이 켜져 있으면 자동 true.
+  requireJwtTenant: true,
   tables: {
     posts: { tenantColumn: 'user_id', mode: 'enforce' },
     orders: { tenantColumn: 'user_id', mode: 'enforce' },
@@ -174,7 +187,7 @@ policy: {
 
 Flow:
 1. Client calls `ctx.setSessionTenant({ user_id: 'u1' })` (after login)
-2. Proxy stores in session `tenant_json`
+2. Proxy stores in session `tenant_json` (client-asserted — see requireJwtTenant)
 3. All subsequent SELECT/UPDATE/DELETE are verified (verify) or auto-injected (inject) with `WHERE user_id = ?`
 4. INSERT validates `user_id` column matches session tenant
 
@@ -301,6 +314,24 @@ Flow:
 5. Worker checks feature policy and JWT role
 6. Worker-only `DOKKEBI_CAPABILITY_SECRET` signs `feature + sessionId + controllersHash + stateHash + nonce + exp`
 7. After guard passes, handler uses `ctx.capability` `token/proof` as execution material, not a simple permit flag
+
+**Worker-side re-verification (required for real protection).** The auto route guard runs in the
+browser bundle and can be patched. Worker routes that perform the costly/privileged work must
+verify the token again:
+
+```ts
+// worker/api/ai/image.ts
+import { verifyCapability } from '../_dokkebi/capability.js';
+
+export const onRequestPost = async (ctx) => {
+  const cap = await verifyCapability(ctx.request, ctx.env, 'image.generate', { stateHash });
+  if (!cap.ok) return new Response(JSON.stringify({ ok: false, code: cap.code }), { status: 403 });
+  // bind cap.payload.sub / cap.payload.stateHash into the actual work
+};
+```
+
+`verifyCapability()` checks the HMAC, `typ: 'DOKKEBI-CAP'`, `exp`, `feature`, and optional
+`stateHash`. Token sources: `X-Dokkebi-Capability: <token>` or `Authorization: Capability <token>`.
 
 Important limitations:
 - Does not replace Authorization Policy. DB write/delete permissions must still be enforced via Worker Authorization Policy or DB RLS.
@@ -661,17 +692,17 @@ Dokkebi removes this race with triple defense (all automatic, no user config):
 |---|------|-------|------|---------------------------|-----------------|--------|
 | 1 | **ECDH(P-256) + HKDF-SHA256 → AES-256-GCM** | Network/transport | Bidirectional E2E encrypted channel | Handshake: `crypto.subtle.generateKey({ECDH, P-256})` ephemeral keypair → `deriveBits` → HKDF splits `dokkebi-enc`/`dokkebi-sig` → AES-256-GCM encrypts all requests/responses | Eavesdropping, MITM plaintext, DevTools plaintext observation | ✅ OK |
 | 2 | **HMAC-SHA256 request signing** | Network/transport | Tamper prevention | All `/api/_dokkebi/db` requests verified with sigKey HMAC before processing. `SIGNATURE_INVALID` defined | Request tampering, message integrity threats | ✅ OK |
-| 3 | **Replay defense (Nonce + ±5s TS)** | Network/transport | Replay blocking | `workerDb` nonce/timestamp → in-memory + `_dokkebi_nonces` D1 cross-isolate duplicate check. `REPLAY_DETECTED` / `TIMESTAMP_SKEW`. Tunable `replay.timestampWindowMs` (1-30s clamp), `nonceTtlMs` (window+5s ~ 5min clamp) | Captured request replay, rapid burst | ✅ OK |
+| 3 | **Replay defense (Nonce + ±5s TS)** | Network/transport | Replay blocking | `workerDb` nonce/timestamp → in-memory check, then D1 `_dokkebi_nonces` claim. Mutations/special commands claim **synchronously** (`INSERT OR IGNORE` + changes) so a replay to another isolate is rejected; reads use a background claim. `REPLAY_DETECTED` / `TIMESTAMP_SKEW`. Tunable `replay.timestampWindowMs` (1-30s clamp), `nonceTtlMs` (window+5s ~ 5min clamp) | Captured request replay, rapid burst | ✅ OK |
 | 4 | **Forward Secrecy (Ephemeral ECDH)** | Network/transport | Past traffic protected if session key leaks | New keypair per handshake, `_dokkebi_ephemeral_keys` deleted after 60s TTL | Long-term session key theft → decrypt past traffic | ✅ OK |
-| 5 | **Session management (FIFO + token bucket)** | Network/session | DoS defense | `_dokkebi_sessions` D1 + per-session `bucketTokens`/`bucketRefillAt`. Session bomb/request burst defense | Session bomb, single-session burst | ✅ OK |
+| 5 | **Session management (FIFO + token bucket)** | Network/session | DoS defense | `_dokkebi_sessions` D1 + per-session `bucketTokens`/`bucketRefillAt`; handshake IP bucket (20/min) + global cap `DOKKEBI_MAX_SESSIONS` (default 500) with FIFO eviction. Session bomb/request burst defense | Session bomb, single-session burst | ✅ OK |
 | 6 | **Envelope body size limit (512KB)** | Network/DoS | Body DoS defense | `MAX_ENVELOPE_BYTES = 512*1024` + `Content-Length` pre-check → 413 | Huge payload DoS, memory exhaustion | ✅ OK |
-| 7 | **SQL Allowlist (table×op)** | Backend/DB | 4-layer stage 1 — allowed table·op only | `dist/dokkebi/sql-allowlist.json` extracted at build → inlined in `workerDb`. SELECT/INSERT/UPDATE/DELETE + `CREATE TABLE _dokkebi_*` only | Arbitrary table SELECT/UPDATE/DELETE, system table tampering | ✅ OK |
+| 7 | **SQL Allowlist (table×op)** | Backend/DB | 4-layer stage 1 — allowed table·op only | `dist/dokkebi/sql-allowlist.json` extracted at build → inlined in `workerDb`. SELECT/INSERT/UPDATE/DELETE; secondary references (JOIN/subquery/`INSERT ... SELECT`) require `SELECT`. **Internal tables (`_dokkebi_*`, `sqlite_*`) and client DDL are always blocked** (`findInternalTableRef`) | Arbitrary table SELECT/UPDATE/DELETE, **system table tampering / session-key theft**, schema recon | ✅ OK |
 | 8 | **Query Registry (SQL shape)** | Backend/DB | 4-layer stage 2 — SQL structure tampering blocked | Shape register/match. Blocks `OR 1=1`, missing WHERE, column changes. **Default `auto`** (_debugSql fallback = effectively off), `queryRegistry.strict: true` blocks unregistered | SQL structure tampering, `OR 1=1`, WHERE removal | ✅ OK (weak in auto — §4.2) |
 | 9 | **Common SQL defense** | Backend/DB | 4-layer stage 0 | `hasMultipleStatements` (`;`), `stripStringsAndComments` (`--`/`/* */`), dangerous tokens (`ATTACH`, `DETACH`, `PRAGMA`, `LOAD_EXTENSION`, `INTO OUTFILE`, `INTO DUMPFILE`, `INFORMATION_SCHEMA`, `PG_SLEEP`, `SLEEP(`, `BENCHMARK(`, `WAITFOR`, `XP_`, `SP_EXECUTESQL`) | SQL injection (stacked queries, comment bypass), DB privilege escalation, time-based blind injection | ✅ OK |
-| 10 | **MTD — Payload Field Rotation** | Network/MTD | Rotate envelope key names per build (static signature defense) | `dok build` SHA-256 maps 8 keys to `_f<hash20>` from `buildId`. `wire-runtime.json` + `_payloadWire.ts` embedded worker+client. `denormalizePayload()` recognizes active+previous mappings → **zero-downtime compatible**. `DOKKEBI_HARDENING_ROTATE=off` disables (default ON) | Static key signature bots (`queryId=`/`_debugSql=`), capture-replay bots, static payload scanners, cross-build payload diff analysis | ✅ OK |
+| 10 | **MTD — Payload Field Rotation** | Network/MTD | Rotate envelope key names per build (static signature defense) | `dok build` SHA-256 maps 10 keys to `_f<hash20>` from `buildId`. `wire-runtime.json` + `_payloadWire.ts` embedded worker+client. `denormalizePayload()` recognizes active+previous mappings → **zero-downtime compatible**. `DOKKEBI_HARDENING_ROTATE=off` disables (default ON) | Static key signature bots (`queryId=`/`_debugSql=`), capture-replay bots, static payload scanners, cross-build payload diff analysis | ✅ OK |
 | 11 | **PoW — lightweight Proof of Work (14-bit SHA-256)** | Network/bot cost | Raise automation cost + protect capability·attest challenges | Required only for `_capabilityUnlock` or `_attest.request === true` (`powPayloadRequired`). Client mines SHA-256 leading zero ≥14bit on `<sid>:<minuteSlot>:<counter>` → worker `verifyAndStripPowDb()`, `±1 minuteSlot` window, counter ≤ 20M. `DOKKEBI_HARDENING_POW=off` disables (default ON) | Capability brute issue, free attestation challenge flood, zero-cost token issue, bots without extra cost on base channel | ✅ OK |
-| 12 | **Tenant Policy (Row-level)** | Backend/DB | 4-layer stage 3 (opt-in) — multi-tenant isolation | `_pe_inject` / `verifyTenant` / `_pe_hasTopLevelOr` embedded. `mode: 'verify'` reject only, `'inject'` auto-inject. `tenant_json` column stores session tenant. top-level `OR`, aliased col validation | A→B data SELECT/UPDATE/DELETE, missing WHERE, OR 1=1 bypass | ✅ OK |
-| 13 | **Authorization Policy (JWT/role)** | Backend/auth | 4-layer stage 4 (opt-in) — op-level permissions | HS256 JWT sign·exp verify, `(op, table)` → `roles.some(r => userRoles.includes(r))`, wildcard `'*'`, `mode: 'warn'`/`'strict'` | Regular user calling admin ops (`UPDATE users`, `DELETE *`), forged/expired JWT reuse | ✅ OK (HS256 only — §4.9) |
+| 12 | **Tenant Policy (Row-level)** | Backend/DB | 4-layer stage 3 (opt-in) — multi-tenant isolation | `_pe_inject` / `verifyTenant` / `_pe_hasTopLevelOr` embedded. `mode: 'verify'` reject only, `'inject'` auto-inject. `tenant_json` column stores session tenant. top-level `OR`, aliased col validation. Tenant comes only from a verified JWT (`requireJwtTenant`, auto-on when authorization/auth.login is enabled); `_setTenant` cannot override a server-bound tenant | A→B data SELECT/UPDATE/DELETE, missing WHERE, OR 1=1 bypass, **client tenant spoofing** | ✅ OK |
+| 13 | **Authorization Policy (JWT/role)** | Backend/auth | 4-layer stage 4 (opt-in) — op-level permissions | HS256 JWT sign·exp verify, `(op, table)` → `roles.some(r => userRoles.includes(r))` **for every referenced table** (JOIN/`INSERT ... SELECT` 포함, 비주 연산 참조는 SELECT), wildcard `'*'`, `mode: 'warn'`/`'strict'` | Regular user calling admin ops (`UPDATE users`, `DELETE *`), forged/expired JWT reuse | ✅ OK (HS256 only — §4.9) |
 | 14 | **Capabilities (Signed Unlock Token)** | Backend/auth | (opt-in) permission branch bypass / cost route protection | `_cap_sign`/`_cap_verify` HMAC, `DOKKEBI_CAPABILITY_SECRET`, auto router guard from `routes`/`@dokkebi-capability` JSDoc at build | WASM patch bypass, direct costly routes (OpenAI etc.), stolen token other session (sid verify) | ✅ OK |
 | 15 | **Capability Chain (`requires.prev`)** | Backend/auth | (opt-in) business step bypass blocked | `prevTokens` HMAC·exp·sid·feature verify. `CAPABILITY_PREV_MISSING`/`CAPABILITY_PREV_INVALID` | Skip auth→payment→step3, step tampering | ✅ OK |
 | 16 | **Bundle Attestation (chunk SHA-256)** | Backend/bundle integrity | (opt-in, auto with capabilities) tampered bundle blocked | `dok build` `backend-bundle.chunks.json` (16KB chunk SHA-256) → worker embedded (not client). `_attest` challenge → client slices in-memory bundle. Fail: `attest_failed` / `CAPABILITY_ATTEST_REQUIRED`. `requires: { attest: true }` gates capability | Client bundle patch (permission bypass·free capability) | ✅ OK |

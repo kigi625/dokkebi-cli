@@ -21,7 +21,9 @@ import { encBytesToB64 } from './_payloadWire.js';
 const _DOKKEBI_INTERNAL_BINDING: string = '__DOKKEBI_PH_INTERNAL_BINDING__' || 'DB';
 function _internalDb(env: any): D1Database {
   const b = env && (env as any)[_DOKKEBI_INTERNAL_BINDING];
-  return (b as D1Database) || (env && _internalDb(env));
+  if (b) return b as D1Database;
+  if (env && env.DB) return env.DB as D1Database; // 내부 바인딩 미설정 시 기본 DB
+  throw new Error('[dokkebi] D1 바인딩 "' + _DOKKEBI_INTERNAL_BINDING + '" 이 없습니다. wrangler.toml 의 d1_databases 를 확인하세요.');
 }
 export interface Env {
   DB: D1Database;
@@ -29,8 +31,45 @@ export interface Env {
   DOKKEBI_SESSION_SECRET: string;
   __DOKKEBI_BC_KEY__?: string;
   __DOKKEBI_BC_KEY_MAP__?: string;
+  DOKKEBI_HANDSHAKE_RPM?: string;
+  DOKKEBI_MAX_SESSIONS?: string;
   [key: string]: unknown;
 }
+
+// ── DoS 방어 — 핸드셰이크 IP 토큰버킷 + 세션 상한 ───────────
+//   서버리스 워커는 인메모리(아이솔레이트) 단위로 제한한다. 분산 IP 공격은
+//   Cloudflare WAF/Bot Management 로 보완해야 한다 (SECURITY.md §4.4).
+const _hsBuckets = new Map<string, { tokens: number; refillAt: number }>();
+const _HS_BUCKETS_MAX = 5000;
+function _hsIp(req: Request): string {
+  return req.headers.get('CF-Connecting-IP')
+    || (req.headers.get('X-Forwarded-For') || '').split(',')[0].trim()
+    || 'unknown';
+}
+function _hsRateLimited(env: Env, ip: string): boolean {
+  const cap = Math.max(1, Math.min(600, Number((env as any).DOKKEBI_HANDSHAKE_RPM || 20) || 20));
+  const refillMs = Math.max(50, Math.floor(60_000 / cap));
+  const now = Date.now();
+  let b = _hsBuckets.get(ip);
+  if (!b) {
+    if (_hsBuckets.size >= _HS_BUCKETS_MAX) _hsBuckets.clear();
+    b = { tokens: cap, refillAt: now };
+    _hsBuckets.set(ip, b);
+  }
+  const n = Math.floor((now - b.refillAt) / refillMs);
+  if (n > 0) {
+    b.tokens = Math.min(cap, b.tokens + n);
+    b.refillAt = now;
+  }
+  if (b.tokens <= 0) return true;
+  b.tokens -= 1;
+  return false;
+}
+function _hsBodyTooLarge(req: Request, maxBytes = 8 * 1024): boolean {
+  const len = Number(req.headers.get('content-length') || 0);
+  return Number.isFinite(len) && len > maxBytes;
+}
+
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -39,6 +78,8 @@ const CORS = {
 };
 
 const EPHEMERAL_TTL_MS = 60_000;
+// 세션 수명 — db.ts.tpl 의 SESSION_TTL_MS 와 동일하게 유지한다.
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 // ── C-1 방어: 인가용 JWT 서명 시크릿은 절대 클라이언트로 내려보내지 않는다. ──
 //   HS256 은 대칭키이므로, 시크릿이 브라우저에 도달하면 누구나 임의 role/user_id JWT 를
 //   위조해 Authorization Policy 와 JWT 기반 테넌트 격리를 무력화할 수 있다.
@@ -110,7 +151,20 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
   const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...CORS };
 
   try {
-    ctx.waitUntil(ensureSecurityTables(_internalDb(env)));
+    ctx.waitUntil(ensureSecurityTables(_internalDb(env)).catch(() => {}));
+
+    // ── DoS 방어: IP 레이트리밋 + 본문 크기 상한 ─────────────
+    const _ip = _hsIp(request);
+    if (_hsRateLimited(env, _ip)) {
+      return new Response(JSON.stringify({
+        ok: false, code: 'HANDSHAKE_RATE_LIMIT', error: '핸드셰이크 요청이 너무 많습니다. 잠시 후 다시 시도하세요.',
+      }), { status: 429, headers });
+    }
+    if (_hsBodyTooLarge(request, 8 * 1024)) {
+      return new Response(JSON.stringify({
+        ok: false, code: 'PAYLOAD_TOO_LARGE', error: '핸드셰이크 요청이 허용 크기를 초과했습니다.',
+      }), { status: 413, headers });
+    }
 
     if (method === 'GET') {
       const ephemeral = await crypto.subtle.generateKey(
@@ -144,7 +198,10 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
       if (!clientPubKey) {
         return new Response(JSON.stringify({ error: 'clientPubKey 필드가 없습니다' }), { status: 400, headers });
       }
-      if (!keyId) {
+      if (typeof clientPubKey !== 'string' || clientPubKey.length > 1024) {
+        return new Response(JSON.stringify({ error: 'clientPubKey 형식이 올바르지 않습니다' }), { status: 400, headers });
+      }
+      if (!keyId || typeof keyId !== 'string' || keyId.length > 128) {
         return new Response(JSON.stringify({ error: 'keyId 필드가 없습니다' }), { status: 400, headers });
       }
 
@@ -197,9 +254,55 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
       const encKeyB64 = encBytesToB64(encKeyBits);
       const sigKeyB64 = encBytesToB64(sigKeyBits);
 
+      // ── 세션 폭탄/축출 DoS 방어 ───────────────────────────────
+      //   - 만료 세션 우선 정리
+      //   - IP별 상한(DOKKEBI_MAX_SESSIONS_PER_IP)으로 한 IP가 대량 생성하지 못하게
+      //   - 전역 상한 초과 시 "가장 많이 만든 IP"에서 먼저 축출 (정상 사용자 세션 보호)
+      const _maxSessions = Math.max(10, Math.min(100_000, Number((env as any).DOKKEBI_MAX_SESSIONS || 500) || 500));
+      const _maxPerIp = Math.max(1, Math.min(1000, Number((env as any).DOKKEBI_MAX_SESSIONS_PER_IP || 20) || 20));
+      try {
+        await ensureSecurityTables(_internalDb(env));
+        const _db = _internalDb(env);
+        const _nowS = Date.now();
+        await _db.prepare(`DELETE FROM _dokkebi_sessions WHERE created_at < ?`).bind(_nowS - SESSION_TTL_MS).run();
+
+        const _ipCntRow = await _db.prepare(`SELECT COUNT(*) AS n FROM _dokkebi_sessions WHERE ip = ?`).bind(_ip).first<{ n: number }>();
+        const _ipCnt = Number(_ipCntRow?.n || 0);
+        if (_ipCnt >= _maxPerIp) {
+          await _db.prepare(
+            `DELETE FROM _dokkebi_sessions WHERE session_id IN (
+               SELECT session_id FROM _dokkebi_sessions WHERE ip = ? ORDER BY created_at ASC LIMIT ?
+             )`
+          ).bind(_ip, Math.max(1, _ipCnt - _maxPerIp + 1)).run();
+        }
+
+        const _cntRow = await _db.prepare(`SELECT COUNT(*) AS n FROM _dokkebi_sessions`).first<{ n: number }>();
+        const _cnt = Number(_cntRow?.n || 0);
+        if (_cnt >= _maxSessions) {
+          const _evict = Math.max(1, _cnt - _maxSessions + 1);
+          const _crowded = await _db.prepare(
+            `SELECT ip FROM _dokkebi_sessions WHERE ip IS NOT NULL GROUP BY ip ORDER BY COUNT(*) DESC LIMIT 1`
+          ).first<{ ip: string }>();
+          let _removed = 0;
+          if (_crowded?.ip) {
+            const _r = await _db.prepare(
+              `DELETE FROM _dokkebi_sessions WHERE session_id IN (
+                 SELECT session_id FROM _dokkebi_sessions WHERE ip = ? ORDER BY created_at ASC LIMIT ?
+               )`
+            ).bind(_crowded.ip, _evict).run();
+            _removed = (_r as any)?.meta?.changes ?? 0;
+          }
+          if (!_removed) {
+            await _db.prepare(
+              `DELETE FROM _dokkebi_sessions WHERE session_id IN (SELECT session_id FROM _dokkebi_sessions ORDER BY created_at ASC LIMIT ?)`
+            ).bind(_evict).run();
+          }
+        }
+      } catch { /* 카운트 실패 시에도 세션 생성은 계속 (가용성 우선) */ }
+
       await _internalDb(env).batch([
         _internalDb(env).prepare(`DELETE FROM _dokkebi_ephemeral_keys WHERE key_id = ?`).bind(keyId),
-        _internalDb(env).prepare(`INSERT INTO _dokkebi_sessions (session_id, enc_key, sig_key, created_at) VALUES (?, ?, ?, ?)`).bind(sessionId, encKeyB64, sigKeyB64, Date.now()),
+        _internalDb(env).prepare(`INSERT INTO _dokkebi_sessions (session_id, enc_key, sig_key, created_at, ip) VALUES (?, ?, ?, ?, ?)`).bind(sessionId, encKeyB64, sigKeyB64, Date.now(), _ip),
       ]);
 
       // 클라이언트에는 암호화 번들 복호화 키만 전달한다.
@@ -235,13 +338,16 @@ async function ensureSecurityTables(db: D1Database) {
   try {
     await db.batch([
       db.prepare(`CREATE TABLE IF NOT EXISTS _dokkebi_ephemeral_keys (key_id TEXT PRIMARY KEY, priv_jwk TEXT NOT NULL, created_at INTEGER NOT NULL)`),
-      db.prepare(`CREATE TABLE IF NOT EXISTS _dokkebi_sessions (session_id TEXT PRIMARY KEY, enc_key TEXT NOT NULL, sig_key TEXT NOT NULL, created_at INTEGER NOT NULL, tenant_json TEXT)`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS _dokkebi_sessions (session_id TEXT PRIMARY KEY, enc_key TEXT NOT NULL, sig_key TEXT NOT NULL, created_at INTEGER NOT NULL, tenant_json TEXT, ip TEXT)`),
       db.prepare(`CREATE TABLE IF NOT EXISTS _dokkebi_nonces (nonce TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)`),
     ]);
     // 기존 테이블에 tenant_json 컬럼이 없으면 추가 (v5 이전 배포 업그레이드용)
     //   SQLite 는 IF NOT EXISTS 미지원이라 try/catch 로 감쌈.
     try {
       await db.prepare(`ALTER TABLE _dokkebi_sessions ADD COLUMN tenant_json TEXT`).run();
+    } catch { /* 컬럼 이미 존재 → 무시 */ }
+    try {
+      await db.prepare(`ALTER TABLE _dokkebi_sessions ADD COLUMN ip TEXT`).run();
     } catch { /* 컬럼 이미 존재 → 무시 */ }
     _tablesReady = true;
   } catch { /* 이미 존재 시 무시 */ }

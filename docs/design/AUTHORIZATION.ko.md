@@ -90,8 +90,16 @@ POST /api/_dokkebi/db
 
 주의:
 - **Tenant Policy 이후에 Authorization** 이 돈다 → Tenant Policy 가 주입한 최종 SQL 기준으로 op/table 이 판단됨
-- 한 번의 요청은 한 개의 SQL 문장이므로 가장 상위 op/table 로 충분 (stacked query 는 이미 1단계에서 차단됨)
-- 규칙 매칭 실패 시에만 JWT 검증 건너뜀 (불필요한 비용 절감)
+- **SQL 이 참조하는 모든 테이블을 검사한다** . 주 연산 대상(첫 `FROM`/`INTO`/`UPDATE`)은 문장의 op 로,
+  그 외 참조(`JOIN`, 서브쿼리, `INSERT ... SELECT` 원본)는 `SELECT` 로 평가한다.
+  하나라도 거부되면 문장 전체가 거부된다.
+  - 예: `SELECT:posts` = public, `SELECT:users` = admin 일 때
+    `SELECT * FROM posts JOIN users ...` 는 비관리자에게 거부된다.
+  - `mode: 'strict'` 에서는 참조된 모든 테이블에 규칙이 있어야 한다(없으면 `NO_RULE`).
+- 한 번의 요청은 한 개의 SQL 문장 (stacked query 는 이미 1단계에서 차단됨)
+- 매칭된 규칙이 JWT 를 요구할 때만 JWT 검증 수행 (불필요한 비용 절감)
+- **server 모드(`dok serve`)도 동일 규칙을 적용합니다.** `queryRegistry.strict` 는 serverless 전용
+  (빌드된 registry 가 정적 자산에 포함되지 않음)이므로 server 모드는 allowlist + Tenant/Authorization 에 의존합니다.
 
 ## 3. 규칙 문법
 
@@ -125,9 +133,14 @@ POST /api/_dokkebi/db
 ## 4. JWT 요구사항
 
 - **알고리즘**: HS256 만 지원
-- **필수 클레임**: `exp` (권장). `role` (혹은 `claim` 에 지정된 필드)
+- **필수 클레임**: `exp` (필수 — `exp` 없는 토큰은 거부됨). `role` (혹은 `claim` 에 지정된 필드)
 - **선택 클레임**: `nbf`, `iss`, `aud`
-- **secret**: `DOKKEBI_JWT_SECRET` Pages 환경변수 (최소 32 bytes 랜덤 권장)
+- **secret**: 하나의 시크릿만 사용 (최소 32 bytes 랜덤 권장). 우선순위:
+  1. `authorization.jwtSecretEnv` 를 **명시**한 경우 → 그 바인딩만
+  2. `JWT_SECRET`
+  3. `DOKKEBI_JWT_SECRET`
+  여러 시크릿을 동시에 수용하지 않는다 (약한 레거시 시크릿으로 서명한 토큰이 통과하지 못함).
+- **tenant claim 우선순위**: 설정한 `claim` 을 먼저 사용하고, `userId` / `user_id` 는 fallback.
 
 > **⚠ 보안(C-1): 브라우저에서 JWT 를 서명하지 마라.** `DOKKEBI_JWT_SECRET` 는 대칭(HS256) 키 — **워커 전용 시크릿**이며 더 이상 핸드셰이크로 클라이언트에 전달되지 않는다. 브라우저 WASM 백엔드는 이 값을 읽을 수 없다(`__dokkebi_env__("JWT_SECRET")` → 빈 문자열). 토큰은 신뢰된 서버 경로에서만 발급해야 한다. 두 가지 방법:
 >

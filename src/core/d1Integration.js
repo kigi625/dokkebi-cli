@@ -17,32 +17,27 @@ function normalizeD1Param(value) {
     return value;
 }
 
-/**
- * D1 REST API로 SQL 실행
- */
-export async function d1Execute(targetConfig, sql, params = []) {
-    const endpoint = [
+function d1Url(targetConfig, action) {
+    return [
         String(targetConfig.apiBase || D1_API_BASE).replace(/\/+$/, ''),
         'accounts',
         encodeURIComponent(String(targetConfig.accountId || '').trim()),
         'd1',
         'database',
         encodeURIComponent(String(targetConfig.databaseId || '').trim()),
-        'query',
+        action,
     ].join('/');
+}
 
-    const response = await fetch(endpoint, {
+async function d1Json(targetConfig, action, body) {
+    const response = await fetch(d1Url(targetConfig, action), {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${targetConfig.apiToken}`,
         },
-        body: JSON.stringify({
-            sql: String(sql || ''),
-            params: Array.isArray(params) ? params.map((v) => normalizeD1Param(v)) : [],
-        }),
+        body: JSON.stringify(body),
     });
-
     const text = await response.text();
     let parsed = null;
     try {
@@ -57,8 +52,66 @@ export async function d1Execute(targetConfig, sql, params = []) {
                 : `D1_HTTP_${response.status}`;
         throw new Error(errorMessage);
     }
+    return parsed;
+}
+
+/**
+ * D1 REST API로 SQL 실행. CREATE TRIGGER 처럼 본문에 ; 가 있는 문은 d1ImportSql 을 쓴다.
+ */
+export async function d1Execute(targetConfig, sql, params = []) {
+    const parsed = await d1Json(targetConfig, 'query', {
+        sql: String(sql || ''),
+        params: Array.isArray(params) ? params.map((v) => normalizeD1Param(v)) : [],
+    });
     const resultEntry = Array.isArray(parsed.result) ? parsed.result[0] : parsed.result;
     return resultEntry || {};
+}
+
+async function sleep(ms) {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * D1 import API로 SQL 스크립트 전체를 적용한다. /query 는 트리거 본문의 ; 에서 incomplete input 이 난다.
+ */
+export async function d1ImportSql(targetConfig, sql) {
+    const { createHash } = await import('crypto');
+    const buf = Buffer.from(String(sql || ''), 'utf8');
+    if (!buf.length) return {};
+    const etag = createHash('md5').update(buf).digest('hex');
+    const initParsed = await d1Json(targetConfig, 'import', { action: 'init', etag });
+    const init = initParsed.result || {};
+    let poll = init;
+    if (init.upload_url && init.filename) {
+        const put = await fetch(init.upload_url, {
+            method: 'PUT',
+            headers: { 'Content-Length': String(buf.length) },
+            body: buf,
+        });
+        if (!put.ok) throw new Error(`D1 SQL 업로드 실패 (${put.status})`);
+        const remoteEtag = String(put.headers.get('etag') || '').replace(/^"|"$/g, '');
+        if (remoteEtag && remoteEtag !== etag) throw new Error('D1 SQL 업로드 검증에 실패했습니다.');
+        const ingestParsed = await d1Json(targetConfig, 'import', {
+            action: 'ingest',
+            etag,
+            filename: init.filename,
+        });
+        poll = ingestParsed.result || ingestParsed;
+    }
+    for (let i = 0; i < 90; i++) {
+        const status = poll.status;
+        const errorText = Array.isArray(poll.errors) ? poll.errors.filter(Boolean).join('\n') : String(poll.error || '');
+        if (status === 'error') throw new Error(errorText || 'D1 import error');
+        if (status === 'complete') return poll;
+        if (errorText === 'Not currently importing anything.') return poll;
+        await sleep(400);
+        const polled = await d1Json(targetConfig, 'import', {
+            action: 'poll',
+            current_bookmark: poll.at_bookmark || '',
+        });
+        poll = polled.result || polled;
+    }
+    throw new Error('D1 마이그레이션 import가 시간 초과되었습니다.');
 }
 
 /**
@@ -110,9 +163,126 @@ function mysqlCreateToSqlite(createSql, tableName) {
     return rebuilt;
 }
 
+function isSqlIdentChar(ch) {
+    return Boolean(ch) && /[A-Za-z0-9_]/.test(ch);
+}
+
+function sqlWithoutComments(text) {
+    return String(text || '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/--.*$/gm, '')
+        .trim();
+}
+
 /**
- * 마이그레이션 폴더의 .sql 파일들을 D1에 순서대로 적용
+ * SQLite 문을 세미콜론으로 나누되, 트리거 BEGIN…END와 문자열/주석 안의 ; 는 유지한다.
+ * 줄 끝 ; 만 자르면 CREATE TRIGGER 본문의 END; 에서 incomplete input 이 난다.
  */
+export function splitSqlStatements(sql) {
+    const src = String(sql || '');
+    const statements = [];
+    let buf = '';
+    let i = 0;
+    let quote = null;
+    let lineComment = false;
+    let blockComment = false;
+    let beginDepth = 0;
+    let caseDepth = 0;
+
+    const matchKeyword = (word) => {
+        if (i > 0 && isSqlIdentChar(src[i - 1])) return false;
+        if (src.slice(i, i + word.length).toUpperCase() !== word) return false;
+        return !isSqlIdentChar(src[i + word.length]);
+    };
+
+    while (i < src.length) {
+        const c = src[i];
+        const n = src[i + 1];
+
+        if (lineComment) {
+            buf += c;
+            if (c === '\n') lineComment = false;
+            i += 1;
+            continue;
+        }
+        if (blockComment) {
+            buf += c;
+            if (c === '*' && n === '/') {
+                buf += n;
+                i += 2;
+                blockComment = false;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if (quote) {
+            buf += c;
+            if (c === quote) {
+                if (quote === "'" && n === "'") {
+                    buf += n;
+                    i += 2;
+                    continue;
+                }
+                quote = null;
+            }
+            i += 1;
+            continue;
+        }
+
+        if (c === '-' && n === '-') {
+            lineComment = true;
+            buf += c;
+            i += 1;
+            continue;
+        }
+        if (c === '/' && n === '*') {
+            blockComment = true;
+            buf += c;
+            i += 1;
+            continue;
+        }
+        if (c === "'" || c === '"' || c === '`') {
+            quote = c;
+            buf += c;
+            i += 1;
+            continue;
+        }
+
+        if (matchKeyword('CASE')) {
+            caseDepth += 1;
+            buf += src.slice(i, i + 4);
+            i += 4;
+            continue;
+        }
+        if (matchKeyword('BEGIN')) {
+            const txn = /^\s+(TRANSACTION|IMMEDIATE|DEFERRED|EXCLUSIVE)\b/i.test(src.slice(i + 5));
+            buf += src.slice(i, i + 5);
+            i += 5;
+            if (!txn) beginDepth += 1;
+            continue;
+        }
+        if (matchKeyword('END')) {
+            buf += src.slice(i, i + 3);
+            i += 3;
+            if (caseDepth > 0) caseDepth -= 1;
+            else if (beginDepth > 0) beginDepth -= 1;
+            continue;
+        }
+
+        if (c === ';' && beginDepth === 0) {
+            if (sqlWithoutComments(buf)) statements.push(buf.trim());
+            buf = '';
+            i += 1;
+            continue;
+        }
+
+        buf += c;
+        i += 1;
+    }
+    if (sqlWithoutComments(buf)) statements.push(buf.trim());
+    return statements;
+}
 export async function applyMigrationsToD1(targetConfig, migrationsDir) {
     const { readdir, readFile } = await import('fs/promises');
     const { join } = await import('path');
@@ -153,14 +323,15 @@ export async function applyMigrationsToD1(targetConfig, migrationsDir) {
         }
 
         const content = await readFile(join(migrationsDir, name), 'utf8');
-        const statements = content
-            .split(/;\s*$/gm)
-            .map((s) => s.trim())
-            .filter(Boolean);
-        for (const sql of statements) {
-            if (!sql) continue;
-            await d1Execute(targetConfig, sql);
+        if (/CREATE\s+TRIGGER\b/i.test(content)) {
+            await d1ImportSql(targetConfig, content);
             applied++;
+        } else {
+            const statements = splitSqlStatements(content);
+            for (const sql of statements) {
+                await d1Execute(targetConfig, sql);
+                applied++;
+            }
         }
         // 적용 완료 기록
         await d1Execute(targetConfig,

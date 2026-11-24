@@ -37,6 +37,8 @@
  *   - 프론트엔드 권한 UI → 클라이언트 판단은 UX 용도일 뿐
  */
 
+import { detectOuterOp, outerStatement, detectPrimaryTableOf } from './sqlShape.js';
+
 // ─────────────────────────────────────────────────────────────
 // Config 정규화 — dokkebi.config.js 의 authorization 섹션 검증/정규화
 // ─────────────────────────────────────────────────────────────
@@ -93,6 +95,7 @@ export function normalizeAuthorizationConfig(raw) {
         enabled: true,
         mode: raw.mode === 'strict' ? 'strict' : 'warn',
         jwtSecretEnv: String(raw.jwtSecretEnv || raw.jwtSecretBinding || 'DOKKEBI_JWT_SECRET'),
+        jwtSecretEnvExplicit: !!(raw.jwtSecretEnv || raw.jwtSecretBinding),
         jwtAlgorithm: 'HS256',
         claim: String(raw.claim || 'role'),
         audience: raw.audience || null,
@@ -120,6 +123,52 @@ function _normalizeRuleSpec(spec) {
     }
     if (spec.auth === true) { out.auth = true; return out; }
     return null;
+}
+
+/**
+ * JWT 서명 검증에 사용할 **단일** 시크릿을 결정한다.
+ *
+ * 과거에는 JWT_SECRET / DOKKEBI_JWT_SECRET / jwtSecretEnv 를 **모두** 허용해
+ * 약한 레거시 시크릿이 하나라도 있으면 인가 전체가 약해졌다.
+ * 이제는 우선순위에 따라 하나만 선택한다.
+ *
+ *   1) jwtSecretEnv 를 명시적으로 설정한 경우 → 그 바인딩만
+ *   2) JWT_SECRET (앱 로그인과의 호환 우선)
+ *   3) DOKKEBI_JWT_SECRET
+ *   4) jwtSecretEnv 기본값
+ *
+ * @returns {{ secret: string, source: string|null }}
+ */
+export function resolveJwtSecret(env, authzMeta) {
+    const e = env && typeof env === 'object' ? env : {};
+    const get = (k) => (k && typeof e[k] === 'string' && e[k]) ? e[k] : '';
+    const named = authzMeta ? authzMeta.jwtSecretEnv : '';
+    const explicit = authzMeta ? authzMeta.jwtSecretEnvExplicit === true : false;
+
+    if (explicit) {
+        const v = get(named);
+        return { secret: v, source: v ? named : null };
+    }
+    const v1 = get('JWT_SECRET');
+    if (v1) return { secret: v1, source: 'JWT_SECRET' };
+    const v2 = get('DOKKEBI_JWT_SECRET');
+    if (v2) return { secret: v2, source: 'DOKKEBI_JWT_SECRET' };
+    if (named && named !== 'JWT_SECRET' && named !== 'DOKKEBI_JWT_SECRET') {
+        const v3 = get(named);
+        if (v3) return { secret: v3, source: named };
+    }
+    return { secret: '', source: null };
+}
+
+/**
+ * JWT payload 에서 테넌트/사용자 식별자를 추출한다.
+ * 명시한 claim 을 **최우선**으로 사용하고, 없을 때만 userId/user_id 로 fallback.
+ * (claim: 'org_id' 인데 user_id 가 먼저 선택되는 오매핑 방지)
+ */
+export function jwtIdentityFromPayload(payload, claim) {
+    if (!payload || typeof payload !== 'object') return null;
+    const v = payload[claim] ?? payload.userId ?? payload.user_id;
+    return v === undefined || v === null ? null : String(v);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -262,7 +311,11 @@ export async function verifyJwtHs256(token, opts) {
     const nowMs = opts.nowMs ?? Date.now();
     const skewMs = (opts.clockSkewSec ?? 30) * 1000;
 
-    if (typeof payload.exp === 'number' && nowMs > payload.exp * 1000 + skewMs) {
+    // exp 는 필수 — exp 없는 토큰은 영구 유효가 되어 만료 정책이 무력화된다.
+    if (typeof payload.exp !== 'number') {
+        return { valid: false, reason: 'JWT 에 exp 클레임이 없습니다.' };
+    }
+    if (nowMs > payload.exp * 1000 + skewMs) {
         return { valid: false, reason: 'JWT 가 만료되었습니다.' };
     }
     if (typeof payload.nbf === 'number' && nowMs + skewMs < payload.nbf * 1000) {
@@ -312,28 +365,16 @@ export function extractOpAndTable(sql) {
     if (typeof sql !== 'string' || sql.length === 0) return { op: null, table: null };
     const normalized = _stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
     const upper = normalized.toUpperCase();
-    const head = upper.trimStart();
-    let op = null;
-    if (head.startsWith('SELECT')) op = 'SELECT';
-    else if (head.startsWith('WITH')) op = 'SELECT';
-    else if (head.startsWith('INSERT')) op = 'INSERT';
-    else if (head.startsWith('UPDATE')) op = 'UPDATE';
-    else if (head.startsWith('DELETE')) op = 'DELETE';
-    else if (head.startsWith('CREATE TABLE')) op = 'CREATE';
+    // `WITH ... DELETE` 같은 문장을 SELECT 로 오판하지 않도록 바깥 문장 기준으로 판별.
+    const { op } = detectOuterOp(upper);
     if (!op) return { op: null, table: null };
-
-    const ident = '["\'`]?([A-Z_][\\w]*(?:\\.[A-Z_][\\w]*)?)["\'`]?';
-    const patterns = {
-        SELECT: new RegExp('\\bFROM\\s+' + ident),
-        INSERT: new RegExp('\\bINTO\\s+' + ident),
-        UPDATE: new RegExp('\\bUPDATE\\s+' + ident),
-        DELETE: new RegExp('\\bFROM\\s+' + ident),
-        CREATE: new RegExp('\\bTABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + ident),
-    };
-    const m = upper.match(patterns[op]);
-    if (!m) return { op, table: null };
-    const parts = m[1].split('.');
-    return { op, table: parts[parts.length - 1].toLowerCase() };
+    const outer = outerStatement(upper);
+    let table = detectPrimaryTableOf(outer, op);
+    if (op === 'CREATE') {
+        const m = outer.match(/\bTABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["\'`]?([A-Z_][\w]*)["\'`]?/);
+        table = m ? m[1] : null;
+    }
+    return { op, table: table ? table.toLowerCase() : null };
 }
 
 function _stripStringsAndComments(sql) {
@@ -352,4 +393,79 @@ function _stripStringsAndComments(sql) {
         i++;
     }
     return out;
+}
+
+/** CTE 이름 집합 — 실제 테이블이 아니므로 참조 검증에서 제외한다. */
+function _extractCteNames(normalizedUpper) {
+    const names = new Set();
+    const withMatch = /^\s*WITH\s+(?:RECURSIVE\s+)?(.+?)\b(SELECT|INSERT|UPDATE|DELETE)\b/is.exec(normalizedUpper);
+    if (!withMatch) return names;
+    const re = /\b([A-Z_][\w]*)\s*(?:\([^)]*\))?\s+AS\s*\(/gi;
+    let m;
+    while ((m = re.exec(withMatch[1])) !== null) names.add(m[1].toLowerCase());
+    return names;
+}
+
+/** SQL 이 참조하는 모든 테이블 이름 (FROM/JOIN/INTO/UPDATE, CTE 제외) */
+function _extractAllTableRefs(normalized) {
+    const tables = new Set();
+    const upper = normalized.toUpperCase();
+    const cteNames = _extractCteNames(upper);
+    const ident = '["\'`]?([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?)["\'`]?';
+    for (const kw of ['FROM', 'JOIN', 'INTO', 'UPDATE']) {
+        const re = new RegExp('\\b' + kw + '\\s+' + ident, 'gi');
+        let m;
+        while ((m = re.exec(normalized)) !== null) {
+            const base = m[1].split('.').pop();
+            if (cteNames.has(base.toLowerCase())) continue;
+            tables.add(base);
+        }
+    }
+    return [...tables];
+}
+
+/**
+ * SQL 의 주 연산 + 참조 테이블 전체. (워커 인라인 로직과 동일 규칙)
+ * @param {string} sql
+ * @returns {{ op: string|null, tables: string[], primary: string|null }}
+ */
+export function extractOpAndTables(sql) {
+    const { op, table } = extractOpAndTable(sql);
+    if (!op) return { op: null, tables: [], primary: null };
+    const normalized = _stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
+    const tables = [...new Set(_extractAllTableRefs(normalized).map((t) => t.toLowerCase()))];
+    return { op, tables, primary: table ? table.toLowerCase() : null };
+}
+
+/**
+ * SQL 이 참조하는 **모든** 테이블에 대해 인가 규칙을 평가한다.
+ *
+ * - 주 연산 대상이 아닌 테이블(JOIN/서브쿼리/INSERT ... SELECT 원본)은 읽기(SELECT)로 취급.
+ * - 하나라도 거부되면 전체 거부.
+ * - 워커 `_az_checkSql` 과 동일한 규칙이어야 한다.
+ *
+ * @param {ReturnType<typeof normalizeAuthorizationConfig>} policy
+ * @param {string} sql
+ * @param {{ payload: any, valid: boolean, reason?: string } | null} jwt
+ */
+export function evaluateSqlAuthorization(policy, sql, jwt = null) {
+    if (!policy || !policy.enabled) return { ok: true };
+    const { op, tables, primary } = extractOpAndTables(sql);
+    const targets = tables.length > 0
+        ? tables.map((t) => ({ table: t, op: t === primary ? (op || '*') : 'SELECT' }))
+        : [{ table: '', op: op || '*' }];
+
+    for (const t of targets) {
+        const matched = matchRule(policy, t.op, t.table);
+        const decision = authorize(matched, policy, jwt);
+        if (!decision.ok) {
+            return {
+                ...decision,
+                op: t.op,
+                table: t.table,
+                rule: matched ? matched.key : null,
+            };
+        }
+    }
+    return { ok: true };
 }

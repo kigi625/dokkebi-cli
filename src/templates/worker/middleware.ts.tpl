@@ -4,7 +4,9 @@
 const _DOKKEBI_INTERNAL_BINDING: string = '__DOKKEBI_PH_INTERNAL_BINDING__' || 'DB';
 function _internalDb(env: any): D1Database {
   const b = env && (env as any)[_DOKKEBI_INTERNAL_BINDING];
-  return (b as D1Database) || (env && _internalDb(env));
+  if (b) return b as D1Database;
+  if (env && env.DB) return env.DB as D1Database; // 내부 바인딩 미설정 시 기본 DB
+  throw new Error('[dokkebi] D1 바인딩 "' + _DOKKEBI_INTERNAL_BINDING + '" 이 없습니다. wrangler.toml 의 d1_databases 를 확인하세요.');
 }
 // @dokkebi-version: 2
 // worker/api/_middleware.ts

@@ -86,10 +86,10 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 | 레이어 | 역할 | 커버리지 |
 |---|---|---|
 | **공통 방어** | 다중 문장(`;`), 주석(`-- /**/`), 50KB 초과, 위험 토큰(`ATTACH`, `PRAGMA`, `LOAD_EXTENSION`, `INTO OUTFILE`, `xp_*`, `SLEEP`, `PG_SLEEP`, `BENCHMARK`, `WAITFOR`, `INFORMATION_SCHEMA`) 차단 | 상시 |
-| **SQL Allowlist** | 테이블 × 연산(SELECT/INSERT/UPDATE/DELETE) 단위 허가. 모든 FROM/JOIN/INTO/UPDATE 참조 검사. `CREATE TABLE` 은 `_dokkebi_*` 만 | 상시 |
+| **SQL Allowlist** | 테이블 × 연산(SELECT/INSERT/UPDATE/DELETE) 단위 허가. 모든 FROM/JOIN/INTO/UPDATE 참조 검사 + 2차 참조(JOIN/서브쿼리/`INSERT ... SELECT`)는 SELECT 권한 필수. 내부 테이블(`_dokkebi_*`, `sqlite_*`)과 클라이언트 DDL 은 항상 차단 | 상시 |
 | **Query Registry** | SQL **shape** 단위 허가 — 컬럼 변경, WHERE 제거, `OR 1=1` 등 구조 변조 차단. 정적 스캐너 + 주석 선언 + dev 학습으로 수집 | 상시 (auto/strict 모드) |
-| **Tenant Policy** | Row-level 격리 — `WHERE user_id = ?` 검증(verify) 또는 자동 주입(inject). top-level `OR`, 누락 WHERE, aliased column 감지 | opt-in |
-| **Authorization** | 연산-레벨 권한 — "DELETE posts 는 role=admin 만" — JWT 서명 검증 + role 매칭 | opt-in |
+| **Tenant Policy** | Row-level 격리 — `WHERE user_id = ?` 검증(verify) 또는 자동 주입(inject). top-level `OR`, 누락 WHERE, aliased column 감지. **테넌트 신분은 검증된 JWT 에서만 (`requireJwtTenant`, authorization/auth.login 활성 시 기본 ON). 세션 `tenant_json` 은 클라이언트 주장값** | opt-in |
+| **Authorization** | 연산-레벨 권한 — "DELETE posts 는 role=admin 만" — JWT 서명 검증 + role 매칭. **참조된 모든 테이블**에 대해 평가(JOIN / `INSERT ... SELECT` 포함, 주 연산 대상이 아닌 참조는 SELECT 로 취급) | opt-in |
 
 파라미터 바인딩은 D1/Supabase/Appwrite SDK 가 `prepare().bind()` 로 처리. 프록시는 raw SQL 을 절대 문자열 보간하지 않음.
 
@@ -102,18 +102,28 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 | Nonce | 요청당 `crypto.randomUUID()` |
 | 평문 잔존 | 복호화 직후 `plain.fill(0)` (best-effort) |
 | 커브 | P-256 (prime256v1) |
-| env secret | 빌드타임에 AES-GCM 으로 감싸 OPFS 저장. Host 클로저에만 복호화 |
+| env secret | **클라이언트에는 번들 복호화 키(`__DOKKEBI_BC_KEY__`)만 전달.** 그 외 `.env` 값은 브라우저에 도달하지 않으며, 백엔드 `process.env.SECRET` 은 `''` 가 됩니다(빌드/배포에서 차단, 예외는 `DOKKEBI_ALLOW_WASM_SECRETS=true`). Secret 은 `worker/api/**` 로 옮기세요 |
 
 ### 2.5 DoS / 자원 고갈
 
 | 범주 | 상한 |
 |---|---|
-| 핸드셰이크 | IP당 20/분 |
+| 핸드셰이크 | IP당 20/분(아이솔레이트 단위, `DOKKEBI_HANDSHAKE_RPM`) + 8KB 본문 |
 | DB 쿼리 | IP당 300/분 + 유효 세션 |
 | 로그 | IP당 600/분 + 64KB body |
 | Body 크기 | handshake 8KB / db 128KB / log 64KB / admin 2KB — `Content-Length` 선체크 + 스트리밍 중 중단 |
-| 세션 | 최대 500 + FIFO |
+| 세션 | 전역 최대 500(`DOKKEBI_MAX_SESSIONS`) + IP별 20(`DOKKEBI_MAX_SESSIONS_PER_IP`). 전역 초과 시 **가장 많이 만든 IP**에서 먼저 축출(오래된 전역 세션 축출 아님) |
 | Nonce 캐시 | TTL 35s + 60s 주기 정리 |
+
+### 2.5.1 클라이언트 IP 신뢰와 로컬 도구 엔드포인트 (`dok serve` / `dok dev`)
+
+| 항목 | 동작 |
+|---|---|
+| 클라이언트 IP | 기본은 **소켓 피어 주소만** 사용. `CF-Connecting-IP` / `X-Forwarded-For` 는 `DOKKEBI_TRUST_PROXY=1` 일 때만 신뢰(신뢰 리버스 프록시 뒤). 헤더 위조로 IP 레이트리밋·`DOKKEBI_PANEL_ALLOWED_IPS` 를 우회하는 것을 막는다. |
+| ECDH 핸드셰이크 | 핸드셰이크마다 새 P-256 키쌍(`keyId`, 60초 TTL, 1회 사용) — serverless 워커와 동일한 forward secrecy. |
+| `/_dokkebi/gif` | IP당 10/분 레이트리밋, PNG 시그니처 강제, 프레임/본문 용량 제한, `-nostdin`/`-f image2`. 로컬 도구이므로 `dok serve` 를 신뢰할 수 없는 네트워크에 노출하지 말 것. |
+| dev 미디어 업로드 | JWT `exp` 필수, JWT 시크릿 미설정 시 프로세스별 랜덤 시크릿 사용(고정 기본값 제거), `Content-Length` 필수·상한. |
+| 바인드 주소 | `dok serve` / `dok dev` 는 `0.0.0.0` 에 바인딩. 신뢰 네트워크/방화벽 뒤에서만 실행하고, 신뢰 프록시 뒤라면 `DOKKEBI_TRUST_PROXY=1` 설정. |
 
 ### 2.6 정보 노출
 
@@ -163,8 +173,11 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 policy: {
   enabled: true,
   mode: 'inject',        // 'verify' (검증만) | 'inject' (자동 주입)
-  claim: 'user_id',      // 세션 tenant_json 에서 꺼낼 필드
+  claim: 'user_id',      // 테넌트 클레임 (requireJwtTenant 시 JWT 클레임)
   strict: true,
+  // 테넌트 신분을 검증된 JWT 에서만 취한다 (세션 tenant_json 무시).
+  // 미설정 시: authorization / auth.login 이 켜져 있으면 자동 true.
+  requireJwtTenant: true,
   tables: {
     posts: { tenantColumn: 'user_id', mode: 'enforce' },
     orders: { tenantColumn: 'user_id', mode: 'enforce' },
@@ -301,6 +314,23 @@ router.post('/api/ai/image', async (ctx) => {
 5. Worker 가 feature 정책과 JWT role 을 확인
 6. Worker-only `DOKKEBI_CAPABILITY_SECRET` 으로 `feature + sessionId + controllersHash + stateHash + nonce + exp` 를 서명
 7. guard 통과 후 핸들러는 `ctx.capability` 의 `token/proof` 를 단순 허가 플래그가 아니라 기능 실행 재료로 사용
+
+**Worker 측 재검증 (실질 보호에 필수).** 자동 라우트 가드는 브라우저 번들에서 돌기 때문에 패치될 수
+있습니다. 실제 고비용/권한 작업을 수행하는 Worker 라우트는 토큰을 다시 검증해야 합니다.
+
+```ts
+// worker/api/ai/image.ts
+import { verifyCapability } from '../_dokkebi/capability.js';
+
+export const onRequestPost = async (ctx) => {
+  const cap = await verifyCapability(ctx.request, ctx.env, 'image.generate', { stateHash });
+  if (!cap.ok) return new Response(JSON.stringify({ ok: false, code: cap.code }), { status: 403 });
+  // cap.payload.sub / cap.payload.stateHash 를 실제 작업 입력에 바인딩
+};
+```
+
+`verifyCapability()` 는 HMAC, `typ: 'DOKKEBI-CAP'`, `exp`, `feature`, 선택적 `stateHash` 를 검증합니다.
+토큰 전달: `X-Dokkebi-Capability: <token>` 또는 `Authorization: Capability <token>`.
 
 중요한 한계:
 - 이 기능은 Authorization Policy 를 대체하지 않습니다. DB 쓰기/삭제 권한은 여전히 Worker 의 Authorization Policy 또는 DB RLS 로 강제해야 합니다.
@@ -661,17 +691,17 @@ dokkebi 는 다음 3중 방어로 이 race 를 제거합니다 (모두 자동, �
 |---|------|---|---|---|---|---|
 | 1 | **ECDH(P-256) + HKDF-SHA256 → AES-256-GCM** | 네트워크/전송 | 양방향 종단 암호화 채널 | 핸드셰이크에서 `crypto.subtle.generateKey({ECDH, P-256})` 으로 ephemeral 키쌍 생성 → `deriveBits` → HKDF로 `dokkebi-enc`/`dokkebi-sig` 두 키 분리 → AES-256-GCM으로 모든 요청·응답 암호화 | 도청, MITM 평문 노출, DevTools 평문 관찰 | ✅ 정상 |
 | 2 | **HMAC-SHA256 요청 서명** | 네트워크/전송 | 변조 방지 | 모든 `/api/_dokkebi/db` 요청은 sigKey 로 HMAC 서명 검증 후 처리. `SIGNATURE_INVALID` 응답 코드 정의됨 | 요청 변조, 메시지 무결성 위협 | ✅ 정상 |
-| 3 | **Replay 방어 (Nonce + ±5s TS)** | 네트워크/전송 | 재전송 차단 | `workerDb` 가 nonce/timestamp 검증 → 인메모리 + `_dokkebi_nonces` D1 cross-isolate 중복 체크. `REPLAY_DETECTED` / `TIMESTAMP_SKEW` 코드. `replay.timestampWindowMs`(1-30s clamp), `nonceTtlMs`(window+5s ~ 5min clamp) 튜닝 가능 | 캡처 요청 재전송, 빠른 다발 발사 | ✅ 정상 |
+| 3 | **Replay 방어 (Nonce + ±5s TS)** | 네트워크/전송 | 재전송 차단 | `workerDb` 가 nonce/timestamp 검증 → 인메모리 검사 후 D1 `_dokkebi_nonces` 선점. **쓰기/특수 명령은 동기** `INSERT OR IGNORE` + changes 로 다른 아이솔레이트 재전송을 차단하고, 읽기는 백그라운드 기록. `REPLAY_DETECTED` / `TIMESTAMP_SKEW` 코드. `replay.timestampWindowMs`(1-30s clamp), `nonceTtlMs`(window+5s ~ 5min clamp) 튜닝 가능 | 캡처 요청 재전송, 빠른 다발 발사 | ✅ 정상 |
 | 4 | **Forward Secrecy (Ephemeral ECDH)** | 네트워크/전송 | 세션키 노출 시에도 과거 트래픽 보호 | 매 핸드셰이크마다 새 키쌍, `_dokkebi_ephemeral_keys` 60s TTL 후 삭제 | 장기 세션키 탈취 후 과거 트래픽 복호화 | ✅ 정상 |
-| 5 | **세션 관리 (FIFO + 토큰 버킷)** | 네트워크/세션 | DoS 방어 | `_dokkebi_sessions` D1 + per-session `bucketTokens`/`bucketRefillAt`. 세션 폭탄/요청 폭주 방어 | 세션 폭탄, 단일 세션 다발 공격 | ✅ 정상 |
+| 5 | **세션 관리 (FIFO + 토큰 버킷)** | 네트워크/세션 | DoS 방어 | `_dokkebi_sessions` D1 + per-session `bucketTokens`/`bucketRefillAt`; 핸드셰이크 IP 버킷(20/분) + 전역 상한 `DOKKEBI_MAX_SESSIONS`(기본 500, FIFO 축출). 세션 폭탄/요청 폭주 방어 | 세션 폭탄, 단일 세션 다발 공격 | ✅ 정상 |
 | 6 | **Envelope Body 크기 제한 (512KB)** | 네트워크/DoS | body DoS 방어 | `MAX_ENVELOPE_BYTES = 512*1024` + `Content-Length` 선체크 → 413 | 거대 페이로드 DoS, 메모리 고갈 | ✅ 정상 |
-| 7 | **SQL Allowlist (테이블×op)** | 백엔드 로직/DB | 4-레이어 1단계 — 허용된 테이블·op만 통과 | `dist/dokkebi/sql-allowlist.json` 빌드시 추출 → `workerDb` 에 인라인 임베드. SELECT/INSERT/UPDATE/DELETE 단위 + `CREATE TABLE _dokkebi_*` 만 허용 | 임의 테이블 SELECT/UPDATE/DELETE, 시스템 테이블 변조 | ✅ 정상 |
+| 7 | **SQL Allowlist (테이블×op)** | 백엔드 로직/DB | 4-레이어 1단계 — 허용된 테이블·op만 통과 | `dist/dokkebi/sql-allowlist.json` 빌드시 추출 → `workerDb` 에 인라인 임베드. SELECT/INSERT/UPDATE/DELETE 단위, 2차 참조는 SELECT 필수. **내부 테이블(`_dokkebi_*`, `sqlite_*`)·클라이언트 DDL 은 항상 차단** (`findInternalTableRef`) | 임의 테이블 SELECT/UPDATE/DELETE, **시스템 테이블 변조 / 세션키 탈취**, 스키마 탐색 | ✅ 정상 |
 | 8 | **Query Registry (SQL shape)** | 백엔드 로직/DB | 4-레이어 2단계 — SQL 구조 변조 차단 | shape 등록·매칭. `OR 1=1`, WHERE 누락, 컬럼 변경 차단. **기본 `auto`** (등록 안된 건 _debugSql 폴백 = 사실상 비활성), `queryRegistry.strict: true` 시 미등록 차단 | SQL 구조 변조, `OR 1=1`, WHERE 제거 | ✅ 정상 (auto 시 방어 약화 — §4.2 참조) |
 | 9 | **공통 SQL 방어** | 백엔드 로직/DB | 4-레이어 0단계 | `hasMultipleStatements` (다중 문장 `;`), `stripStringsAndComments` (주석 `--`/`/* */`), 위험토큰 차단 (`ATTACH`, `DETACH`, `PRAGMA`, `LOAD_EXTENSION`, `INTO OUTFILE`, `INTO DUMPFILE`, `INFORMATION_SCHEMA`, `PG_SLEEP`, `SLEEP(`, `BENCHMARK(`, `WAITFOR`, `XP_`, `SP_EXECUTESQL`) | SQL injection (스택 쿼리, 주석 우회), DB 권한 확장, 시간 기반 blind injection | ✅ 정상 |
-| 10 | **MTD — Payload Field Rotation** | 네트워크/MTD (Moving Target Defense) | 봉투 내부 키명을 빌드별로 회전 (정적 시그니처 방어) | `dok build` 가 `buildId` 기반 SHA-256 으로 `queryId/params/_debugSql/_setTenant/_attest/_capabilityUnlock/sql/_jwt` 8개 키를 `_f<hash20>` 으로 매핑(`PAYLOAD_FIELD_ROTATE_CANONICAL`). `wire-runtime.json` + `_payloadWire.ts` 로 워커·클라 동시 임베드. `denormalizePayload()` 가 active+previous(이전 빌드 호환) 두 매핑 모두 인식 → **무중단 배포 호환**. `DOKKEBI_HARDENING_ROTATE=off` 로 비활성 가능 (기본 ON) | 자동화 도구의 정적 키 시그니처 매칭(`queryId=`/`_debugSql=`), 캡처-재구성 봇, 정적 페이로드 스캐너, 빌드 간 페이로드 다이프 분석 | ✅ 정상 |
+| 10 | **MTD — Payload Field Rotation** | 네트워크/MTD (Moving Target Defense) | 봉투 내부 키명을 빌드별로 회전 (정적 시그니처 방어) | `dok build` 가 `buildId` 기반 SHA-256 으로 `queryId/params/_debugSql/_setTenant/_login/_attest/_capabilityUnlock/_tableExists/sql/_jwt` 10개 키를 `_f<hash20>` 으로 매핑(`PAYLOAD_FIELD_ROTATE_CANONICAL`). `wire-runtime.json` + `_payloadWire.ts` 로 워커·클라 동시 임베드. `denormalizePayload()` 가 active+previous(이전 빌드 호환) 두 매핑 모두 인식 → **무중단 배포 호환**. `DOKKEBI_HARDENING_ROTATE=off` 로 비활성 가능 (기본 ON) | 자동화 도구의 정적 키 시그니처 매칭(`queryId=`/`_debugSql=`), 캡처-재구성 봇, 정적 페이로드 스캐너, 빌드 간 페이로드 다이프 분석 | ✅ 정상 |
 | 11 | **PoW — 경량 Proof of Work (14-bit SHA-256)** | 네트워크/봇 비용 부과 | 자동화 봇의 단가 상승 + capability·attest 챌린지 보호 | `_capabilityUnlock` 또는 `_attest.request === true` 페이로드에만 요구 (`powPayloadRequired`). 클라가 `<sid>:<minuteSlot>:<counter>` SHA-256 leading zero ≥14bit 채굴 → 워커가 `verifyAndStripPowDb()` 로 검증, `±1 minuteSlot` 윈도우, counter ≤ 20M, slot 만료 거부. 빌드 시 `_payloadWire.ts` 에 임베드. `DOKKEBI_HARDENING_POW=off` 로 비활성 (기본 ON) | 자동화 봇의 capability 무차별 발급 시도, 무료 attestation 챌린지 폭주, 토큰 발급 단가 0 공격, 기본 채널 위 추가 비용 부과 안된 봇 | ✅ 정상 |
-| 12 | **Tenant Policy (Row-level)** | 백엔드 로직/DB | 4-레이어 3단계 (opt-in) — 멀티테넌트 격리 | `_pe_inject` / `verifyTenant` / `_pe_hasTopLevelOr` 임베드. `mode: 'verify'` 거절만, `'inject'` 자동 주입. `tenant_json` 컬럼에 세션 테넌트 저장. top-level `OR`, aliased col 검증 | A→B 데이터 SELECT/UPDATE/DELETE, WHERE 누락, OR 1=1 우회 | ✅ 정상 |
-| 13 | **Authorization Policy (JWT/role)** | 백엔드 로직/인가 | 4-레이어 4단계 (opt-in) — op-level 권한 | HS256 JWT 서명·exp 검증, `(op, table)` → `roles.some(r => userRoles.includes(r))` 매칭, wildcard `'*'` 지원, `mode: 'warn'`/`'strict'` | 일반 사용자가 admin op (`UPDATE users`, `DELETE *`) 호출, JWT 위조/만료 토큰 재사용 | ✅ 정상 (HS256 한정 — §4.9) |
+| 12 | **Tenant Policy (Row-level)** | 백엔드 로직/DB | 4-레이어 3단계 (opt-in) — 멀티테넌트 격리 | `_pe_inject` / `verifyTenant` / `_pe_hasTopLevelOr` 임베드. `mode: 'verify'` 거절만, `'inject'` 자동 주입. `tenant_json` 컬럼에 세션 테넌트 저장. top-level `OR`, aliased col 검증. 테넌트는 검증된 JWT 에서만(`requireJwtTenant`, authorization/auth.login 활성 시 기본 ON). `_setTenant` 는 서버 바인딩 테넌트를 덮어쓸 수 없음 | A→B 데이터 SELECT/UPDATE/DELETE, WHERE 누락, OR 1=1 우회, **클라이언트 테넌트 위조** | ✅ 정상 |
+| 13 | **Authorization Policy (JWT/role)** | 백엔드 로직/인가 | 4-레이어 4단계 (opt-in) — op-level 권한 | HS256 JWT 서명·exp 검증, **참조된 모든 테이블**에 `(op, table)` → `roles.some(...)` 매칭(JOIN/`INSERT ... SELECT` 포함, 주 연산 대상이 아닌 참조는 SELECT), wildcard `'*'` 지원, `mode: 'warn'`/`'strict'` | 일반 사용자가 admin op (`UPDATE users`, `DELETE *`) 호출, JOIN/서브쿼리 우회, JWT 위조/만료 토큰 재사용 | ✅ 정상 (HS256 한정 — §4.9) |
 | 14 | **Capabilities (Signed Unlock Token)** | 백엔드 로직/인가 | (opt-in) 권한 분기점프 / 비용 라우트 보호 | `_cap_sign`/`_cap_verify` HMAC, `DOKKEBI_CAPABILITY_SECRET` 사용, `routes`/`@dokkebi-capability` JSDoc 빌드 시 자동 라우터 guard 삽입 | WASM 패치로 권한 분기 우회, 외부 비용 라우트(OpenAI 등) 직접 호출, 토큰 탈취 후 다른 세션 사용 (sid 검증) | ✅ 정상 |
 | 15 | **Capability Chain (`requires.prev`)** | 백엔드 로직/인가 | (opt-in) 비즈 단계 우회 차단 | `prevTokens` HMAC·exp·sid·feature 일치 검증. `CAPABILITY_PREV_MISSING`/`CAPABILITY_PREV_INVALID` 코드 | 1단계 인증·2단계 결제 건너뛰고 3단계 직접 호출, 단계 비틀기 | ✅ 정상 |
 | 16 | **Bundle Attestation (chunk SHA-256)** | 백엔드 로직/번들 무결성 | (opt-in, capabilities 켜면 자동) 변조된 번들 차단 | `dok build` 가 `backend-bundle.chunks.json` (16KB chunk SHA-256 매니페스트) 생성 → 워커 코드에 임베드 (클라이언트 비노출). `_attest` challenge → 클라가 메모리 번들 슬라이싱 응답. 실패시 `attest_failed` / `CAPABILITY_ATTEST_REQUIRED`. `requires: { attest: true }` 시 capability 발급 게이트 | 클라이언트 번들 패치(권한 분기 우회·자유 capability 발급) | ✅ 정상 |
@@ -679,7 +709,7 @@ dokkebi 는 다음 3중 방어로 이 race 를 제거합니다 (모두 자동, �
 | 18 | **Panel IP Guard (CIDR)** | 네트워크/관제 | (opt-in) 관제 패널 외부 IP 차단 | `workerAdmin`/`workerAdminApi` 에 `panelIpAllowed` + CIDR 매칭. `CF-Connecting-IP` 우선 → `X-Forwarded-For` fallback. 차단 시 403 + `panel_ip_block` 이벤트 (`_dokkebi_security`) | 패널 비밀번호 무차별 대입, 외부 IP 관제 API 호출, 로그/이벤트 무단 조회·삭제 | ✅ 정상 |
 | 19 | **관리자 패널 보안 (PW + 락 + 토큰)** | 백엔드 로직/관제 | 항상 ON | `timingSafeEqual` 상수-시간 PW 비교, 5회 실패 → 5분 락, HMAC 서명 + 만료 토큰, 2KB body 상한, 600/min 로그 한도 | 패널 PW 브루트포스, 타이밍 공격, 토큰 위조, 관제 DoS | ✅ 정상 |
 | 20 | **Strict CSP (hash-pinned)** | 네트워크/XSS 심층방어 | (opt-in) | `deploy.js _writeSecurityHeaders` → `dist/_headers`. 인라인 `<script>/<style>` 콘텐츠를 SHA-256 해싱해 `script-src 'self' 'sha256-…'` 자동 부여, `unsafe-inline` 제거. CSP 전 directive 명시 | XSS 후속 외부 스크립트 주입, eval, 데이터 유출 (자료/키 탈취) | ✅ 정상 |
-| 21 | **OPFS 환경시크릿 (Opaque Handle)** | 백엔드 로직/시크릿 | 항상 ON | 빌드 타임 AES-GCM 으로 env-secret 감싸 OPFS 저장. host 클로저에만 복호화. `.dokkebi/env-secrets.json` 정적 서빙 차단 | 브라우저 콘솔/DevTools 환경변수 노출, 클라이언트 코드 dump | ✅ 정상 (XSS 시 같은 origin 재현 가능 — §4.3) |
+| 21 | **Opaque Handle (번들 키 한정)** | 백엔드 로직/시크릿 | 항상 ON | `__DOKKEBI_BC_KEY__` 만 AES-GCM 으로 감싸 OPFS 저장, host 클로저에서만 복호화. 서버 전용 `.env` Secret 은 브라우저로 전달되지 않으며 백엔드 `process.env.SECRET` 은 배포/strict 빌드에서 차단. `.dokkebi/env-secrets.json` 정적 서빙 차단 | 브라우저 콘솔/DevTools 환경변수 노출, 클라이언트 코드 dump | ✅ 정상 (XSS 시 같은 origin 재현 가능 — §4.3) |
 | 22 | **번들 무결성 SHA-256** | 빌드/번들 | 항상 ON | `dok build` 가 `backend.bundle.enc` SHA-256 → `backend.bundle.<hash12>.enc` immutable 파일명 + 런타임 `crypto.subtle.digest` 검증 | 번들 교체/변조, MITM 번들 swap | ✅ 정상 |
 | 23 | **무중단 배포 — BC_KEY_MAP** | 빌드/배포 | 항상 ON (v6.x+) | `__DOKKEBI_BC_KEY_MAP__` (최근 5개 빌드 키 FIFO) Worker Secret 등록. 클라가 `bh=<hash12>` 동봉 → `pickClientHandshakeSecrets()` 가 매칭 키로 응답 | 캐시·전파 race로 인한 핸드셰이크 실패 (시나리오 A·B) | ✅ 정상 |
 | 24 | **무중단 배포 — `prop_pending` 흡수** | 빌드/배포 | 항상 ON | `_pickBcKeyForBundle()` 가 `bh` 미매칭 + direct 키도 현재 번들용 아님 시 `status: 'pending'` 반환. 핸드셰이크 핸들러는 잘못된 키로 폴백하지 않고 `200 + { pending: true, code: 'prop_pending', retryAfterMs: 5000 }` 응답 → 클라 SDK 자동 백오프 재시도 | 새 deploy 직후 ~수십초의 Worker Secret 전파 지연 시 사용자에게 빨간 콘솔 에러로 노출되는 문제, 잘못된 키로 복호화 실패 후 무한 재시도 | ✅ 정상 |

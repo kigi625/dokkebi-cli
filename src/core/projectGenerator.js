@@ -95,6 +95,7 @@ function buildFileTree({ name, frontend, database, withAuth, proxyMode = 'server
     if (proxyMode === 'serverless') {
         files['worker/api/_dokkebi/handshake.ts'] = workerHandshake();
         files['worker/api/_dokkebi/_payloadWire.ts'] = emitPayloadWireTs(disabledWireRuntimeJson());
+        files['worker/api/_dokkebi/capability.ts'] = workerCapability();
         files['worker/api/_dokkebi/db.ts'] = workerDb(database);
         files['worker/api/_dokkebi/log.ts'] = workerLog();
         files['worker/api/_dokkebi/_panel.ts'] = workerAdmin(name);
@@ -496,6 +497,15 @@ const _PHASE_B_PH_FULL = [
 
 export function workerHandshake() {
     return renderTemplate('worker/handshake.ts.tpl', [..._PHASE_B_PH_INTERNAL]);
+}
+
+/**
+ * Worker 측 capability 검증 헬퍼 (worker/api/_dokkebi/capability.ts).
+ * 브라우저의 자동 라우트 가드는 패치 가능하므로, 실제 고비용/관리 작업을
+ * 수행하는 worker/api/** 라우트에서 이 헬퍼로 토큰을 재검증한다.
+ */
+export function workerCapability() {
+    return renderTemplate('worker/capability.ts.tpl', []);
 }
 
 
@@ -1596,7 +1606,7 @@ export interface Env {
   __DOKKEBI_BC_HASH__?: string;
 }
 
-const _SKIP = ['/_dokkebi/_panel', '/api/billing/lemon-webhook'];
+const _SKIP = ['/_dokkebi/_panel', '/api/billing/lemon-webhook', '/api/scanner'];
 
 // ── Phase B — internal DB resolver (build-time injected) ─
 const _DOKKEBI_INTERNAL_BINDING: string = '__DOKKEBI_PH_INTERNAL_BINDING__' || 'DB';

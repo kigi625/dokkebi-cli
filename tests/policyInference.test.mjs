@@ -352,18 +352,21 @@ test('_inferSessionClaim: 그 외 → tenantColumn 그대로 (creator_token 등)
     );
 });
 
-test('_resolveTenantClaim: 테이블 명시 > 전역 > 컬럼명 순 fallback', () => {
+test('_resolveTenantClaim: sessionClaim 은 배타적, 없을 때만 전역/컬럼 fallback', () => {
+    // 보안 강화(C2): 테이블에 sessionClaim 을 명시하면 그 클레임만 사용한다.
+    // 다른 클레임으로 fallback 하면 site_id 같은 FK 컬럼에 user_id 가 들어가는
+    // 오매핑이 생길 수 있어 의도적으로 배타적으로 변경.
     // 1) 테이블 명시값이 세션에 있으면 그걸 사용
     assert.deepEqual(
         _resolveTenantClaim({ user_id: 'u1', creator_token: 'c1' }, 'user_id', 'creator_token', 'id'),
         ['user_id', 'u1']
     );
-    // 2) 테이블 명시값이 세션에 없으면 전역 사용
+    // 2) 테이블 명시값이 세션에 없으면 전역으로 대체하지 않는다 (TENANT_MISSING/optional skip)
     assert.deepEqual(
         _resolveTenantClaim({ creator_token: 'c1' }, 'user_id', 'creator_token', 'id'),
-        ['creator_token', 'c1']
+        ['user_id', undefined]
     );
-    // 3) 전역도 없으면 tenantCol 이름으로 fallback
+    // 3) sessionClaim 이 없을 때만 전역 → 컬럼명 fallback
     assert.deepEqual(
         _resolveTenantClaim({ sender_token: 's1' }, undefined, 'user_id', 'sender_token'),
         ['sender_token', 's1']

@@ -18,6 +18,9 @@ function base64UrlDecode(s) {
 function verifyJwtHs256(token, secret) {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
+  let header;
+  try { header = JSON.parse(base64UrlDecode(parts[0]).toString('utf8')); } catch { return null; }
+  if (!header || header.alg !== 'HS256' || header.typ !== 'JWT') return null;
   const signingInput = `${parts[0]}.${parts[1]}`;
   let sigExpected;
   try {
@@ -32,8 +35,9 @@ function verifyJwtHs256(token, secret) {
   try {
     const payloadJson = base64UrlDecode(parts[1]).toString('utf8');
     const payload = JSON.parse(payloadJson);
-    const exp = payload.exp;
-    if (typeof exp === 'number' && exp * 1000 < Date.now()) return null;
+    // exp 필수 — exp 없는 토큰은 영구 유효가 되어 업로드 토큰이 만료되지 않는다.
+    if (typeof payload.exp !== 'number' || payload.exp * 1000 < Date.now()) return null;
+    if (typeof payload.nbf === 'number' && payload.nbf * 1000 > Date.now()) return null;
     return payload;
   } catch {
     return null;
@@ -113,6 +117,17 @@ export async function tryDevBlogMediaPost(req, res, { jwtSecret, mediaRoot }) {
   const ct = req.headers['content-type'] || '';
   if (!ct.toLowerCase().includes('multipart/form-data')) {
     json(res, { error: 'multipart/form-data 로 file 필드를 보내 주세요.' }, 400);
+    return true;
+  }
+
+  // 본문 전체를 formData 로 버퍼링하기 전에 크기를 먼저 제한한다 (메모리 고갈 방어).
+  const _contentLength = Number(req.headers['content-length']);
+  if (!Number.isFinite(_contentLength) || _contentLength <= 0) {
+    json(res, { error: 'Content-Length 가 필요합니다.' }, 411);
+    return true;
+  }
+  if (_contentLength > 100 * 1024 * 1024) {
+    json(res, { error: '업로드가 너무 큽니다.' }, 413);
     return true;
   }
 

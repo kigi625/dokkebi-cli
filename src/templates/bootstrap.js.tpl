@@ -1336,13 +1336,8 @@ function _dokkebiScheduleVersionProbeForPath(path) {
       return { ok: true, value: count };
     },
     async dbTableExists(handleId, tableName) {
-      try {
-        const res = await _proxyQuery(
-          "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-          [tableName]
-        );
-        return (res.value?.rows?.length ?? 0) > 0;
-      } catch { return false; }
+      const res = await _proxyTableExists(tableName);
+      return !!(res && res.ok && res.value && res.value.exists);
     },
     // Tenant Policy (Stage 1/2) — 세션 클레임 설정.
     // DSL 업데이트 후 ctx.setSessionTenant({user_id}) 로 호출될 예정.
@@ -1368,16 +1363,18 @@ function _dokkebiScheduleVersionProbeForPath(path) {
 
   // Worker 테넌트/인가: /api/_dokkebi/db 는 Authorization 헤더가 없으므로
   // 암호화 페이로드에 JWT 를 실어 보냄. 앱에서 window.__DOKKEBI_DB_JWT__ = () => token;
+  // __DOKKEBI_LOGIN__ 으로 로그인한 경우 발급 토큰을 자동으로 사용한다(수동 설정 불필요).
+  var _autoDbJwt = '';
   function _getJwtForDbChannel() {
     try {
       var g = typeof window !== 'undefined' ? window : null;
-      if (!g) return '';
-      var v = g.__DOKKEBI_DB_JWT__;
-      if (typeof v === 'function') v = v();
-      return (typeof v === 'string' && v) ? v : '';
-    } catch (e) {
-      return '';
-    }
+      if (g) {
+        var v = g.__DOKKEBI_DB_JWT__;
+        if (typeof v === 'function') v = v();
+        if (typeof v === 'string' && v) return v;
+      }
+    } catch (e) { /* ignore */ }
+    return _autoDbJwt || '';
   }
 
   async function _buildDbPayload(sql, params) {
@@ -1411,12 +1408,18 @@ function _dokkebiScheduleVersionProbeForPath(path) {
   //   이후 모든 db 요청이 verifyTenantPolicy / injectTenantPolicy 에서
   //   이 값을 기준으로 검증됩니다.
   //   null 을 넘기면 로그아웃(클리어).
-  //   ⚠ 자기 자신의 세션만 변경 가능 — 다른 세션 탈취가 전제되지 않는 한
-  //     공격 벡터가 되지 않습니다. 문서: docs/design/TENANT_POLICY.md
+  //
+  //   ⚠ 보안 경계 아님: tenant_json 은 클라이언트가 설정하는 값이다.
+  //     - worker 로그인(auth.login) 또는 policy.requireJwtTenant:true 구성에서는
+  //       서버가 _setTenant 를 거부한다(TENANT_SERVER_BOUND).
+  //     - JWT 가 함께 오면 클레임은 JWT 값으로 고정된다(TENANT_CLIENT_OVERRIDE).
+  //     - 즉, 실제 격리는 "검증된 JWT/서버 로그인"으로만 성립한다.
+  //   문서: docs/design/TENANT_POLICY.md
   // ────────────────────────────────────────────────────────
   // DB 요청과 동일 _dbRequest 큐에 넣어 counter(nonce) 순서가 역행하지 않게 함.
   // 큐 밖에서 호출 시 loadProjects 등과 병렬 → 서버 counter regression + replay_attempt 로그.
   async function _proxySetTenant(tenantObj) {
+    if (tenantObj === null) { _autoDbJwt = ''; }  // 로그아웃 — 자동 보관 토큰 폐기
     return _dbRequest(async function() {
       try {
         const payload = { _setTenant: tenantObj === undefined ? null : tenantObj };
@@ -1427,6 +1430,10 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           body,
         });
         const json = await resp.json();
+        // 정책 거부(403)는 세션 무효가 아니다 — 재핸드셰이크 없이 그대로 반환.
+        if (resp.status === 403 && typeof json.code === 'string' && json.code.indexOf('TENANT_') === 0) {
+          return json;
+        }
         if (resp.status === 403 && json.error) {
           _clearSessionOPFS();
           await _performHandshake();
@@ -1445,6 +1452,26 @@ function _dokkebiScheduleVersionProbeForPath(path) {
   }
   try { window.__DOKKEBI_SET_TENANT__ = _proxySetTenant; } catch {}
 
+  // ── 내부: 테이블 존재 확인 (sqlite_master 직접 접근 대체) ────────
+  //   클라이언트 SQL 은 sqlite_master 를 참조할 수 없으므로, 이 내부 명령을 사용한다.
+  async function _proxyTableExists(tableName) {
+    return _dbRequest(async function() {
+      try {
+        const payload = { _tableExists: String(tableName == null ? '' : tableName) };
+        const body = await _encryptPayload(payload);
+        const resp = await _fetch('/api/_dokkebi/db', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+          body,
+        });
+        const json = await resp.json();
+        return json._enc ? await _decryptResponse(json) : json;
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
+    });
+  }
+
   // ── C-1: 워커측 로그인 ──────────────────────────────────────
   //   비밀번호 검증과 JWT 서명은 전적으로 워커에서 수행된다(클라이언트는 시크릿 미보유).
   //     const { ok, value } = await window.__DOKKEBI_LOGIN__({ identifier, password })
@@ -1461,7 +1488,15 @@ function _dokkebiScheduleVersionProbeForPath(path) {
           body,
         });
         const json = await resp.json();
-        return json._enc ? await _decryptResponse(json) : json;
+        const decoded = json._enc ? await _decryptResponse(json) : json;
+        // 발급 토큰을 자동 보관 — 이후 모든 db 요청의 _jwt 로 사용되어
+        // JWT 기반 테넌트/인가(requireJwtTenant)가 즉시 동작한다.
+        try {
+          if (decoded && decoded.ok === true && decoded.value && typeof decoded.value.token === 'string' && decoded.value.token) {
+            _autoDbJwt = decoded.value.token;
+          }
+        } catch (e) { /* ignore */ }
+        return decoded;
       } catch (e) {
         return { ok: false, error: e.message };
       }
@@ -1740,7 +1775,8 @@ function _dokkebiScheduleVersionProbeForPath(path) {
         var _POLICY_CODES = ['TENANT_MISSING', 'TENANT_MISMATCH', 'NO_TENANT_FILTER', 'NO_WHERE',
           'LOOSE_OR', 'INSERT_MISSING_TENANT_COL', 'INSERT_NO_COLUMNS', 'INJECT_FAILED',
           'INJECT_INCOMPLETE', 'AUTH_REQUIRED', 'ROLE_MISSING', 'ROLE_FORBIDDEN',
-          'RULE_DENY', 'NO_RULE', 'sql_blocked', 'UNSUPPORTED_OP', 'UNSUPPORTED_INSERT_SUBQUERY'];
+          'RULE_DENY', 'NO_RULE', 'sql_blocked', 'UNSUPPORTED_OP', 'UNSUPPORTED_INSERT_SUBQUERY',
+          'SQL_BLOCKED', 'TENANT_SERVER_BOUND', 'TENANT_CLIENT_OVERRIDE', 'TENANT_RESERVED_KEY'];
         if (_POLICY_CODES.indexOf(errCode) >= 0) {
           console.warn('[dokkebi] 🚫 정책/권한 거부 (' + errCode + ') — 세션 유지:', errMsg);
           _sendLog('error', 'wasm', ['DB 정책 위반 ' + errCode, errMsg, json.table ? 'table=' + json.table : '']).catch(function() {});
@@ -2491,12 +2527,21 @@ function _dokkebiScheduleVersionProbeForPath(path) {
       _vm.setProp(_vm.global, '__dokkebi_host__', hostModule);
 
       // Step 3a-env: 민감 환경변수 Opaque Handle 호스트 함수 등록
-      // WASM 번들 내 __dokkebi_env__("KEY") 호출 시 Host 클로저의 실제 값을 반환
-      // 실제 시크릿 값은 WASM 메모리에 평문으로 존재하지 않고 Host JS 스코프에만 존재
+      // WASM 번들 내 __dokkebi_env__("KEY") 호출 시 Host 클로저의 값을 반환
+      // ⚠ 서버 전용 Secret 은 클라이언트로 전달되지 않는다(handshake 는 BC 키만).
+      //   누락된 secret-like 키는 조용히 '' 로 넘기지 않고 호스트 콘솔에 경고한다.
+      var _envMissingWarned = {};
       _vm.setProp(_vm.global, '__dokkebi_env__', _vm.newFunction('__dokkebi_env__', (keyH) => {
         const key = _vm.getString(keyH);
         const val = _envSecretMap[key];
-        return _vm.newString(val !== undefined ? val : '');
+        if (val === undefined || val === null || val === '') {
+          if (/(SECRET|KEY|TOKEN|PASSWORD|PRIVATE|CREDENTIAL)/i.test(key) && !_envMissingWarned[key]) {
+            _envMissingWarned[key] = true;
+            console.error('[dokkebi] ⚠ process.env.' + key + ' 는 브라우저로 전달되지 않습니다. Worker API(worker/api/…)로 옮기세요.');
+          }
+          return _vm.newString('');
+        }
+        return _vm.newString(String(val));
       }));
 
       // Step 3a-timer: setTimeout/clearTimeout 호스트 딜레이 함수

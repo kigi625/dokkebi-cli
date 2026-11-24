@@ -13,19 +13,66 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import { detectOuterOp, outerStatement, detectPrimaryTableOf } from './sqlShape.js';
 
-// dokkebi 내부 시스템 테이블 — 항상 허용
-const SYSTEM_TABLES = [
-    '_dokkebi_errors',
-    '_dokkebi_requests',
-    '_dokkebi_security',
+// ─────────────────────────────────────────────────────────────
+// 내부 시스템 테이블 접근 차단
+//
+//   `_dokkebi_sessions` 에는 전 세션의 enc_key/sig_key 가, `_dokkebi_ephemeral_keys`
+//   에는 핸드셰이크 개인키 JWK 가 들어 있다. 따라서 클라이언트(브라우저 WASM)
+//   SQL 이 이 테이블을 읽을 수 있으면 세션 하이재킹·감사로그 삭제가 가능하다.
+//   내부 코드(worker 의 `_internalDb`, dok serve)만 직접 prepare 로 접근하며,
+//   프록시를 통과하는 클라이언트 SQL 은 allowlist 유무와 무관하게 항상 차단한다.
+//   (로그/감사 테이블도 포함 — 변조·삭제 방지)
+// ─────────────────────────────────────────────────────────────
+const INTERNAL_TABLE_PREFIX = '_dokkebi_';
+
+export function isInternalTableName(name) {
+    const n = String(name || '').toLowerCase();
+    return n.startsWith(INTERNAL_TABLE_PREFIX) || n === 'sqlite_master' || n.startsWith('sqlite_');
+}
+
+/**
+ * 클라이언트 SQL 이 내부 테이블(_dokkebi_*, sqlite_*)을 참조하는지 검사.
+ * @param {string} sql
+ * @returns {string|null} 참조된 내부 테이블명 (없으면 null)
+ */
+export function findInternalTableRef(sql) {
+    if (typeof sql !== 'string' || sql.length === 0) return null;
+    const normalized = stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
+    for (const t of extractAllTables(normalized)) {
+        if (isInternalTableName(t)) return t;
+    }
+    // CREATE TABLE 대상은 FROM/JOIN 패턴에 걸리지 않으므로 별도 검사.
+    const m = /\bCREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["'`]?([A-Za-z_][\w]*)["'`]?/i.exec(normalized);
+    if (m && isInternalTableName(m[1])) return m[1];
+    // 인용/스키마 표기("main"."_dokkebi_x" 등) 우회 방어 — 예약 접두사 토큰 자체를 검사.
+    const token = /(?:^|[^A-Za-z0-9_])(?:"|`|'|\[)?((?:_dokkebi_|sqlite_)[A-Za-z0-9_]*)/i.exec(normalized);
+    if (token) return token[1];
+    return null;
+}
+
+/** 세션 키스토어 — 사용자 SQL(UNION/JOIN/CREATE AS 포함)에서 하드 거부 */
+export const KEYSTORE_TABLES = Object.freeze([
     '_dokkebi_sessions',
     '_dokkebi_ephemeral_keys',
     '_dokkebi_nonces',
-    'sqlite_master',
-];
+]);
 
-const SYSTEM_OPS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE'];
+/**
+ * 정규화된 SQL 이 키스토어 테이블을 참조하는지 검사.
+ * 문자열 리터럴은 호출 전에 strip 되어 있어야 한다.
+ * @param {string} normalized
+ * @returns {string|null} 매칭된 테이블명
+ */
+export function findKeystoreTableRef(normalized) {
+    const compact = String(normalized || '').replace(/["'`[\]]/g, '');
+    for (const name of KEYSTORE_TABLES) {
+        const re = new RegExp(`(^|[^A-Za-z0-9])${name}([^A-Za-z0-9]|$)`, 'i');
+        if (re.test(compact)) return name;
+    }
+    return null;
+}
 
 /**
  * 빌드 타임: 백엔드 소스에서 SQL 허용목록 자동 추출
@@ -66,11 +113,6 @@ export async function extractAllowlist(sourceRoot, opts = {}) {
         name,
         ops: tableOps[name] || ['SELECT'],
     }));
-
-    // 시스템 테이블 추가
-    for (const sysTable of SYSTEM_TABLES) {
-        tables.push({ name: sysTable, ops: [...SYSTEM_OPS] });
-    }
 
     const policy = opts.policy;
     // policy 가 명시되고 enabled === true 면 v2 스키마로 출력.
@@ -525,14 +567,8 @@ function extractAllTables(normalized) {
  * 기본 연산 판별 (첫 키워드)
  */
 function detectPrimaryOp(normalizedUpper) {
-    const head = normalizedUpper.trimStart();
-    if (head.startsWith('SELECT'))   return 'SELECT';
-    if (head.startsWith('INSERT'))   return 'INSERT';
-    if (head.startsWith('UPDATE'))   return 'UPDATE';
-    if (head.startsWith('DELETE'))   return 'DELETE';
-    if (head.startsWith('WITH'))     return 'SELECT';  // CTE는 최종적으로 SELECT/INSERT/UPDATE/DELETE 중 하나
-    if (head.startsWith('CREATE TABLE')) return 'CREATE';
-    return null;
+    // `WITH ... DELETE` 를 SELECT 로 오판하지 않도록 괄호 밖 문장 키워드를 사용한다.
+    return detectOuterOp(normalizedUpper).op;
 }
 
 /**
@@ -568,6 +604,19 @@ export function validateSqlAllowlist(sql, allowlist, opts = {}) {
         return { allowed: false, reason: `위험한 SQL 토큰 감지: ${danger}` };
     }
 
+    // 3-b) 내부 시스템 테이블(_dokkebi_* · sqlite_*) 참조 차단 (항상 수행, fail-closed)
+    //      allowlist 가 없거나 strict=false 인 모드에서도 반드시 막아야 한다.
+    //      (기존 keyStore 전용 차단보다 넓게 적용 — 로그/감사 테이블 변조 방지)
+    const internalRef = findInternalTableRef(sql);
+    if (internalRef) {
+        return { allowed: false, reason: `내부 시스템 테이블에는 접근할 수 없습니다: "${internalRef}"` };
+    }
+
+    // 3-c) 클라이언트 DDL 차단 — 스키마 변경은 빌드·마이그레이션 경로에서만 수행한다.
+    if (/^(?:CREATE|ALTER|DROP|TRUNCATE|REINDEX|VACUUM)\b/.test(upper)) {
+        return { allowed: false, reason: 'DDL(CREATE/ALTER/DROP)은 클라이언트 SQL 에서 허용되지 않습니다.' };
+    }
+
     // allowlist 부재 시:
     //   strict=true → 모든 쿼리 거부 (fail-closed)
     //   strict=false → 위 공통 검증만 통과하면 허용 (하위 호환)
@@ -584,37 +633,11 @@ export function validateSqlAllowlist(sql, allowlist, opts = {}) {
         return { allowed: false, reason: `허용되지 않은 SQL 연산: ${normalized.slice(0, 30)}` };
     }
 
-    // 허용 테이블 맵 (CREATE 참조 검증 + 일반 검증 모두에서 사용)
+    // 허용 테이블 맵 (일반 검증에서 사용)
     const allowedMap = new Map();
     for (const t of allowlist.tables) allowedMap.set(t.name.toLowerCase(), t);
 
-    // 5) CREATE TABLE은 시스템 테이블(_dokkebi_*)만 허용
-    if (op === 'CREATE') {
-        // CREATE TABLE [IF NOT EXISTS] [schema.]name 형태의 테이블명 추출
-        // extractAllTables 는 FROM/JOIN/INTO/UPDATE 만 보므로 CREATE는 별도 추출 필요
-        const ident = `["'` + '`' + `]?([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?)["'` + '`' + `]?`;
-        const createRe = new RegExp(`\\bCREATE\\s+(?:TEMP(?:ORARY)?\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${ident}`, 'i');
-        const m = normalized.match(createRe);
-        if (!m) {
-            return { allowed: false, reason: 'CREATE TABLE 구문에서 테이블명을 추출할 수 없습니다.' };
-        }
-        const rawName = m[1];
-        const baseName = rawName.split('.').pop().toLowerCase();
-        if (!baseName.startsWith('_dokkebi_')) {
-            return { allowed: false, reason: `CREATE TABLE은 _dokkebi_* 시스템 테이블만 허용됩니다. (요청: ${rawName})` };
-        }
-        // 추가로 CREATE 바디 안에서 FROM/JOIN 등으로 다른 테이블 참조가 있는지 (CREATE TABLE ... AS SELECT ...)
-        const referenced = extractAllTables(upper).map(t => t.toLowerCase());
-        for (const t of referenced) {
-            if (t === baseName) continue;
-            if (!allowedMap.get(t)) {
-                return { allowed: false, reason: `CREATE TABLE 중 허용되지 않은 참조 테이블: "${t}"` };
-            }
-        }
-        return { allowed: true };
-    }
-
-    // 6) 모든 테이블 참조 추출 → 전부 allowlist에 있어야 함
+    // 5) 모든 테이블 참조 추출 → 전부 allowlist에 있어야 함
     const allTables = extractAllTables(upper).map(t => t.toLowerCase());
     // CTE 전용 쿼리(WITH ... SELECT * FROM cte)의 경우 외부 테이블 참조가 0개일 수 있음
     // → upper가 WITH로 시작하면 0개도 허용 (CTE 이름만 참조)
@@ -622,28 +645,34 @@ export function validateSqlAllowlist(sql, allowlist, opts = {}) {
         return { allowed: false, reason: 'SQL에서 테이블명을 추출할 수 없습니다.' };
     }
 
+    // 주 연산 대상(첫 FROM/INTO/UPDATE) 과 CTE 이름은 아래 루프에서 함께 사용한다.
+    const cteNames = extractCteNames(upper);
+    const primaryTable = detectPrimaryTable(upper, op);
+    const primaryLower = primaryTable ? primaryTable.toLowerCase() : '';
+
     for (const t of allTables) {
         const entry = allowedMap.get(t);
         if (!entry) {
             return {
                 allowed: false,
-                reason: `허용되지 않은 테이블: "${t}" (등록된 테이블: ${[...allowedMap.keys()].filter(n => !n.startsWith('_dokkebi_') && n !== 'sqlite_master').join(', ')})`,
+                reason: `허용되지 않은 테이블: "${t}" (등록된 테이블: ${[...allowedMap.keys()].join(', ')})`,
             };
         }
-        // 주 연산(op) 확인은 기본 대상 테이블에 한해 수행하는 것이 일반적이지만,
-        // 여기서는 "참조된 모든 테이블에 대해 최소 SELECT 이상" 으로 검증 → UNION/JOIN이 INSERT-only 테이블을 노출하지 못하도록
-        if (op === 'SELECT' && !entry.ops.includes('SELECT')) {
+        // 읽기 참조 검증:
+        //   - SELECT 문의 모든 테이블은 SELECT 권한 필요
+        //   - INSERT/UPDATE/DELETE 에서 주 연산 대상이 아닌 테이블은 JOIN/서브쿼리/
+        //     INSERT ... SELECT 의 원본이므로 SELECT 권한 필요
+        //     (예: INSERT INTO posts SELECT ... FROM users → users 는 SELECT)
+        const isPrimary = !!primaryLower && t === primaryLower;
+        if ((op === 'SELECT' || !isPrimary) && !entry.ops.includes('SELECT')) {
             return { allowed: false, reason: `테이블 "${t}"에 대한 SELECT가 허용되지 않습니다.` };
         }
     }
 
-    // 7) 주 연산이 대상 테이블에 허용되는지 확인 (INSERT/UPDATE/DELETE)
-    // 기본 대상은 INSERT/UPDATE의 경우 첫 테이블, DELETE의 경우 FROM 다음 첫 테이블
+    // 6) 주 연산이 대상 테이블에 허용되는지 확인 (INSERT/UPDATE/DELETE)
     // CTE 이름은 실제 테이블이 아니므로 primary 검증에서 스킵
-    const cteNames = extractCteNames(upper);
-    const primaryTable = detectPrimaryTable(upper, op);
-    if (primaryTable && !cteNames.has(primaryTable.toLowerCase())) {
-        const entry = allowedMap.get(primaryTable.toLowerCase());
+    if (primaryTable && !cteNames.has(primaryLower)) {
+        const entry = allowedMap.get(primaryLower);
         if (!entry || !entry.ops.includes(op)) {
             return {
                 allowed: false,
@@ -659,19 +688,8 @@ export function validateSqlAllowlist(sql, allowlist, opts = {}) {
  * 주 연산의 대상 테이블 추출
  */
 function detectPrimaryTable(normalizedUpper, op) {
-    const ident = `["'` + '`' + `]?([A-Z_][\\w]*(?:\\.[A-Z_][\\w]*)?)["'` + '`' + `]?`;
-    const patterns = {
-        SELECT: new RegExp(`\\bFROM\\s+${ident}`),
-        INSERT: new RegExp(`\\bINTO\\s+${ident}`),
-        UPDATE: new RegExp(`\\bUPDATE\\s+${ident}`),
-        DELETE: new RegExp(`\\bFROM\\s+${ident}`),
-    };
-    const p = patterns[op];
-    if (!p) return null;
-    const m = normalizedUpper.match(p);
-    if (!m) return null;
-    const parts = m[1].split('.');
-    return parts[parts.length - 1];
+    // CTE 본문이 아니라 바깥 문장에서 대상을 찾는다.
+    return detectPrimaryTableOf(outerStatement(normalizedUpper), op);
 }
 
 /**

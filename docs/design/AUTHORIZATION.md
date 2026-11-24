@@ -90,8 +90,14 @@ POST /api/_dokkebi/db
 
 Notes:
 - **Authorization runs after Tenant Policy** → op/table judged on final SQL after Tenant Policy injection
-- One request = one SQL statement; top-level op/table is sufficient (stacked queries blocked at step 1)
-- JWT verification skipped only when no rule matches (cost savings)
+- **Every table referenced by the SQL is checked** . The primary target (first `FROM`/`INTO`/`UPDATE`) uses the statement's op; other references — `JOIN`, subqueries, `INSERT ... SELECT` sources — are evaluated as `SELECT`. A single denied table rejects the whole statement.
+  - Example: with `SELECT:posts` = public and `SELECT:users` = admin, `SELECT * FROM posts JOIN users ...` is denied for non-admins.
+  - In `mode: 'strict'`, every referenced table needs a matching rule (`NO_RULE` otherwise).
+- One request = one SQL statement; stacked queries are blocked at step 1
+- JWT verification skipped only when no matched rule requires it (cost savings)
+- **Server mode (`dok serve`) enforces the same rules.** `queryRegistry.strict` is serverless-only
+  (the built registry is not shipped with the static assets), so server mode relies on
+  allowlist + Tenant/Authorization.
 
 ## 3. Rule syntax
 
@@ -125,9 +131,14 @@ Value specs:
 ## 4. JWT requirements
 
 - **Algorithm**: HS256 only
-- **Required claims**: `exp` (recommended). `role` (or field specified in `claim`)
+- **Required claims**: `exp` (mandatory — tokens without `exp` are rejected). `role` (or field specified in `claim`)
 - **Optional claims**: `nbf`, `iss`, `aud`
-- **secret**: `DOKKEBI_JWT_SECRET` Pages env var (32+ random bytes recommended)
+- **secret**: one secret only (32+ random bytes recommended). Resolution order:
+  1. `authorization.jwtSecretEnv` when set explicitly (that binding only)
+  2. `JWT_SECRET`
+  3. `DOKKEBI_JWT_SECRET`
+  Multiple secrets are **not** accepted simultaneously — a stale/weak legacy secret cannot keep valid tokens alive.
+- **tenant claim precedence**: the configured `claim` is preferred; `userId` / `user_id` are only fallbacks.
 
 > **⚠ Security (C-1): never sign JWTs in the browser.** `DOKKEBI_JWT_SECRET` is a symmetric HS256 key — it is a **Worker-only secret** and is no longer shipped to the client via handshake. Backend code running in the browser-WASM cannot read it (`__dokkebi_env__("JWT_SECRET")` returns empty). Issue tokens from a trusted server path only. Two options:
 >

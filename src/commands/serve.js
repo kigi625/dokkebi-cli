@@ -32,8 +32,22 @@ import { frameSrcDirective, CSP_SCRIPT_SRC_LEMON_SQUEEZY } from '../core/cspFram
 import https from 'https';
 import fs from 'fs/promises';
 import { handleAdminRoute, logSecurityEvent, logRequest, logError } from '../core/adminPanel.js';
-import { loadDokkebiConfigMerged } from '../core/dokkebiConfigLoad.js';
+import { tryDokkebiGifEncode } from '../core/gifEncode.js';
+import { resolveClientIp, trustProxyFromEnv } from '../core/clientIp.js';
+import { loadDokkebiConfigMerged, applySecurityPreset } from '../core/dokkebiConfigLoad.js';
 import { loadAllowlist, validateSqlAllowlist } from '../core/sqlAllowlist.js';
+import {
+    normalizePolicyConfig,
+    verifyTenantPolicy,
+    injectTenantPolicy,
+} from '../core/policyEngine.js';
+import {
+    normalizeAuthorizationConfig,
+    resolveJwtSecret,
+    jwtIdentityFromPayload,
+    verifyJwtHs256,
+    evaluateSqlAuthorization,
+} from '../core/authorizationPolicy.js';
 import {
     createECDH,
     createHmac,
@@ -42,6 +56,7 @@ import {
     timingSafeEqual,
     hkdfSync,
     randomBytes,
+    randomUUID,
 } from 'crypto';
 import { runBuild } from './build.js';
 import { loadWireRuntimeForLocalProxy, denormalizePayload, verifyAndStripPow } from '../core/payloadWireRuntime.js';
@@ -49,12 +64,30 @@ import { buildBundleBootPayload, injectBundleBootScript } from '../core/bundleBo
 import { t } from '../i18n/index.js';
 
 // ─────────────────────────────────────────────────────────────
-// 서버 시작 시 ECDH P-256 키쌍 생성 (세션마다 새로 생성 = Ephemeral)
+// ECDH P-256 — 핸드셰이크마다 새 키쌍 (Forward Secrecy)
+//   서버 시작 시 키 1개를 재사용하면 세션 간 forward secrecy 가 깨진다.
+//   GET 에서 keyId 를 발급하고 POST 에서 1회 소비한다 (60초 TTL).
 // ─────────────────────────────────────────────────────────────
-const serverEcdh = createECDH('prime256v1');
-serverEcdh.generateKeys();
-// 브라우저 WebCrypto에서 importKey('raw') 가능한 비압축 포인트 형식
-const SERVER_PUB_KEY_B64 = serverEcdh.getPublicKey('base64');
+const EPHEMERAL_KEY_TTL_MS = 60_000;
+const ephemeralServerKeys = new Map(); // keyId → { ecdh, createdAt }
+
+function _pruneEphemeralKeys(now = Date.now()) {
+    for (const [id, v] of ephemeralServerKeys) {
+        if (now - v.createdAt > EPHEMERAL_KEY_TTL_MS) ephemeralServerKeys.delete(id);
+    }
+}
+
+function _createEphemeralServerKey() {
+    _pruneEphemeralKeys();
+    const ecdh = createECDH('prime256v1');
+    ecdh.generateKeys();
+    const keyId = randomUUID();
+    ephemeralServerKeys.set(keyId, { ecdh, createdAt: Date.now() });
+    // 브라우저 WebCrypto에서 importKey('raw') 가능한 비압축 포인트 형식
+    return { keyId, serverPubKey: ecdh.getPublicKey('base64') };
+}
+
+const TRUST_PROXY = trustProxyFromEnv(process.env);
 
 // sessionId → { encKey: Buffer, sigKey: Buffer, createdAt: number }
 const sessionStore = new Map();
@@ -89,9 +122,9 @@ const BODY_LIMITS = {
 const rateLimitMap = new Map(); // `${ip}:${endpoint}` → { count, windowStart }
 
 function getClientIp(req) {
-    return req.headers['x-forwarded-for']?.split(',')[0]?.trim()
-        || req.socket?.remoteAddress
-        || 'unknown';
+    // 기본은 소켓 피어만 신뢰 — X-Forwarded-For 위조로 레이트리밋/IP allowlist 를
+    // 우회하지 못하도록 한다. 리버스 프록시 뒤라면 DOKKEBI_TRUST_PROXY=1.
+    return resolveClientIp(req, { trustProxy: TRUST_PROXY });
 }
 
 function checkRateLimit(ip, endpoint) {
@@ -251,6 +284,42 @@ export async function runServe(src, options = {}) {
     const projectName   = dokConfig?.name || path.basename(sourceRoot);
     const proxyMode     = dokConfig?.proxyMode || 'server';
 
+    // ── 보안 정책 (Tenant / Authorization) — server 모드도 동일 규칙 적용 ──
+    const secConfig = applySecurityPreset(dokConfig || {}, { quiet: true });
+    const securityCtx = {
+        policy: normalizePolicyConfig(secConfig?.policy, {
+            authorizationEnabled: secConfig?.authorization?.enabled === true
+                && String(secConfig?.authorization?.mode || '').toLowerCase() !== 'off',
+            authLoginEnabled: secConfig?.auth?.login?.enabled === true,
+        }),
+        authz: normalizeAuthorizationConfig(secConfig?.authorization),
+        jwtSecret: '',
+    };
+    securityCtx.jwtSecret = resolveJwtSecret(
+        { ...process.env, ...envVars },
+        securityCtx.authz,
+    ).secret;
+    if (securityCtx.policy?.enabled) {
+        console.log('[dokkebi] 🔐 Tenant Policy 활성 (server 모드)'
+            + (securityCtx.policy.requireJwtTenant ? ' — JWT 전용 테넌트' : ' — 세션 테넌트 허용'));
+    }
+    if (securityCtx.authz?.enabled) {
+        console.log('[dokkebi] 🔐 Authorization Policy 활성 (server 모드, mode='
+            + securityCtx.authz.mode + ')');
+        if (!securityCtx.jwtSecret) {
+            console.warn('[dokkebi] ⚠ DOKKEBI_JWT_SECRET 미설정 — Authorization/테넌트 JWT 검증이 항상 실패합니다.');
+        }
+        if (securityCtx.authz.mode === 'strict' && (securityCtx.authz.rules || []).length === 0) {
+            console.warn('[dokkebi] ⚠ server 모드: authorization.mode=strict 이지만 명시 규칙이 없습니다.'
+                + '\n[dokkebi]   자동 추론 규칙은 빌드 산출물(worker)에만 반영되므로, 모든 DB 쿼리가 NO_RULE 로 차단됩니다.'
+                + '\n[dokkebi]   dokkebi.config.js 에 명시 규칙을 추가하거나 serverless 모드를 사용하세요.');
+        }
+    }
+    if (secConfig?.queryRegistry?.strict === true) {
+        console.warn('[dokkebi] ⚠ queryRegistry.strict 는 serverless 전용입니다 — server 모드에서는'
+            + ' allowlist + Tenant/Authorization 으로만 방어합니다. (등록 쿼리 강제 불가)');
+    }
+
     // env-secrets.json 로드 (빌드 타임에 분리된 민감 환경변수)
     let envSecrets = {};
     try {
@@ -315,12 +384,18 @@ export async function runServe(src, options = {}) {
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Dokkebi-Session, Authorization');
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+        // ── Local GIF encode (ffmpeg) — sticker editor ────────
+        if (urlPath === '/_dokkebi/gif' || urlPath === '/api/_dokkebi/gif') {
+            await tryDokkebiGifEncode(req, res, { trustProxy: TRUST_PROXY });
+            return;
+        }
+
         // ── 어드민 패널 (serve: /_dokkebi/_panel, serverless 호환: /api/_dokkebi/_panel) ──
         if (urlPath.startsWith('/_dokkebi/_panel') || urlPath.startsWith('/api/_dokkebi/_panel')) {
             await handleAdminRoute(req, res, {
                 adminPassword, adminAllowedIps, panelIpGuardEnabled, dbType, dbConfig, proxyDbQuery,
                 activeConnections: activeSockets.size,
-                projectName, mode: 'serve',
+                projectName, mode: 'serve', trustProxy: TRUST_PROXY,
             });
             return;
         }
@@ -334,9 +409,10 @@ export async function runServe(src, options = {}) {
                 console.warn(`${ts()} ${C.yellow}[Rate Limit]${C.reset} 핸드셰이크 초과 (ip: ${ip})`);
                 return;
             }
+            const _eph = _createEphemeralServerKey();
             res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-            res.end(JSON.stringify({ serverPubKey: SERVER_PUB_KEY_B64 }));
-            console.log(`${ts()} ${C.cyan}[핸드셰이크]${C.reset} 서버 공개키 발급`);
+            res.end(JSON.stringify({ serverPubKey: _eph.serverPubKey, keyId: _eph.keyId }));
+            console.log(`${ts()} ${C.cyan}[핸드셰이크]${C.reset} 서버 공개키 발급 (ephemeral)`);
             return;
         }
 
@@ -372,7 +448,7 @@ export async function runServe(src, options = {}) {
             }
             return handleDbProxy(req, res, dbType, dbConfig,
                 (ev) => logSecurityEvent(proxyDbQuery, dbType, dbConfig, ev),
-                sqlAllowlist, distRoot, proxyMode);
+                sqlAllowlist, distRoot, proxyMode, securityCtx);
         }
 
         // ── 3. POST /api/_dokkebi/log — 로그 수집 ─────────────
@@ -521,18 +597,26 @@ async function handleHandshake(req, res, _envSecrets = {}) {
     try { body = await readJson(req, { maxBytes: BODY_LIMITS.handshake }); }
     catch (e) { handleReadJsonError(res, e); return; }
 
-    const { clientPubKey } = body;
+    const { clientPubKey, keyId } = body;
     if (!clientPubKey) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'clientPubKey 필드가 없습니다' }));
         return;
     }
+    const _ephEntry = keyId ? ephemeralServerKeys.get(String(keyId)) : null;
+    if (!_ephEntry || Date.now() - _ephEntry.createdAt > EPHEMERAL_KEY_TTL_MS) {
+        if (keyId) ephemeralServerKeys.delete(String(keyId));
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: '키 교환 정보가 만료되었습니다. 페이지를 새로고침하세요.' }));
+        return;
+    }
+    ephemeralServerKeys.delete(String(keyId));
 
     try {
         const clientPubBuf = Buffer.from(clientPubKey, 'base64');
 
-        // ECDH 공유 비밀 계산
-        const sharedSecret = serverEcdh.computeSecret(clientPubBuf);
+        // ECDH 공유 비밀 계산 (이 핸드셰이크 전용 키)
+        const sharedSecret = _ephEntry.ecdh.computeSecret(clientPubBuf);
 
         // HKDF-SHA256으로 두 개의 독립 키 파생
         const encKey = Buffer.from(hkdfSync(
@@ -593,7 +677,7 @@ async function handleHandshake(req, res, _envSecrets = {}) {
 // DB 프록시 핸들러 (HMAC + nonce + timestamp 검증)
 // ─────────────────────────────────────────────────────────────
 
-async function handleDbProxy(req, res, dbType, dbConfig, _logSec, _allowlist, distRoot, proxyMode) {
+async function handleDbProxy(req, res, dbType, dbConfig, _logSec, _allowlist, distRoot, proxyMode, securityCtx = null) {
     const _sec = _logSec || (() => {});
     let raw;
     try { raw = await readJson(req, { maxBytes: BODY_LIMITS.db }); }
@@ -707,7 +791,131 @@ async function handleDbProxy(req, res, dbType, dbConfig, _logSec, _allowlist, di
     }
     body = vr.body;
 
-    const { sql, params = [] } = body;
+    // ── 4a0. JWT 해석 (Authorization 헤더 또는 암호화 payload `_jwt`) ──
+    //   server 모드에서도 Tenant/Authorization 이 동일한 JWT 규칙을 사용한다.
+    const _policy = securityCtx?.policy || null;
+    const _authz = securityCtx?.authz || null;
+    const _jwtSecret = securityCtx?.jwtSecret || '';
+    let _jwt = null;
+    {
+        const authHeader = String(req.headers.authorization || req.headers.Authorization || '');
+        const m = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
+        const token = (m && m[1].trim()) || (typeof body._jwt === 'string' ? body._jwt : '');
+        if (token && _jwtSecret) {
+            _jwt = await verifyJwtHs256(token, {
+                secret: _jwtSecret,
+                audience: _authz?.audience || null,
+                issuer: _authz?.issuer || null,
+                clockSkewSec: _authz?.clockSkewSec ?? 30,
+            });
+        }
+    }
+    const _jwtIdentity = (() => {
+        if (!_jwt || !_jwt.valid || !_jwt.payload) return null;
+        const claim = String(_policy?.claim || 'user_id');
+        return jwtIdentityFromPayload(_jwt.payload, claim);
+    })();
+
+    // ── 4a1. 세션 테넌트 설정 (_setTenant) ──────────────────
+    //   server 모드는 세션을 메모리에 보관한다. 값 자체는 클라이언트 주장이므로
+    //   JWT/서버 로그인으로 고정되지 않으면 인가 경계가 아니다(워커와 동일 규칙).
+    if (body && body._setTenant !== undefined) {
+        const setTenant = body._setTenant;
+        const claim = String(_policy?.claim || 'user_id');
+        if (setTenant === null) {
+            session.tenant = null;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(encryptResponse(session, { ok: true, value: { tenantUpdated: true } })));
+            return;
+        }
+        if (typeof setTenant !== 'object' || Array.isArray(setTenant)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, code: 'TENANT_INVALID', error: '테넌트 값은 객체여야 합니다.' }));
+            return;
+        }
+        for (const k of Object.keys(setTenant)) {
+            if (k.charCodeAt(0) === 95) {
+                _sec({ type: 'tenant_reject', ip: getClientIp(req), path: req.url, detail: 'reserved tenant key: ' + k });
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, code: 'TENANT_RESERVED_KEY', error: "예약 접두사('_')는 사용할 수 없습니다: " + k }));
+                return;
+            }
+        }
+        if (_policy?.requireJwtTenant === true) {
+            _sec({ type: 'tenant_reject', ip: getClientIp(req), path: req.url, detail: 'server-bound tenant' });
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, code: 'TENANT_SERVER_BOUND', error: '테넌트는 JWT 가 결정합니다. _setTenant 로 변경할 수 없습니다.' }));
+            return;
+        }
+        if (_jwtIdentity !== null) {
+            if (Object.prototype.hasOwnProperty.call(setTenant, claim) && String(setTenant[claim]) !== _jwtIdentity) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, code: 'TENANT_CLIENT_OVERRIDE', error: '테넌트 값이 인증된 사용자와 일치하지 않습니다.' }));
+                return;
+            }
+            setTenant[claim] = _jwtIdentity;
+        }
+        session.tenant = setTenant;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(encryptResponse(session, { ok: true, value: { tenantUpdated: true } })));
+        return;
+    }
+
+    // ── 4a2. server 모드에서 미지원인 워커 전용 명령 ──────────
+    //   혼동을 막기 위해 명시적 코드로 응답한다(조용히 SQL 오류로 떨어지지 않게).
+    if (body && body._login !== undefined) {
+        res.writeHead(501, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, code: 'LOGIN_UNSUPPORTED', error: 'worker 측 로그인은 serverless(Cloudflare Pages) 전용입니다.' }));
+        return;
+    }
+    if (body && body._capabilityUnlock !== undefined) {
+        res.writeHead(501, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, code: 'CAPABILITY_UNSUPPORTED', error: 'Signed Unlock Token 은 serverless 전용입니다.' }));
+        return;
+    }
+    if (body && body._attest !== undefined) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, code: 'ATTEST_DISABLED', error: 'Bundle Attestation 은 serverless 전용입니다.' }));
+        return;
+    }
+
+    // ── 4a. 내부 명령: 테이블 존재 확인 ──────────────────────
+    //   sqlite_master 는 클라이언트 SQL 에서 차단되므로 내부 명령으로만 제공한다.
+    if (body && body._tableExists !== undefined) {
+        const tableName = body._tableExists;
+        if (typeof tableName !== 'string' || !tableName || tableName.length > 128) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, code: 'TABLE_EXISTS_INVALID', error: '테이블 이름이 필요합니다.' }));
+            return;
+        }
+        let exists = false;
+        if (dbType === 'd1') {
+            try {
+                const r = await proxyDbQuery(dbType, dbConfig,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", [tableName]);
+                exists = (r?.rows?.length ?? 0) > 0;
+            } catch { exists = false; }
+        }
+        const encT = encryptResponse(session, { ok: true, value: { exists } });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(encT));
+        return;
+    }
+
+    // ── 4a3. SQL 결정 — queryId/_debugSql 폴백 ──────────────
+    //   브라우저 런타임은 queryId + _debugSql 로 보낸다(server 모드에는 registry 가
+    //   없으므로 _debugSql 을 사용). allowlist/정책 검증은 아래에서 동일하게 수행한다.
+    let params = Array.isArray(body.params) ? body.params : [];
+    let sql = typeof body.sql === 'string' ? body.sql : undefined;
+    if (!sql && typeof body._debugSql === 'string') sql = body._debugSql;
+    if (typeof body.queryId === 'string' && !sql) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            ok: false, code: 'QUERY_REGISTRY_UNSUPPORTED',
+            error: 'server 모드에서는 queryId 단독 쿼리를 지원하지 않습니다 (registry 는 serverless 전용).',
+        }));
+        return;
+    }
 
     // ── 4b. 세션 바인딩 명령 처리 (⚠ 보안 효과 없음) ────────
     // 주의: 이 명령은 클라이언트가 자가 선언하는 메타데이터일 뿐,
@@ -757,6 +965,64 @@ async function handleDbProxy(req, res, dbType, dbConfig, _logSec, _allowlist, di
             _sec({ type: 'sql_blocked', ip, path: req.url, detail: alCheck.reason + ' | ' + sql?.slice(0, 100) });
             res.writeHead(403, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: alCheck.reason }));
+            return;
+        }
+    }
+
+    // ── 5c. Tenant Policy (server 모드) ─────────────────────
+    //   worker 와 동일한 규칙: JWT 클레임이 있으면 항상 우선,
+    //   requireJwtTenant=true 면 세션 tenant 를 사용하지 않는다.
+    if (_policy && _policy.enabled && _policy.mode && _policy.mode !== 'off') {
+        const claim = String(_policy.claim || 'user_id');
+        let tenantCtx = session.tenant || null;
+        if (_jwt && _jwt.valid && _jwt.payload) {
+            const claims = { ..._jwt.payload };
+            for (const k of Object.keys(claims)) {
+                if (k.charCodeAt(0) === 95) delete claims[k];
+            }
+            if (_jwtIdentity !== null) claims[claim] = _jwtIdentity;
+            if (_policy.requireJwtTenant === true) {
+                tenantCtx = _jwtIdentity !== null ? claims : null;
+            } else if (_jwtIdentity !== null) {
+                tenantCtx = { ...(tenantCtx || {}), ...claims };
+            }
+        }
+        const strict = _policy.strict !== false;
+        if (String(_policy.mode).toLowerCase() === 'inject') {
+            const ir = injectTenantPolicy(sql, params, tenantCtx, _policy, { strict });
+            if (!ir.ok) {
+                _sec({ type: 'tenant_policy_violation', ip: getClientIp(req), path: req.url,
+                    detail: (ir.code || 'INJECT') + ': ' + (ir.reason || '') + ' | ' + String(sql).slice(0, 100) });
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: ir.reason, code: ir.code, table: ir.table }));
+                return;
+            }
+            if (ir.injected) {
+                sql = ir.sql;
+                params = ir.params;
+            }
+        } else {
+            const vr = verifyTenantPolicy(sql, params, tenantCtx, _policy, { strict });
+            if (!vr.ok) {
+                _sec({ type: 'tenant_policy_violation', ip: getClientIp(req), path: req.url,
+                    detail: (vr.code || 'VERIFY') + ': ' + (vr.reason || '') + ' | ' + String(sql).slice(0, 100) });
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: vr.reason, code: vr.code, table: vr.table }));
+                return;
+            }
+        }
+    }
+
+    // ── 5d. Authorization Policy (server 모드) ──────────────
+    //   참조된 모든 테이블을 검사한다 (JOIN / INSERT ... SELECT 포함).
+    if (_authz && _authz.enabled) {
+        const decision = evaluateSqlAuthorization(_authz, sql, _jwt);
+        if (!decision.ok) {
+            _sec({ type: 'authz_denied', ip: getClientIp(req), path: req.url,
+                detail: (decision.code || 'DENY') + ': ' + (decision.reason || '')
+                    + ' | op=' + (decision.op || '?') + ' table=' + (decision.table || '?') });
+            res.writeHead(decision.code === 'AUTH_REQUIRED' ? 401 : 403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: decision.reason, code: decision.code }));
             return;
         }
     }

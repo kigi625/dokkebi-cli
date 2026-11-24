@@ -23,10 +23,10 @@ import { runFrontendBuild } from '../core/runFrontendBuild.js';
 import { extractAllowlist } from '../core/sqlAllowlist.js';
 import { buildRegistry, writeRegistry } from '../core/queryRegistry.js';
 import { normalizePolicyConfig } from '../core/policyEngine.js';
-import { normalizeAuthorizationConfig } from '../core/authorizationPolicy.js';
+import { normalizeAuthorizationConfig, resolveJwtSecret } from '../core/authorizationPolicy.js';
 import { inferPolicyFromProject, mergeInferredIntoConfig } from '../core/policyInference.js';
 import { scanPolicyAnnotations, mergeAnnotationsIntoInferred } from '../core/policyAnnotations.js';
-import { workerDb, workerAdmin, workerAdminApi, workerHandshake, workerRootMiddleware } from '../core/projectGenerator.js';
+import { workerDb, workerAdmin, workerAdminApi, workerHandshake, workerCapability, workerLog, workerRootMiddleware } from '../core/projectGenerator.js';
 import { loadPlugins, generatePluginBootstrapCode } from '../core/pluginLoader.js';
 import { loadDokkebiConfigMerged, applySecurityPreset } from '../core/dokkebiConfigLoad.js';
 import { getHardeningFlags } from '../core/hardeningFlags.js';
@@ -765,23 +765,22 @@ export async function runBuild(src, options = {}) {
         const workerOnlyEnvUsages = Array.from(new Set(wasmResult.sensitiveEnvUsages || []));
         if (workerOnlyEnvUsages.length > 0) {
             const message = `[dokkebi] ⚠ Worker 전용 Secret을 백엔드 WASM에서 직접 읽고 있습니다: ${workerOnlyEnvUsages.join(', ')}\n`
-                + '[dokkebi]   이 값들은 클라이언트로 전달되지 않습니다. Worker-side operation/proxy로 옮겨 결과만 응답하세요.';
+                + '[dokkebi]   이 값들은 클라이언트로 전달되지 않으므로 런타임에는 빈 문자열("")이 됩니다.\n'
+                + '[dokkebi]   Worker-side operation/proxy(worker/api/…)로 옮겨 결과만 응답하세요.';
             const strict = String(dokkebiConfig?.security?.level || '').toLowerCase() === 'strict';
-            // strict 만 차단. dok deploy 는 말미 안내용 경고만 (배포 진행).
-            if (strict) {
+            // 의도적 예외: DOKKEBI_ALLOW_WASM_SECRETS=true 또는 security.allowWasmSecrets: true
+            const allowWasmSecrets =
+                String(process.env.DOKKEBI_ALLOW_WASM_SECRETS || '').toLowerCase() === 'true'
+                || dokkebiConfig?.security?.allowWasmSecrets === true;
+            const hardBlock = !allowWasmSecrets && (strict || options.forDeploy === true);
+            if (hardBlock) {
                 throw new Error(
                     message
-                    + '\n[dokkebi]   배포 차단: security.level: strict 에서는 Worker 전용 Secret 의 WASM 직접 사용을 허용하지 않습니다.',
+                    + '\n[dokkebi]   빌드/배포 차단: 브라우저로 내려가는 백엔드에서 Secret 을 직접 읽을 수 없습니다.'
+                    + '\n[dokkebi]   (예외 허용: DOKKEBI_ALLOW_WASM_SECRETS=true — 값이 사용자 브라우저에 노출될 수 있음)',
                 );
             }
-            if (options.forDeploy) {
-                console.warn(
-                    message
-                    + '\n[dokkebi]   배포는 계속됩니다. Worker-side(worker/api/…) 로 옮기는 것을 권장합니다.',
-                );
-            } else {
-                console.warn(message);
-            }
+            console.warn(message);
         }
         console.log(t('build.buildComplete', { mode: wasmResult.mode }));
 
@@ -1037,7 +1036,21 @@ export async function runBuild(src, options = {}) {
     //   dokkebi.config.js 의 policy 섹션이 있으면 v2 스키마로 자동 출력.
     //   문서: docs/design/TENANT_POLICY.md
     console.log('\n' + t('build.allowlistStep'));
-    const policyMeta = normalizePolicyConfig(effectiveConfig?.policy);
+    const policyMeta = normalizePolicyConfig(effectiveConfig?.policy, {
+        authorizationEnabled: !!effectiveConfig?.authorization?.enabled
+            && String(effectiveConfig?.authorization?.mode || '').toLowerCase() !== 'off',
+        authLoginEnabled: effectiveConfig?.auth?.login?.enabled === true,
+    });
+    if (policyMeta.enabled && policyMeta.requireJwtTenant === true
+        && effectiveConfig?.policy?.requireJwtTenant === undefined) {
+        console.log('[dokkebi] 🔐 policy.requireJwtTenant 자동 ON — 테넌트는 검증된 JWT 클레임에서만 취합니다'
+            + ' (세션 tenant_json 무시). 익명 해시-ID 테넌시를 쓰려면 requireJwtTenant: false 를 명시하세요.');
+    }
+    if (policyMeta.enabled && policyMeta.requireJwtTenant !== true) {
+        console.warn('[dokkebi] ⚠ policy.requireJwtTenant=false — 세션 tenant_json 은 클라이언트가'
+            + ' 변경할 수 있으므로, Tenant Policy 만으로는 악의적 클라이언트의 테넌트 위조를 막지 못합니다.'
+            + ' (권장: true — JWT/worker 로그인으로 테넌트를 고정)');
+    }
 
     // ── Phase B-4: 샤딩 ↔ 정책 정합성 검증 ─────────────────────────
     //   샤딩 모드일 때 strategy.key 와 policy.tables[*].sessionClaim 이
@@ -1061,6 +1074,23 @@ export async function runBuild(src, options = {}) {
 
     const authzMeta = normalizeAuthorizationConfig(effectiveConfig?.authorization);
     const authLoginMeta = normalizeAuthLoginConfig(effectiveConfig?.auth);
+    if (authzMeta?.enabled) {
+        const _jwtEnv = { ...envVars, ...process.env };
+        const _picked = resolveJwtSecret(_jwtEnv, authzMeta);
+        if (!_picked.secret) {
+            console.warn('[dokkebi] ⚠ Authorization 이 활성인데 JWT 시크릿이 없습니다'
+                + ' (JWT_SECRET 또는 DOKKEBI_JWT_SECRET). 모든 인증 요청이 실패합니다.');
+        } else if (_jwtEnv.JWT_SECRET && _jwtEnv.DOKKEBI_JWT_SECRET
+            && _jwtEnv.JWT_SECRET !== _jwtEnv.DOKKEBI_JWT_SECRET) {
+            console.warn('[dokkebi] ⚠ JWT_SECRET 과 DOKKEBI_JWT_SECRET 값이 다릅니다.'
+                + ' 서명 검증은 ' + _picked.source + ' 하나만 사용합니다 (다른 값으로 서명한 토큰은 거부).');
+        }
+        if (authzMeta.jwtSecretEnvExplicit && (_jwtEnv.JWT_SECRET || _jwtEnv.DOKKEBI_JWT_SECRET)
+            && !_jwtEnv[authzMeta.jwtSecretEnv]) {
+            console.warn('[dokkebi] ⚠ jwtSecretEnv(' + authzMeta.jwtSecretEnv + ')를 명시했지만 값이 없습니다.'
+                + ' JWT_SECRET/DOKKEBI_JWT_SECRET 로 대체하지 않고 검증이 실패합니다.');
+        }
+    }
     const replayMeta = normalizeReplayConfig(effectiveConfig?.security);
     const webauthnMeta = normalizeWebAuthnConfig(effectiveConfig?.security);
     const adlMeta = normalizeActiveDefenseConfig(effectiveConfig?.security);
@@ -1334,6 +1364,21 @@ export async function runBuild(src, options = {}) {
             await fs.writeFile(workerHsPath, workerHandshake(), 'utf-8');
             console.log('[dokkebi] handshake.ts 재생성 완료');
         } catch { /* handshake.ts 미존재 → 무시 */ }
+
+        // 로그 수집 엔드포인트도 빌드마다 최신 템플릿으로 재생성한다.
+        // (기존 프로젝트의 낡은 log.ts 에는 레이트리밋/본문 상한이 없을 수 있음)
+        const workerLogPath = path.join(sourceRoot, 'worker', 'api', '_dokkebi', 'log.ts');
+        try {
+            await fs.access(workerLogPath);
+            await fs.writeFile(workerLogPath, workerLog(), 'utf-8');
+        } catch { /* log.ts 미존재 → 무시 */ }
+
+        // 서버측 capability 검증 헬퍼 — 라우트에서 재검증할 때 import 한다.
+        const workerCapPath = path.join(sourceRoot, 'worker', 'api', '_dokkebi', 'capability.ts');
+        try {
+            await fs.mkdir(path.dirname(workerCapPath), { recursive: true });
+            await fs.writeFile(workerCapPath, workerCapability(), 'utf-8');
+        } catch { /* 생성 실패 → 무시 (기존 파일 유지) */ }
 
         const rootMwPath = path.join(sourceRoot, 'worker', '_middleware.ts');
         try {
@@ -1962,6 +2007,9 @@ async function findTsFiles(dir) {
         if (entry.isDirectory()) {
             results.push(...await findTsFiles(fullPath));
         } else if (entry.name.endsWith('.ts')) {
+            // 테스트/선언 파일은 Pages Functions 엔트리가 아니다.
+            // (예: worker/lib/foo.test.ts 가 node:assert 를 import 해 빌드 실패하는 것 방지)
+            if (/\.(test|spec)\.ts$/.test(entry.name) || entry.name.endsWith('.d.ts')) continue;
             results.push(fullPath);
         }
     }

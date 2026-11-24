@@ -81,6 +81,36 @@ export async function login(ctx, email, password) {
 
 Internal behavior: `ctx.setSessionTenant(obj)` sends `{_setTenant: obj}` to `POST /api/_dokkebi/db` → server runs `UPDATE _dokkebi_sessions SET tenant_json = ? WHERE session_id = ?`. `obj === null` clears on logout.
 
+> **⚠ Security boundary  — tenant_json is client-asserted**
+> `tenant_json` is written from a client payload, so it is **not** proof of identity. A malicious
+> client can send `_setTenant({ user_id: '<victim>' })` and read the victim's rows.
+> To make tenant isolation real, the tenant must come from a **server-verified** source:
+>
+> - `policy.requireJwtTenant: true` — the tenant claim is taken only from a verified JWT
+>   (`Authorization: Bearer` or encrypted `_jwt`). Session `tenant_json` is ignored.
+>   If no JWT supplies the claim → `TENANT_MISSING`.
+>   **Default:** auto-enabled when `authorization.enabled` or `auth.login.enabled` is on.
+> - Worker-side login (`auth.login`) — the proxy binds claims from the login query and
+>   rejects client `_setTenant` calls (`TENANT_SERVER_BOUND`).
+> - When a valid JWT is present, `_setTenant` cannot change the tenant claim to a different
+>   value (`TENANT_CLIENT_OVERRIDE`); the JWT value always wins.
+> - JWT identity extraction prefers the configured `policy.claim` and only falls back to
+>   `userId` / `user_id` (prevents `org_id` being filled with a user id).
+> - Client JWT wiring: `__DOKKEBI_LOGIN__()` stores the issued token and attaches it to every
+>   DB request automatically. For a token obtained elsewhere, set
+>   `window.__DOKKEBI_DB_JWT__ = () => token`.
+>
+> Anonymous hash-ID tenancy (no JWT) still works for UX-style scoping, but treat it as
+> **not an authorization boundary** — one client can always claim another client's hash.
+>
+> System tables (`_dokkebi_*`, `sqlite_*`) are never reachable from client SQL, regardless of
+> allowlist/registry settings.
+>
+> **Server mode (`dok serve`)** enforces the same tenant rules. The session tenant is kept in
+> server memory, and `_setTenant` follows the same JWT-binding / `requireJwtTenant` guards.
+> `auth.login` and Signed Unlock Tokens are serverless-only and return explicit
+> `LOGIN_UNSUPPORTED` / `CAPABILITY_UNSUPPORTED` codes.
+
 ### Per-table `sessionClaim` (v5.4+) — tenant isolation with hash IDs only, no JWT
 
 Tenant Policy is **independent of login / JWT**. Session `tenant_json` is free-form JSON, so **any value** used for user identification (hash token, device ID, anonymous cookie, etc.) can serve as the tenant.
@@ -118,9 +148,15 @@ await ctx.setSessionTenant({
 
 Engine claim resolution order (evaluated per table):
 
-1. `tables[X].sessionClaim` — session key explicitly set on the table (clearest)
-2. `policy.sessionClaim` — global default (backward compatible)
+1. `tables[X].sessionClaim` — session key explicitly set on the table. **Exclusive**: when set,
+   no other claim is used (prevents mapping a user id into an unrelated FK like `site_id`).
+2. `policy.sessionClaim` — global default (when the table has no `sessionClaim`)
 3. `tenantColumn` name as-is — conventional fallback (column name = session key)
+
+> `mode: 'optional'` is enforced **only when the claim resolves and the mapping is unambiguous**
+> (`sessionClaim` set, or `tenantColumn` equals the global claim name). Otherwise the table is
+> treated as public — e.g. `inquiries.site_id` + global `user_id` stays public until you add
+> `sessionClaim: 'site_id'` to that table.
 
 For example, `SELECT * FROM notos WHERE creator_token = ?` uses `notos.sessionClaim = 'creator_token'` and compares against the session's `creator_token` value. For convention cases where **column name and session key differ** (like `users.id`), only specify `sessionClaim: 'user_id'`. Everything else is auto-placed by `dok policy:scaffold` using the column name as the session key.
 
@@ -418,8 +454,10 @@ Algorithm:
 for each table T referenced by sql:
   policy = allowlist.policy(T)
   if policy.mode == 'none':         continue
-  if policy.mode == 'optional':     continue
-  if policy.mode == 'enforce':
+  if policy.mode == 'optional':
+    # enforce only when the claim resolves and the mapping is unambiguous
+    if !claimResolved || ambiguousMapping: continue
+  if policy.mode == 'enforce' || policy.mode == 'optional':
     tenantCol = policy.tenantColumn
     sessionClaim = tenant.claim              # e.g. 'user_id'
     expectedValue = tenantContext[sessionClaim]

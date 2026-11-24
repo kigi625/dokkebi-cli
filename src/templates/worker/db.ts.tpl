@@ -467,7 +467,8 @@ async function _runActiveDefenseAnalysis(db: D1Database, now: number) {
   try {
     const r = await db.prepare(
       `SELECT ip, COUNT(*) as cnt FROM "_dokkebi_security"
-         WHERE ts >= datetime('now','-10 minutes') AND ip <> '' AND type <> 'query_fallback'
+         WHERE ts >= datetime('now','-10 minutes') AND ip <> ''
+           AND type NOT IN ('query_fallback','adl_block','adl_detect','authz_denied')
          GROUP BY ip HAVING cnt >= 5 ORDER BY cnt DESC LIMIT 50`
     ).all<{ ip: string; cnt: number }>();
     const stmts: D1PreparedStatement[] = [];
@@ -712,18 +713,80 @@ function extractAllTables(normalized: string): string[] {
   return [...tables];
 }
 
+// ── 바깥 문장(DML) 판별 ─────────────────────────────────────
+//   `WITH x AS (SELECT 1) DELETE FROM posts` 를 SELECT 로 오판하지 않도록
+//   괄호 밖(depth 0)의 첫 DML 키워드를 찾는다.
+const _OUTER_DML = new Set(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE']);
+function _detectOuterOp(normalizedUpper: string): { op: string | null; index: number } {
+  const s = String(normalizedUpper || '');
+  const n = s.length;
+  let depth = 0;
+  let firstWord = true;
+  for (let i = 0; i < n; i++) {
+    const ch = s[i];
+    if (ch === '"' || ch === '`') {
+      const q = ch; i++;
+      while (i < n) { if (s[i] === q) { if (s[i + 1] === q) { i += 2; continue; } break; } i++; }
+      continue;
+    }
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') { if (depth > 0) depth--; continue; }
+    if (depth !== 0) continue;
+    if (!/[A-Z_]/.test(ch)) continue;
+    let j = i;
+    while (j < n && /[A-Z0-9_]/.test(s[j])) j++;
+    const word = s.slice(i, j);
+    const wordStart = i;
+    i = j - 1;
+    if (firstWord) {
+      firstWord = false;
+      if (word === 'WITH') continue;
+      if (_OUTER_DML.has(word)) return { op: word, index: wordStart };
+      if (word === 'REPLACE') return { op: 'INSERT', index: wordStart };
+      return { op: null, index: -1 };
+    }
+    if (_OUTER_DML.has(word)) return { op: word, index: wordStart };
+    if (word === 'REPLACE') return { op: 'INSERT', index: wordStart };
+  }
+  return { op: null, index: -1 };
+}
 function detectPrimaryOp(normalizedUpper: string): string | null {
-  const head = normalizedUpper.trimStart();
-  if (head.startsWith('SELECT'))   return 'SELECT';
-  if (head.startsWith('INSERT'))   return 'INSERT';
-  if (head.startsWith('UPDATE'))   return 'UPDATE';
-  if (head.startsWith('DELETE'))   return 'DELETE';
-  if (head.startsWith('WITH'))     return 'SELECT';
-  if (head.startsWith('CREATE TABLE')) return 'CREATE';
+  return _detectOuterOp(normalizedUpper).op;
+}
+function _outerStatement(normalizedUpper: string): string {
+  const { index } = _detectOuterOp(normalizedUpper);
+  return index < 0 ? String(normalizedUpper || '') : String(normalizedUpper).slice(index);
+}
+
+// ── 내부 시스템 테이블 접근 차단 ──────────────────────────────
+//   _dokkebi_sessions(전 세션 enc/sig 키), _dokkebi_ephemeral_keys(개인키 JWK),
+//   로그/감사 테이블, sqlite_* 스키마 메타까지 클라이언트 SQL 로는 절대 접근할 수 없다.
+//   프록시의 allowlist 유무와 무관하게 항상 차단한다.
+//   (src/core/sqlAllowlist.js 의 findInternalTableRef 와 동일 규칙)
+const INTERNAL_TABLE_PREFIX = '_dokkebi_';
+
+function isInternalTableName(name: string): boolean {
+  const n = String(name || '').toLowerCase();
+  return n.startsWith(INTERNAL_TABLE_PREFIX) || n === 'sqlite_master' || n.startsWith('sqlite_');
+}
+
+function findInternalTableRef(sql: string): string | null {
+  if (typeof sql !== 'string' || sql.length === 0) return null;
+  const normalized = stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
+  for (const t of extractAllTables(normalized)) {
+    if (isInternalTableName(t)) return t;
+  }
+  const m = /\bCREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["'`]?([A-Za-z_][\w]*)["'`]?/i.exec(normalized);
+  if (m && isInternalTableName(m[1])) return m[1];
+  // 인용/스키마 표기("main"."_dokkebi_x" 등) 우회 방어 — 예약 접두사 토큰 자체를 검사.
+  const token = /(?:^|[^A-Za-z0-9_])(?:"|`|'|\[)?((?:_dokkebi_|sqlite_)[A-Za-z0-9_]*)/i.exec(normalized);
+  if (token) return token[1];
   return null;
 }
 
 function detectPrimaryTable(normalizedUpper: string, op: string): string | null {
+  // CTE 본문이 아니라 바깥 문장에서 대상을 찾는다.
+  const outer = _outerStatement(normalizedUpper);
   const ident = '["\'`]?([A-Z_][\\w]*(?:\\.[A-Z_][\\w]*)?)["\'`]?';
   const patterns: Record<string, RegExp> = {
     SELECT: new RegExp('\\bFROM\\s+' + ident),
@@ -733,10 +796,24 @@ function detectPrimaryTable(normalizedUpper: string, op: string): string | null 
   };
   const p = patterns[op];
   if (!p) return null;
-  const m = normalizedUpper.match(p);
+  const m = outer.match(p);
   if (!m) return null;
   const parts = m[1].split('.');
   return parts[parts.length - 1];
+}
+
+function _isReadOnlySelectSql(s: string): boolean {
+  const raw = (s || '').replace(/^\uFEFF/, '').trimStart();
+  // 주석/문자열을 제거한 뒤 **실제 DML op** 로 판정한다.
+  //   `/*!read*/ DELETE ...` 처럼 힌트로 쓰기를 읽기로 위장할 수 없어야 한다.
+  const normalized = stripStringsAndComments(raw).replace(/\s+/g, ' ').trim().toUpperCase();
+  const op = detectPrimaryOp(normalized);
+  if (op === 'SELECT') {
+    // `/*!write*/` 는 replica 지연 회피를 위해 primary 로 보낸다.
+    return !/^\/\*!\s*write\s*\*\//i.test(raw);
+  }
+  // INSERT/UPDATE/DELETE/UNKNOWN → 쓰기(또는 안전하지 않은 분류)로 취급
+  return false;
 }
 
 function validateSql(sql: string): { ok: boolean; reason?: string } {
@@ -812,19 +889,30 @@ const _authzMeta: any = __DOKKEBI_PH_AUTHZ__;
 const _authLoginMeta: any = __DOKKEBI_PH_AUTH_LOGIN__;
 
 // JWT HMAC 키 캐시 (아이솔레이트 단위). 비밀값 변경 시 워커 재시작 필요.
-let _authzJwtKey: CryptoKey | null = null;
-let _authzJwtKeyPromise: Promise<CryptoKey> | null = null;
+// 시크릿별 검증 키 캐시 (회전/테스트에서 서로 다른 시크릿을 섞지 않도록)
+const _authzJwtKeys = new Map<string, CryptoKey>();
+// JWT 서명 검증에 사용할 **단일** 시크릿 (약한 레거시 시크릿 동시 수용 방지)
+function _az_resolveJwtSecret(env: Env): string {
+  const get = (k: string) => (k && typeof (env as any)[k] === 'string' && (env as any)[k]) ? (env as any)[k] : '';
+  const named = _authzMeta && _authzMeta.jwtSecretEnv;
+  const explicit = !!(_authzMeta && _authzMeta.jwtSecretEnvExplicit === true);
+  if (explicit) return get(named);
+  return get('JWT_SECRET') || get('DOKKEBI_JWT_SECRET')
+    || (named && named !== 'JWT_SECRET' && named !== 'DOKKEBI_JWT_SECRET' ? get(named) : '');
+}
+
 async function _az_getJwtKey(secret: string): Promise<CryptoKey> {
-  if (_authzJwtKey) return _authzJwtKey;
-  if (_authzJwtKeyPromise) return _authzJwtKeyPromise;
-  _authzJwtKeyPromise = crypto.subtle.importKey(
+  const cached = _authzJwtKeys.get(secret);
+  if (cached) return cached;
+  const key = await crypto.subtle.importKey(
     'raw',
     new TextEncoder().encode(secret),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['verify'],
-  ).then((k) => { _authzJwtKey = k; return k; });
-  return _authzJwtKeyPromise;
+  );
+  _authzJwtKeys.set(secret, key);
+  return key;
 }
 
 function _az_b64urlToBytes(s: string): Uint8Array {
@@ -849,20 +937,21 @@ async function _az_verifyJwtHs256(token: string, env: Env): Promise<{ valid: boo
   if (!header || header.alg !== 'HS256' || header.typ !== 'JWT') {
     return { valid: false, reason: '지원하지 않는 알고리즘 (HS256 만)' };
   }
-  const secret =
-    (typeof env.DOKKEBI_JWT_SECRET === 'string' && env.DOKKEBI_JWT_SECRET) ||
-    (typeof env.JWT_SECRET === 'string' && env.JWT_SECRET) ||
-    '';
+  const secret = _az_resolveJwtSecret(env);
   if (!secret) return { valid: false, reason: 'DOKKEBI_JWT_SECRET 또는 JWT_SECRET 미설정' };
-  const key = await _az_getJwtKey(secret);
   const sig = _az_b64urlToBytes(s64);
   const data = new TextEncoder().encode(`${h64}.${p64}`);
+  const key = await _az_getJwtKey(secret);
   const ok = await crypto.subtle.verify('HMAC', key, sig, data);
   if (!ok) return { valid: false, reason: '서명 불일치' };
 
   const now = Date.now();
   const skewMs = ((_authzMeta && _authzMeta.clockSkewSec) || 30) * 1000;
-  if (typeof payload.exp === 'number' && now > payload.exp * 1000 + skewMs) {
+  // exp 필수 — exp 없는 토큰은 영구 유효가 되므로 거부한다.
+  if (typeof payload.exp !== 'number') {
+    return { valid: false, reason: 'exp 클레임 없음' };
+  }
+  if (now > payload.exp * 1000 + skewMs) {
     return { valid: false, reason: '만료됨' };
   }
   if (typeof payload.nbf === 'number' && now + skewMs < payload.nbf * 1000) {
@@ -887,8 +976,8 @@ async function _az_verifyJwtHs256(token: string, env: Env): Promise<{ valid: boo
 let _authLoginSignKey: CryptoKey | null = null;
 let _authLoginSignKeyPromise: Promise<CryptoKey> | null = null;
 function _login_jwtSecret(env: Env): string {
-  return (typeof (env as any).DOKKEBI_JWT_SECRET === 'string' && (env as any).DOKKEBI_JWT_SECRET) ||
-         (typeof (env as any).JWT_SECRET === 'string' && (env as any).JWT_SECRET) || '';
+  // 검증과 동일한 단일 시크릿을 사용한다 (로그인/검증 불일치 방지).
+  return _az_resolveJwtSecret(env);
 }
 async function _login_getSignKey(env: Env): Promise<CryptoKey | null> {
   const secret = _login_jwtSecret(env);
@@ -1003,7 +1092,91 @@ function _az_extractBearerToken(req: Request, payload: any): string | null {
   return null;
 }
 
-/** 세션 tenant_json + 검증된 JWT 로 테넌트 클레임 보강. 암호화 DB 요청에 _jwt 가 있으면 세션보다 JWT 를 우선(USER_KEY/tenant_json 레이스·구버전 세션으로 인한 TENANT_MISMATCH 방지). */
+// ── Authorization Policy — SQL 이 참조하는 "모든" 테이블 검사 ──────────────
+//   과거에는 첫 FROM/INTO/UPDATE 대상(primary) 하나만 규칙 매칭해서
+//     SELECT * FROM posts JOIN users            (users 규칙 우회)
+//     INSERT INTO posts ... SELECT ... FROM users
+//   같은 형태로 보호 테이블을 읽을 수 있었다.
+//   이제 참조 테이블 전부에 대해 규칙을 평가하며, 주 연산 대상이 아닌 테이블은
+//   읽기(SELECT)로 취급한다. (JOIN/서브쿼리/INSERT ... SELECT 원본)
+async function _az_checkSql(
+  sql: string,
+  req: Request,
+  payload: any,
+  env: Env,
+): Promise<{ ok: boolean; code?: string; reason?: string; log?: string }> {
+  if (!_authzMeta || !_authzMeta.enabled) return { ok: true };
+
+  const normalized = stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
+  const upper = normalized.toUpperCase();
+
+  let op: string | null = null;
+  if (upper.startsWith('SELECT') || upper.startsWith('WITH')) op = 'SELECT';
+  else if (upper.startsWith('INSERT')) op = 'INSERT';
+  else if (upper.startsWith('UPDATE')) op = 'UPDATE';
+  else if (upper.startsWith('DELETE')) op = 'DELETE';
+  else if (upper.startsWith('CREATE TABLE')) op = 'CREATE';
+
+  const primary = op ? detectPrimaryTable(upper, op) : null;
+  const primaryLower = primary ? primary.toLowerCase() : '';
+  const tables = extractAllTables(upper).map((t) => t.toLowerCase());
+
+  const targets = tables.length > 0
+    ? tables.map((t) => ({ table: t, op: t === primaryLower ? (op || '*') : 'SELECT' }))
+    : [{ table: '', op: op || '*' }];
+
+  const decisions = targets.map((t) => ({ ...t, matched: _az_matchRule(t.op, t.table) }));
+  const needsJwt = decisions.some((d) => d.matched && d.matched.spec && d.matched.spec.public !== true);
+
+  let jwtRes: any = null;
+  if (needsJwt) {
+    const token = _az_extractBearerToken(req, payload);
+    jwtRes = token
+      ? await _az_verifyJwtHs256(token, env)
+      : { valid: false, reason: 'Authorization 헤더 없음' };
+  }
+
+  for (const d of decisions) {
+    const dec = _az_authorize(d.matched, jwtRes);
+    if (!dec.ok) {
+      return {
+        ok: false,
+        code: dec.code,
+        reason: dec.reason,
+        log: 'op=' + d.op + ' table=' + (d.table || '?') + ' rule=' + (d.matched ? d.matched.key : '<none>'),
+      };
+    }
+  }
+  return { ok: true };
+}
+
+/** 세션 tenant_json + 검증된 JWT 로 테넌트 클레임 구성.
+ *
+ *   - 유효한 JWT 가 있으면 **항상** JWT 클레임이 세션 값보다 우선한다.
+ *     (세션 tenant_json 은 클라이언트가 `_setTenant` 로 바꿀 수 있어 신뢰할 수 없다)
+ *   - `policy.requireJwtTenant === true` 이면 JWT 없이는 테넌트가 성립하지 않는다.
+ *   - 암호화 payload 의 `_jwt` 뿐 아니라 `Authorization: Bearer` 헤더도 인정한다.
+ */
+function _jwtClaimIdentity(payload: any, claim: string): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const v = payload[claim] ?? payload.userId ?? payload.user_id;
+  return v === undefined || v === null ? null : String(v);
+}
+
+async function _jwtTenantIdentity(
+  req: Request,
+  payload: any,
+  env: Env,
+  claim: string,
+): Promise<string | null> {
+  const token = _az_extractBearerToken(req, payload);
+  if (!token) return null;
+  const r = await _az_verifyJwtHs256(token, env);
+  if (!r.valid || !r.payload) return null;
+  const pl = r.payload as Record<string, unknown>;
+  return _jwtClaimIdentity(pl, claim);
+}
+
 async function _tenantContextFromSessionAndJwt(
   cached: { tenantJson: string | null },
   req: Request,
@@ -1019,30 +1192,35 @@ async function _tenantContextFromSessionAndJwt(
   }
   if (!_policyMeta || !_policyMeta.enabled) return base;
   const claim = String(_policyMeta.claim || 'user_id');
+  const requireJwt = _policyMeta.requireJwtTenant === true;
 
+  let jwtClaims: Record<string, unknown> | null = null;
   const token = _az_extractBearerToken(req, payload);
-  let mergedFromJwt: Record<string, unknown> | null = null;
   if (token) {
     const jwtRes = await _az_verifyJwtHs256(token, env);
     if (jwtRes.valid && jwtRes.payload) {
-      const pl = jwtRes.payload as Record<string, unknown>;
-      const id = pl.userId ?? pl.user_id ?? pl[claim];
-      if (id !== undefined && id !== null) {
-        mergedFromJwt = { ...(base || {}), [claim]: String(id) };
+      const pl = { ...(jwtRes.payload as Record<string, unknown>) };
+      // 예약(`_`) 클레임은 테넌트 컨텍스트로 승격하지 않는다 (`_isAdmin` 우회 방지).
+      for (const k of Object.keys(pl)) {
+        if (k.charCodeAt(0) === 95) delete (pl as any)[k];
       }
+      const id = _jwtClaimIdentity(pl, claim);
+      if (id !== null) pl[claim] = id;
+      jwtClaims = pl;
     }
   }
 
-  const preferJwtTenant =
-    typeof payload._jwt === 'string' &&
-    payload._jwt.length > 0 &&
-    mergedFromJwt &&
-    mergedFromJwt[claim] !== undefined;
+  if (requireJwt) {
+    // JWT 전용 모드 — 세션 tenant_json 은 아예 사용하지 않는다.
+    if (!jwtClaims || jwtClaims[claim] === undefined || jwtClaims[claim] === null) return null;
+    return jwtClaims;
+  }
 
-  if (preferJwtTenant) return mergedFromJwt;
+  if (jwtClaims && jwtClaims[claim] !== undefined && jwtClaims[claim] !== null) {
+    return { ...(base || {}), ...jwtClaims };
+  }
   if (base && base[claim] !== undefined && base[claim] !== null) return base;
-  if (mergedFromJwt) return mergedFromJwt;
-  return base;
+  return jwtClaims;
 }
 
 let _capSignKey: CryptoKey | null = null;
@@ -1151,14 +1329,7 @@ function _pe_normalize(sql: string): string {
   return _pe_stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
 }
 function _pe_detectOp(upper: string): string | null {
-  const head = upper.trimStart();
-  if (head.startsWith('SELECT')) return 'SELECT';
-  if (head.startsWith('INSERT')) return 'INSERT';
-  if (head.startsWith('UPDATE')) return 'UPDATE';
-  if (head.startsWith('DELETE')) return 'DELETE';
-  if (head.startsWith('WITH'))   return 'SELECT';
-  if (head.startsWith('CREATE')) return 'CREATE';
-  return null;
+  return detectPrimaryOp(upper);
 }
 const _PE_RESERVED = new Set(['WHERE','SET','VALUES','ON','GROUP','ORDER','LIMIT','HAVING','UNION','INNER','LEFT','RIGHT','FULL','CROSS','OUTER','NATURAL','AS','USING','AND','OR','RETURNING','INTERSECT','EXCEPT','FROM','JOIN','INTO','UPDATE','SELECT','INSERT','DELETE']);
 function _pe_extractTableRefs(normalized: string): any[] {
@@ -1180,15 +1351,51 @@ function _pe_extractTableRefs(normalized: string): any[] {
   }
   return refs;
 }
+// 괄호 밖(depth 0)의 WHERE 와 tail 키워드 위치를 찾는다. raw SQL 에도 사용 가능.
+function _pe_scanOuterWhere(sql: string): { whereEnd: number; tailStart: number } {
+  let depth = 0;
+  let whereEnd = -1;
+  let tailStart = -1;
+  const n = sql.length;
+  const TAIL = new Set(['ORDER', 'GROUP', 'LIMIT', 'HAVING', 'RETURNING', 'UNION', 'INTERSECT', 'EXCEPT']);
+  for (let i = 0; i < n; i++) {
+    const ch = sql[i];
+    const nx = sql[i + 1];
+    if (ch === '-' && nx === '-') { while (i < n && sql[i] !== '\n') i++; continue; }
+    if (ch === '/' && nx === '*') { i += 2; while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i++; i++; continue; }
+    if (ch === "'") {
+      i++;
+      while (i < n) { if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; } if (sql[i] === "'") break; i++; }
+      continue;
+    }
+    if (ch === '"' || ch === '`') {
+      const q = ch; i++;
+      while (i < n) { if (sql[i] === q) { if (sql[i + 1] === q) { i += 2; continue; } break; } i++; }
+      continue;
+    }
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') { if (depth > 0) depth--; continue; }
+    if (depth !== 0) continue;
+    if (ch === ';') { if (tailStart < 0) tailStart = i; break; }
+    if (!/[A-Za-z_]/.test(ch)) continue;
+    let j = i;
+    while (j < n && /[A-Za-z0-9_]/.test(sql[j])) j++;
+    const word = sql.slice(i, j).toUpperCase();
+    if (whereEnd < 0) {
+      if (word === 'WHERE') whereEnd = j;
+    } else if (TAIL.has(word)) {
+      tailStart = i;
+      break;
+    }
+    i = j - 1;
+  }
+  return { whereEnd, tailStart };
+}
 function _pe_extractWhere(normalized: string): { start: number; end: number; text: string } | null {
-  const m = /\bWHERE\b/i.exec(normalized);
-  if (!m) return null;
-  const start = m.index + m[0].length;
-  const remaining = normalized.slice(start);
-  const endRe = /\b(ORDER\s+BY|GROUP\s+BY|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT)\b|;/i;
-  const endMatch = endRe.exec(remaining);
-  const end = endMatch ? start + endMatch.index : normalized.length;
-  return { start, end, text: normalized.slice(start, end) };
+  const { whereEnd, tailStart } = _pe_scanOuterWhere(normalized);
+  if (whereEnd < 0) return null;
+  const end = tailStart >= 0 ? tailStart : normalized.length;
+  return { start: whereEnd, end, text: normalized.slice(whereEnd, end) };
 }
 function _pe_hasTopLevelOr(whereText: string): boolean {
   const upper = whereText.toUpperCase();
@@ -1267,7 +1474,8 @@ function _pe_findTenantCondInUpper(upper: string, alias: string | null, col: str
     let m: RegExpExecArray | null;
     while ((m = re.exec(upper)) !== null) {
       let depth = 0;
-      for (let i = 0; i < m.index; i++) {
+      const depthEnd = m.index + (upper[m.index] === '(' ? 1 : 0);
+      for (let i = 0; i < depthEnd; i++) {
         if (upper[i] === '(') depth++;
         else if (upper[i] === ')') depth--;
       }
@@ -1287,6 +1495,9 @@ function _pe_findTenantCond(whereText: string, alias: string | null, col: string
     const subUpper = upper.slice(sp.start, sp.end);
     const { inner, relOffset } = _pe_peelWrappedConjunct(sub);
     if (!inner) continue;
+    // 서브쿼리 내부 조건 / OR 로 느슨해진 conjunct 는 바깥 행 필터가 아니다.
+    if (/\bSELECT\b/i.test(inner)) continue;
+    if (_pe_hasTopLevelOr(inner)) continue;
     const innerUpper = subUpper.slice(relOffset, relOffset + inner.length);
     r = _pe_findTenantCondInUpper(innerUpper, alias, col);
     if (r) {
@@ -1317,10 +1528,19 @@ function _pe_findTablePolicy(tables: any, name: string): any {
   }
   return null;
 }
+function _pe_optionalEnforceable(tp: any, globalClaim: string): boolean {
+  if (!tp) return false;
+  if (tp.sessionClaim) return true;
+  return String(tp.tenantColumn || '').toLowerCase() === String(globalClaim || '').toLowerCase();
+}
 function _pe_resolveClaim(tenantContext: any, tableClaim: string | undefined, globalClaim: string, tenantCol: string): [string, unknown] {
+  // sessionClaim 명시 시 그 클레임만 사용 (FK 컬럼에 user_id 가 들어가는 오매핑 방지)
+  if (tableClaim) {
+    const v = tenantContext ? tenantContext[tableClaim] : undefined;
+    return [tableClaim, v];
+  }
   const candidates: string[] = [];
-  if (tableClaim) candidates.push(tableClaim);
-  if (globalClaim && globalClaim !== tableClaim) candidates.push(globalClaim);
+  if (globalClaim) candidates.push(globalClaim);
   if (tenantCol && !candidates.includes(tenantCol)) candidates.push(tenantCol);
   if (candidates.length === 0) return ['user_id', undefined];
   if (!tenantContext) return [candidates[0], undefined];
@@ -1345,11 +1565,14 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
     const tp = _pe_findTablePolicy(policy.tables, ref.name);
     if (!tp) continue;
     const mode = tp.mode;
-    if (mode === 'none' || mode === 'optional') continue;
-    if (mode !== 'enforce' && mode !== 'inject') continue;
+    if (mode === 'none') continue;
+    if (mode !== 'enforce' && mode !== 'inject' && mode !== 'optional') continue;
+    if (mode === 'optional' && !_pe_optionalEnforceable(tp, globalClaim)) continue;
     const tenantCol = tp.tenantColumn;
     if (!tenantCol) continue;
     const [claim, expected] = _pe_resolveClaim(tenantContext, tp.sessionClaim, globalClaim, tenantCol);
+    // optional: 클레임이 있으면 enforce, 없으면 공개(스킵)
+    if (mode === 'optional' && (expected === undefined || expected === null)) continue;
     if (expected === undefined || expected === null) {
       return { ok: false, code: 'TENANT_MISSING', reason: '테넌트 클레임 "' + claim + '" 가 세션에 없습니다.', table: ref.name };
     }
@@ -1399,19 +1622,13 @@ function _pe_injectInsert(sql: string, params: unknown[], _ref: any, tenantCol: 
 function _pe_injectWhere(sql: string, params: unknown[], _op: string, ref: any, tenantCol: string, expected: any): any {
   const colExpr = (ref.alias ? ref.alias + '.' : '') + tenantCol;
   const cond = colExpr + ' = ?';
-  const whereRe = /\bWHERE\b/i;
-  const wm = whereRe.exec(sql);
+  // 바깥 문장의 WHERE 만 대상으로 한다 (서브쿼리 WHERE 오삽입 방지).
+  const { whereEnd, tailStart } = _pe_scanOuterWhere(sql);
+  const insertAt = tailStart >= 0 ? tailStart : sql.length;
   let newSql: string;
-  if (wm) {
-    const after = sql.slice(wm.index + wm[0].length);
-    const tailRe = /\b(ORDER\s+BY|GROUP\s+BY|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT)\b|;/i;
-    const tm = tailRe.exec(after);
-    const insertAtAbs = wm.index + wm[0].length + (tm ? tm.index : after.length);
-    newSql = (sql.slice(0, insertAtAbs).trimEnd() + ' AND (' + cond + ') ' + sql.slice(insertAtAbs).trimStart()).replace(/\s+/g, ' ');
+  if (whereEnd >= 0) {
+    newSql = (sql.slice(0, insertAt).trimEnd() + ' AND (' + cond + ') ' + sql.slice(insertAt).trimStart()).replace(/\s+/g, ' ');
   } else {
-    const tailRe = /\b(ORDER\s+BY|GROUP\s+BY|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT)\b|;\s*$/i;
-    const tm = tailRe.exec(sql);
-    const insertAt = tm ? tm.index : sql.length;
     newSql = (sql.slice(0, insertAt).trimEnd() + ' WHERE ' + cond + ' ' + sql.slice(insertAt).trimStart()).replace(/\s+/g, ' ');
   }
   const markers = [' AND (' + cond + ')', ' WHERE ' + cond];
@@ -1420,11 +1637,25 @@ function _pe_injectWhere(sql: string, params: unknown[], _op: string, ref: any, 
     const i = newSql.lastIndexOf(marker);
     if (i >= 0) { markerIdx = i + marker.lastIndexOf('?'); break; }
   }
-  if (markerIdx < 0) markerIdx = newSql.lastIndexOf(cond) + cond.lastIndexOf('?');
-  const beforeCount = _pe_countQMarks(newSql, markerIdx);
+  if (markerIdx < 0) return null;
+  const beforeCount = _pe_countQMarksRaw(newSql, markerIdx);
   const newParams = params.slice();
   newParams.splice(beforeCount, 0, expected);
   return { sql: newSql, params: newParams };
+}
+function _pe_countQMarksRaw(sql: string, offset: number): number {
+  let count = 0;
+  const n = Math.min(offset, sql.length);
+  for (let i = 0; i < n; i++) {
+    const ch = sql[i];
+    const nx = sql[i + 1];
+    if (ch === '-' && nx === '-') { while (i < n && sql[i] !== '\n') i++; continue; }
+    if (ch === '/' && nx === '*') { i += 2; while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i++; i++; continue; }
+    if (ch === "'") { i++; while (i < n) { if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; } if (sql[i] === "'") break; i++; } continue; }
+    if (ch === '"' || ch === '`') { const q = ch; i++; while (i < n) { if (sql[i] === q) { if (sql[i + 1] === q) { i += 2; continue; } break; } i++; } continue; }
+    if (ch === '?') count++;
+  }
+  return count;
 }
 function injectTenantPolicy(sql: string, params: unknown[], tenantContext: any, policy: any, opts: any = {}): any {
   if (!policy || !policy.tables || Object.keys(policy.tables).length === 0) return { ok: true, sql, params, injected: false };
@@ -1441,7 +1672,9 @@ function injectTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
   const refs0 = _pe_extractTableRefs(normalized0);
   const targets = refs0.filter((r) => {
     const tp = _pe_findTablePolicy(policy.tables, r.name);
-    return tp && (tp.mode === 'enforce' || tp.mode === 'inject') && tp.tenantColumn;
+    if (!tp || !tp.tenantColumn) return false;
+    const _optionalOk = tp.mode !== 'optional' || _pe_optionalEnforceable(tp, policy.claim || 'user_id');
+    return (tp.mode === 'enforce' || tp.mode === 'inject' || (tp.mode === 'optional' && _optionalOk)) && !!tp.tenantColumn;
   });
   if (targets.length === 0) return { ok: true, sql, params, injected: false };
   let curSql = sql; let curParams = params.slice();
@@ -1454,7 +1687,17 @@ function injectTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
     if (!failingTable) break;
     const normalizedCur = _pe_normalize(curSql);
     const curRefs = _pe_extractTableRefs(normalizedCur);
-    const tRef = curRefs.find((r) => r.name.toLowerCase() === failingTable.toLowerCase());
+    const curOp = _pe_detectOp(normalizedCur.toUpperCase());
+    const outerStart = _detectOuterOp(normalizedCur.toUpperCase()).index;
+    const opKeyword = curOp === 'INSERT' ? 'INTO' : curOp === 'UPDATE' ? 'UPDATE' : 'FROM';
+    const candidateRefs = curRefs
+      .filter((r) => r.name.toLowerCase() === failingTable.toLowerCase())
+      .filter((r) => (outerStart < 0 ? true : r.offset >= outerStart))
+      .filter((r) => r.keyword === opKeyword || (curOp === 'SELECT' && r.keyword === 'FROM'))
+      .sort((a, b) => a.offset - b.offset);
+    const tRef = candidateRefs[0] || curRefs
+      .filter((r) => r.name.toLowerCase() === failingTable.toLowerCase())
+      .sort((a, b) => a.offset - b.offset)[0];
     if (!tRef) break;
     const tp = _pe_findTablePolicy(policy.tables, failingTable);
     if (!tp || !tp.tenantColumn) break;
@@ -1463,15 +1706,6 @@ function injectTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
     if (failingExpected === undefined || failingExpected === null) {
       return { ok: false, code: 'TENANT_MISSING', reason: '테넌트 클레임 "' + failingClaim + '" 가 세션에 없어 ' + failingTable + ' 에 주입할 수 없습니다.', table: failingTable };
     }
-    const curOp = _pe_detectOp(normalizedCur.toUpperCase());
-    const allowedKw: Record<string, Set<string>> = {
-      SELECT: new Set(['FROM', 'JOIN']),
-      UPDATE: new Set(['UPDATE']),
-      DELETE: new Set(['FROM']),
-      INSERT: new Set(['INTO']),
-    };
-    const allowed = curOp ? allowedKw[curOp] : null;
-    if (!allowed || !allowed.has(tRef.keyword)) break;
     const rewrite = curOp === 'INSERT'
       ? _pe_injectInsert(curSql, curParams, tRef, tenantCol, failingExpected)
       : _pe_injectWhere(curSql, curParams, curOp, tRef, tenantCol, failingExpected);
@@ -1524,6 +1758,18 @@ function validateSqlAllowlist(sql: string, opts: { strict?: boolean } = {}): { a
     return { allowed: false, reason: `위험한 SQL 토큰 감지: ${danger}` };
   }
 
+  // 내부 시스템 테이블(_dokkebi_* · sqlite_*) 참조 차단 — allowlist 유무와 무관하게 항상.
+  //   allowlist(null) + DOKKEBI_SQL_STRICT=false 조합에서도 세션키 탈취·로그 변조를 막는다.
+  const internalRef = findInternalTableRef(sql);
+  if (internalRef) {
+    return { allowed: false, reason: `내부 시스템 테이블에는 접근할 수 없습니다: "${internalRef}"` };
+  }
+
+  // 클라이언트 DDL 차단 (스키마 변경은 빌드/마이그레이션 경로 전용)
+  if (/^(?:CREATE|ALTER|DROP|TRUNCATE|REINDEX|VACUUM)\b/.test(upper)) {
+    return { allowed: false, reason: 'DDL(CREATE/ALTER/DROP)은 클라이언트 SQL 에서 허용되지 않습니다.' };
+  }
+
   if (!hasAllowlist) {
     if (strict) {
       return { allowed: false, reason: 'SQL allowlist가 없어 모든 쿼리를 거부합니다.' };
@@ -1539,45 +1785,30 @@ function validateSqlAllowlist(sql: string, opts: { strict?: boolean } = {}): { a
   const allowedMap = new Map<string, any>();
   for (const t of _sqlAllowlist.tables) allowedMap.set(String(t.name).toLowerCase(), t);
 
-  if (op === 'CREATE') {
-    const ident = '["\'`]?([a-zA-Z_][\\w]*(?:\\.[a-zA-Z_][\\w]*)?)["\'`]?';
-    const createRe = new RegExp('\\bCREATE\\s+(?:TEMP(?:ORARY)?\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?' + ident, 'i');
-    const m = normalized.match(createRe);
-    if (!m) return { allowed: false, reason: 'CREATE TABLE 구문에서 테이블명을 추출할 수 없습니다.' };
-    const rawName = m[1];
-    const baseName = rawName.split('.').pop()!.toLowerCase();
-    if (!baseName.startsWith('_dokkebi_')) {
-      return { allowed: false, reason: `CREATE TABLE은 _dokkebi_* 시스템 테이블만 허용됩니다. (요청: ${rawName})` };
-    }
-    const referenced = extractAllTables(upper).map(t => t.toLowerCase());
-    for (const t of referenced) {
-      if (t === baseName) continue;
-      if (!allowedMap.get(t)) {
-        return { allowed: false, reason: `CREATE TABLE 중 허용되지 않은 참조 테이블: "${t}"` };
-      }
-    }
-    return { allowed: true };
-  }
-
   const allTables = extractAllTables(upper).map(t => t.toLowerCase());
   if (allTables.length === 0 && !upper.trimStart().startsWith('WITH')) {
     return { allowed: false, reason: 'SQL에서 테이블명을 추출할 수 없습니다.' };
   }
+
+  const cteNames = extractCteNames(upper);
+  const primaryTable = detectPrimaryTable(upper, op);
+  const primaryLower = primaryTable ? primaryTable.toLowerCase() : '';
 
   for (const t of allTables) {
     const entry = allowedMap.get(t);
     if (!entry) {
       return { allowed: false, reason: `허용되지 않은 테이블: "${t}"` };
     }
-    if (op === 'SELECT' && !entry.ops.includes('SELECT')) {
+    // SELECT 문의 모든 테이블, 그리고 DML 에서 주 연산 대상이 아닌 테이블
+    // (JOIN/서브쿼리/INSERT ... SELECT 원본)은 읽기 대상이므로 SELECT 권한이 필요하다.
+    const isPrimary = !!primaryLower && t === primaryLower;
+    if ((op === 'SELECT' || !isPrimary) && !entry.ops.includes('SELECT')) {
       return { allowed: false, reason: `테이블 "${t}"에 대한 SELECT가 허용되지 않습니다.` };
     }
   }
 
-  const cteNames = extractCteNames(upper);
-  const primaryTable = detectPrimaryTable(upper, op);
-  if (primaryTable && !cteNames.has(primaryTable.toLowerCase())) {
-    const entry = allowedMap.get(primaryTable.toLowerCase());
+  if (primaryTable && !cteNames.has(primaryLower)) {
+    const entry = allowedMap.get(primaryLower);
     if (!entry || !entry.ops.includes(op)) {
       return {
         allowed: false,
@@ -1730,8 +1961,9 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     _nonceMap.set(nonce, now);
 
     // ── 3. 세션 조회 (인메모리 캐시 → D1 폴백) ──────────────
-    //   콜드패스(캐시 미스): D1 batch [세션 + nonce] → 크로스 아이솔레이트 replay 차단
-    //   핫패스(캐시 히트): 인메모리 nonce만으로 충분 → D1 조회 생략
+    //   콜드패스(캐시 미스): D1 batch [세션 + nonce 존재 확인]
+    //   실제 nonce 선점(INSERT)은 HMAC/AES 통과 후 아래 5-a 에서 수행한다.
+    //   (서명 검증 전에 D1 쓰기를 하지 않아 위조 요청의 쓰기 증폭을 막는다)
     let cached = _sessionCache.get(sid as string);
     if (!cached || now - cached.created_at > SESSION_TTL_MS) {
       _sessionCache.delete(sid as string);
@@ -1786,30 +2018,6 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
         deleteCount: 0,
       };
       _sessionCache.set(sid as string, cached);
-
-      // Phase 1-① cold-path — D1 Nonce 는 블로킹 INSERT 로 고쳐 changes
-      // 를 확인한다. 크로스 아이솔레이트에서 동시에 동일 nonce 가 도착해도
-      // D1 primary 가 write 를 직렬화하므로 둘 중 하나만 changes=1 이 된다.
-      try {
-        const res = await _internalDb(env).prepare(
-          `INSERT OR IGNORE INTO _dokkebi_nonces (nonce, expires_at) VALUES (?, ?)`
-        ).bind(nonce, now + NONCE_TTL_MS).run();
-        const changes = (res as any)?.meta?.changes ?? (res as any)?.changes ?? 1;
-        if (changes === 0) {
-          logSecurity(_internalDb(env), 'replay_attempt', clientIp, '/api/_dokkebi/db', 'd1 primary duplicate nonce');
-          return new Response(JSON.stringify({
-            ok: false, code: 'REPLAY_DETECTED', error: '중복된 요청 nonce 가 감지되었습니다 (d1).',
-          }), { status: 403, headers });
-        }
-      } catch { /* D1 일시 장애 — 인메모리 방어에 의존 */ }
-    } else {
-      // Phase 1-① hot-path — 세션 캐시가 있으므로 D1 은 fire-and-forget.
-      // (동일 아이솔레이트 내부에서는 _nonceMap 이 이미 막아주며, 크로스
-      //  아이솔레이트 race 는 콜드패스에서만 의미가 있다.)
-      ctx.waitUntil(
-        _internalDb(env).prepare(`INSERT OR IGNORE INTO _dokkebi_nonces (nonce, expires_at) VALUES (?, ?)`)
-          .bind(nonce, now + NONCE_TTL_MS).run().catch(() => {})
-      );
     }
 
     // ── 4. 요청 HMAC 검증 (CPU only) ─────────────────────────
@@ -1842,17 +2050,6 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
       }
       return null;
     };
-    const _isReadOnlySelectSql = (s: string): boolean => {
-      const raw = (s || '').replace(/^\uFEFF/, '').trimStart();
-      // Phase B-4: 명시적 read 메타 — SQL 선두에 `/*!read*/` 힌트가 있으면 read 로 인식.
-      //   동적으로 합성된 SELECT 또는 함수형 view 호출처럼 prefix 가 SELECT 가 아닌
-      //   read-only 쿼리를 안전하게 read replica 로 분기시키기 위함.
-      if (/^\/\*!\s*read\s*\*\//i.test(raw)) return true;
-      if (/^\/\*!\s*write\s*\*\//i.test(raw)) return false;
-      const t = raw.toUpperCase();
-      // WITH 로 시작하는 문장은 INSERT/UPDATE 등 변형이 있을 수 있어 SELECT 만 카운터 완화
-      return t.startsWith('SELECT');
-    };
 
     // ── 5. AES-GCM 복호화 + 메모리 제로화 (CPU only) ─────────
     const combined = Uint8Array.from(atob(enc), (c) => c.charCodeAt(0));
@@ -1866,6 +2063,41 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
       return new Response(JSON.stringify({ ok: false, code: 'POW_INVALID', error: powRes.error }), { status: 403, headers });
     }
     payload = powRes.payload;
+
+    // ── 5-a. Nonce 선점 (크로스 아이솔레이트 replay 차단) ─────────
+    //   읽기(SELECT)는 상태를 변경하지 않으므로 D1 쓰기를 백그라운드로 미룬다.
+    //   쓰기/특수 명령은 D1 primary 에 동기 INSERT 하고 changes 를 확인해,
+    //   서로 다른 아이솔레이트로 동시에 재전송된 동일 nonce 를 1건만 실행한다.
+    //   (nonce 형식은 클라이언트가 정하므로 counter 에 의존하지 않는다)
+    {
+      const _payloadNeedsSyncNonce = (() => {
+        // batch read 는 아래 5-batch 에서 read-only SELECT 만 허용하므로 읽기로 취급.
+        if (Array.isArray(payload._batchRead) && payload._batchRead.length > 0) return false;
+        if (payload._setTenant !== undefined || payload._login !== undefined
+            || payload._attest !== undefined || payload._capabilityUnlock !== undefined) return true;
+        const _raw = typeof payload.sql === 'string' ? payload.sql
+          : (typeof payload._debugSql === 'string' ? payload._debugSql : null);
+        if (_raw === null) return true; // queryId 만 온 경우(레지스트리 해석 전) 보수적으로 동기
+        return !_isReadOnlySelectSql(_raw);
+      })();
+      const _claimNonce = () => _internalDb(env).prepare(
+        `INSERT OR IGNORE INTO _dokkebi_nonces (nonce, expires_at) VALUES (?, ?)`
+      ).bind(nonce, now + NONCE_TTL_MS).run();
+      if (_payloadNeedsSyncNonce) {
+        try {
+          const _nr = await _claimNonce();
+          const _nchg = (_nr as any)?.meta?.changes ?? (_nr as any)?.changes ?? 1;
+          if (_nchg === 0) {
+            logSecurity(_internalDb(env), 'replay_attempt', clientIp, '/api/_dokkebi/db', 'd1 duplicate nonce (mutation)');
+            return new Response(JSON.stringify({
+              ok: false, code: 'REPLAY_DETECTED', error: '중복된 요청 nonce 가 감지되었습니다 (d1).',
+            }), { status: 403, headers });
+          }
+        } catch { /* D1 일시 장애 — 인메모리 방어에 의존 */ }
+      } else {
+        ctx.waitUntil(_claimNonce().catch(() => {}));
+      }
+    }
 
     // ── 5-batch. 다중 SELECT 를 단일 D1.batch 로 실행 (opaqueHandle read coalesce) ──
     const _batchReadArr = payload._batchRead;
@@ -1931,12 +2163,12 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
         const sqlCheckB = validateSql(sqlB!);
         if (!sqlCheckB.ok) {
           logSecurity(_internalDb(env), 'sql_inject', clientIp, '/api/_dokkebi/db', (sqlCheckB.reason || '') + ' | ' + sqlB?.slice(0, 100));
-          return new Response(JSON.stringify({ ok: false, error: sqlCheckB.reason }), { status: 403, headers });
+          return new Response(JSON.stringify({ ok: false, error: sqlCheckB.reason, code: 'SQL_BLOCKED' }), { status: 403, headers });
         }
         const alCheckB = validateSqlAllowlist(sqlB!, { strict: strictFlagB });
         if (!alCheckB.allowed) {
           logSecurity(_internalDb(env), 'sql_blocked', clientIp, '/api/_dokkebi/db', (alCheckB.reason || '') + ' | ' + sqlB?.slice(0, 100));
-          return new Response(JSON.stringify({ ok: false, error: alCheckB.reason }), { status: 403, headers });
+          return new Response(JSON.stringify({ ok: false, error: alCheckB.reason, code: 'SQL_BLOCKED' }), { status: 403, headers });
         }
         if (!_isReadOnlySelectSql(sqlB!)) {
           logSecurity(_internalDb(env), 'sql_blocked', clientIp, '/api/_dokkebi/db', 'batch item is not read-only SELECT');
@@ -1968,41 +2200,15 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
         }
 
         if (_authzMeta && _authzMeta.enabled) {
-          const az_upperB = sqlB!.toUpperCase().trimStart();
-          let az_opB: string | null = null;
-          if (az_upperB.startsWith('SELECT') || az_upperB.startsWith('WITH')) az_opB = 'SELECT';
-          else if (az_upperB.startsWith('INSERT')) az_opB = 'INSERT';
-          else if (az_upperB.startsWith('UPDATE')) az_opB = 'UPDATE';
-          else if (az_upperB.startsWith('DELETE')) az_opB = 'DELETE';
-          else if (az_upperB.startsWith('CREATE TABLE')) az_opB = 'CREATE';
-
-          const az_primaryB = az_opB ? detectPrimaryTable(stripStringsAndComments(sqlB!).replace(/\s+/g, ' ').trim().toUpperCase(), az_opB) : null;
-          const az_tableB = az_primaryB || '';
-
-          const matchedB = _az_matchRule(az_opB || '*', az_tableB);
-
-          let jwtResB: any = null;
-          const needsJwtB = matchedB && matchedB.spec && matchedB.spec.public !== true;
-          if (needsJwtB) {
-            const tokenB = _az_extractBearerToken(request, subPl);
-            if (tokenB) {
-              jwtResB = await _az_verifyJwtHs256(tokenB, env);
-            } else {
-              jwtResB = { valid: false, reason: 'Authorization 헤더 없음' };
-            }
-          }
-
-          const decisionB = _az_authorize(matchedB, jwtResB);
-          if (!decisionB.ok) {
+          const _azrB = await _az_checkSql(sqlB!, request, subPl, env);
+          if (!_azrB.ok) {
             logSecurity(_internalDb(env), 'authz_denied', clientIp, '/api/_dokkebi/db',
-              (decisionB.code || 'DENY') + ': ' + (decisionB.reason || '') +
-              ' | op=' + (az_opB || '?') + ' table=' + (az_tableB || '?') +
-              (matchedB ? ' rule=' + matchedB.key : ' rule=<none>'));
+              (_azrB.code || 'DENY') + ': ' + (_azrB.reason || '') + ' | ' + (_azrB.log || ''));
             return new Response(JSON.stringify({
               ok: false,
-              error: decisionB.reason,
-              code: decisionB.code,
-            }), { status: decisionB.code === 'AUTH_REQUIRED' ? 401 : 403, headers });
+              error: _azrB.reason,
+              code: _azrB.code,
+            }), { status: _azrB.code === 'AUTH_REQUIRED' ? 401 : 403, headers });
           }
         }
 
@@ -2151,6 +2357,39 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
             }), { status: 400, headers });
           }
         }
+
+        // ── C-3 방어: 테넌트 클레임 위조 차단 ──
+        //   세션 tenant_json 은 클라이언트가 직접 설정하는 값이므로, 그것만으로
+        //   row-level 격리를 만들면 사용자가 tenant 값을 타인 ID 로 바꿔 남의 데이터를
+        //   읽을 수 있다. 서버가 아는 신분(worker _login 바인딩 / 검증된 JWT)이 있으면
+        //   그 값만 허용한다.
+        //     - requireJwtTenant 또는 worker 로그인(bindTenant) → _setTenant 자체를 거부
+        //     - 그 외 JWT 가 함께 오면 클레임 값을 JWT 값으로 고정(다른 값은 403)
+        {
+          const _claim = String(_policyMeta?.claim || 'user_id');
+          const _serverBoundLogin = _authLoginMeta?.enabled === true && _authLoginMeta?.bindTenant !== false;
+          const _requireJwt = _policyMeta?.requireJwtTenant === true;
+          if (_requireJwt || _serverBoundLogin) {
+            logSecurity(_internalDb(env), 'tenant_reject', clientIp, '/api/_dokkebi/db',
+              'client tenant override blocked (server-bound tenant)');
+            return new Response(JSON.stringify({
+              ok: false, code: 'TENANT_SERVER_BOUND',
+              error: '이 프로젝트의 테넌트는 서버(로그인/JWT)가 결정합니다. _setTenant 로 변경할 수 없습니다.',
+            }), { status: 403, headers });
+          }
+          const _jwtIdent = await _jwtTenantIdentity(request, payload as Record<string, unknown>, env, _claim);
+          if (_jwtIdent !== null) {
+            if (Object.prototype.hasOwnProperty.call(setTenant, _claim) && String((setTenant as any)[_claim]) !== _jwtIdent) {
+              logSecurity(_internalDb(env), 'tenant_reject', clientIp, '/api/_dokkebi/db',
+                'client tenant claim mismatch with JWT: ' + _claim);
+              return new Response(JSON.stringify({
+                ok: false, code: 'TENANT_CLIENT_OVERRIDE',
+                error: '테넌트 값이 인증된 사용자와 일치하지 않습니다.',
+              }), { status: 403, headers });
+            }
+            (setTenant as any)[_claim] = _jwtIdent;
+          }
+        }
       }
       const tenantStr = setTenant === null ? null : JSON.stringify(setTenant);
       try {
@@ -2172,6 +2411,33 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
         _enc: true,
         enc: encBytesToB64(resEnc0),
         iv: encBytesToB64(resIv0),
+      }), { headers });
+    }
+
+    // ── 5-introspect. 테이블 존재 확인 (내부 전용) ─────────────
+    //   클라이언트 SQL 의 sqlite_master 접근을 차단했으므로, 런타임 헬퍼는
+    //   이 내부 명령으로만 테이블 존재 여부를 확인한다(이름만 반환, 스키마 비노출).
+    if (payload._tableExists !== undefined) {
+      const _teName = payload._tableExists;
+      if (typeof _teName !== 'string' || !_teName || _teName.length > 128) {
+        return new Response(JSON.stringify({
+          ok: false, code: 'TABLE_EXISTS_INVALID', error: '테이블 이름이 필요합니다.',
+        }), { status: 400, headers });
+      }
+      let _teExists = false;
+      try {
+        const row = await _internalDb(env).prepare(
+          `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`
+        ).bind(_teName).first();
+        _teExists = !!row;
+      } catch { _teExists = false; }
+      const teJson = JSON.stringify({ ok: true, value: { exists: _teExists } });
+      const ivTe = crypto.getRandomValues(new Uint8Array(12));
+      const encTe = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivTe }, cached.encKey, new TextEncoder().encode(teJson));
+      return new Response(JSON.stringify({
+        _enc: true,
+        enc: encBytesToB64(encTe),
+        iv: encBytesToB64(ivTe),
       }), { headers });
     }
 
@@ -2407,7 +2673,7 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     const sqlCheck = validateSql(sql!);
     if (!sqlCheck.ok) {
       logSecurity(_internalDb(env), 'sql_inject', clientIp, '/api/_dokkebi/db', (sqlCheck.reason || '') + ' | ' + sql?.slice(0, 100));
-      return new Response(JSON.stringify({ ok: false, error: sqlCheck.reason }), { status: 403, headers });
+      return new Response(JSON.stringify({ ok: false, error: sqlCheck.reason, code: 'SQL_BLOCKED' }), { status: 403, headers });
     }
 
     // ── 6b. SQL Allowlist 검증 (방어 깊이) ────────────────────
@@ -2418,7 +2684,7 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     const alCheck = validateSqlAllowlist(sql!, { strict: strictFlag });
     if (!alCheck.allowed) {
       logSecurity(_internalDb(env), 'sql_blocked', clientIp, '/api/_dokkebi/db', (alCheck.reason || '') + ' | ' + sql?.slice(0, 100));
-      return new Response(JSON.stringify({ ok: false, error: alCheck.reason }), { status: 403, headers });
+      return new Response(JSON.stringify({ ok: false, error: alCheck.reason, code: 'SQL_BLOCKED' }), { status: 403, headers });
     }
 
     // SELECT/WITH 가 아니면 모노토닉 카운터 검증 (직렬 쓰기·복잡 질의 순서 보장)
@@ -2467,43 +2733,15 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     //   RULE_DENY, NO_RULE(strict 모드) 등.
     //   문서: docs/design/AUTHORIZATION.md
     if (_authzMeta && _authzMeta.enabled) {
-      const az_upper = sql!.toUpperCase().trimStart();
-      let az_op: string | null = null;
-      if (az_upper.startsWith('SELECT') || az_upper.startsWith('WITH')) az_op = 'SELECT';
-      else if (az_upper.startsWith('INSERT')) az_op = 'INSERT';
-      else if (az_upper.startsWith('UPDATE')) az_op = 'UPDATE';
-      else if (az_upper.startsWith('DELETE')) az_op = 'DELETE';
-      else if (az_upper.startsWith('CREATE TABLE')) az_op = 'CREATE';
-
-      const az_primary = az_op ? detectPrimaryTable(stripStringsAndComments(sql!).replace(/\s+/g, ' ').trim().toUpperCase(), az_op) : null;
-      const az_table = az_primary || '';
-
-      const matched = _az_matchRule(az_op || '*', az_table);
-
-      // 규칙이 매칭되지 않은 경우: warn 모드면 통과, strict 모드면 NO_RULE
-      // 매칭된 경우에만 JWT 검증 시도 (불필요한 검증 비용 절감)
-      let jwtRes: any = null;
-      const needsJwt = matched && matched.spec && matched.spec.public !== true;
-      if (needsJwt) {
-        const token = _az_extractBearerToken(request, payload);
-        if (token) {
-          jwtRes = await _az_verifyJwtHs256(token, env);
-        } else {
-          jwtRes = { valid: false, reason: 'Authorization 헤더 없음' };
-        }
-      }
-
-      const decision = _az_authorize(matched, jwtRes);
-      if (!decision.ok) {
+      const azr = await _az_checkSql(sql!, request, payload, env);
+      if (!azr.ok) {
         logSecurity(_internalDb(env), 'authz_denied', clientIp, '/api/_dokkebi/db',
-          (decision.code || 'DENY') + ': ' + (decision.reason || '') +
-          ' | op=' + (az_op || '?') + ' table=' + (az_table || '?') +
-          (matched ? ' rule=' + matched.key : ' rule=<none>'));
+          (azr.code || 'DENY') + ': ' + (azr.reason || '') + ' | ' + (azr.log || ''));
         return new Response(JSON.stringify({
           ok: false,
-          error: decision.reason,
-          code: decision.code,
-        }), { status: decision.code === 'AUTH_REQUIRED' ? 401 : 403, headers });
+          error: azr.reason,
+          code: azr.code,
+        }), { status: azr.code === 'AUTH_REQUIRED' ? 401 : 403, headers });
       }
     }
 
@@ -2511,9 +2749,11 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     //   HMAC 이 통과한 정당 요청만 이 지점에 도달. XSS 하이재킹 시 세션
     //   내부에서 자동화된 대량 쓰기 시도를 차단한다.
     {
-      const _up = sql!.toUpperCase().trimStart();
-      const _isWrite = _up.startsWith('INSERT') || _up.startsWith('UPDATE') || _up.startsWith('DELETE');
-      const _isDelete = _up.startsWith('DELETE');
+      // 주석/BOM/힌트 prefix 와 무관하게 실제 op 로 판정한다.
+      const _budgetUpper = stripStringsAndComments(sql!).replace(/\s+/g, ' ').trim().toUpperCase();
+      const _budgetOp = detectPrimaryOp(_budgetUpper);
+      const _isWrite = _budgetOp === 'INSERT' || _budgetOp === 'UPDATE' || _budgetOp === 'DELETE';
+      const _isDelete = _budgetOp === 'DELETE';
       if (_isWrite) {
         const _tnow = Date.now();
         if (_tnow - cached.writeWindowStart > _MUTATION_WINDOW_MS) {

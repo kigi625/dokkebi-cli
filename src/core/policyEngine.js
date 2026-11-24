@@ -29,6 +29,8 @@ export const POLICY_ENGINE_VERSION = 1;
  * 큰따옴표·백틱 식별자는 원형 유지 (SQLite 호환).
  * 작은따옴표 문자열은 ''(빈 문자열) 로 대체 — 토큰 카운팅에는 영향 없음.
  */
+import { detectOuterOp, outerStatement } from './sqlShape.js';
+
 export function stripStringsAndComments(sql) {
     let out = '';
     let i = 0;
@@ -93,14 +95,8 @@ export function normalizeSql(sql) {
 }
 
 export function detectPrimaryOp(upper) {
-    const head = upper.trimStart();
-    if (head.startsWith('SELECT')) return 'SELECT';
-    if (head.startsWith('INSERT')) return 'INSERT';
-    if (head.startsWith('UPDATE')) return 'UPDATE';
-    if (head.startsWith('DELETE')) return 'DELETE';
-    if (head.startsWith('WITH'))   return 'SELECT'; // CTE 최종 연산은 보통 SELECT
-    if (head.startsWith('CREATE')) return 'CREATE';
-    return null;
+    // CTE 뒤 DML(`WITH ... DELETE`)을 SELECT 로 오판하지 않도록 괄호 밖 키워드를 사용.
+    return detectOuterOp(upper).op;
 }
 
 const _RESERVED_AS_ALIAS = new Set([
@@ -145,16 +141,95 @@ export function extractTableRefs(normalized) {
  * RETURNING / UNION / ; / 끝 까지.
  * @returns {{start:number, end:number, text:string} | null}
  */
+// 괄호 밖(depth 0)의 WHERE 와 그 뒤 tail 키워드 위치를 찾는다.
+// 문자열/주석/인용 식별자를 건너뛰므로 raw SQL 에도 사용할 수 있다.
+function _scanOuterWhere(sql) {
+    let depth = 0;
+    let whereEnd = -1;
+    let tailStart = -1;
+    const n = sql.length;
+    const TAIL = new Set(['ORDER', 'GROUP', 'LIMIT', 'HAVING', 'RETURNING', 'UNION', 'INTERSECT', 'EXCEPT']);
+    for (let i = 0; i < n; i++) {
+        const ch = sql[i];
+        const nx = sql[i + 1];
+        if (ch === '-' && nx === '-') { while (i < n && sql[i] !== '\n') i++; continue; }
+        if (ch === '/' && nx === '*') { i += 2; while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i++; i++; continue; }
+        if (ch === "'") {
+            i++;
+            while (i < n) {
+                if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; }
+                if (sql[i] === "'") break;
+                i++;
+            }
+            continue;
+        }
+        if (ch === '"' || ch === '`') {
+            const q = ch; i++;
+            while (i < n) {
+                if (sql[i] === q) { if (sql[i + 1] === q) { i += 2; continue; } break; }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '(') { depth++; continue; }
+        if (ch === ')') { if (depth > 0) depth--; continue; }
+        if (depth !== 0) continue;
+        if (ch === ';') { if (tailStart < 0) tailStart = i; break; }
+        if (!/[A-Za-z_]/.test(ch)) continue;
+        let j = i;
+        while (j < n && /[A-Za-z0-9_]/.test(sql[j])) j++;
+        const word = sql.slice(i, j).toUpperCase();
+        if (whereEnd < 0) {
+            if (word === 'WHERE') whereEnd = j;
+        } else if (TAIL.has(word)) {
+            tailStart = i;
+            break;
+        }
+        i = j - 1;
+    }
+    return { whereEnd, tailStart };
+}
+
+function _countQMarksRaw(sql, offset) {
+    let count = 0;
+    let depth = 0;
+    const n = Math.min(offset, sql.length);
+    for (let i = 0; i < n; i++) {
+        const ch = sql[i];
+        const nx = sql[i + 1];
+        if (ch === '-' && nx === '-') { while (i < n && sql[i] !== '\n') i++; continue; }
+        if (ch === '/' && nx === '*') { i += 2; while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i++; i++; continue; }
+        if (ch === "'") {
+            i++;
+            while (i < n) {
+                if (sql[i] === "'" && sql[i + 1] === "'") { i += 2; continue; }
+                if (sql[i] === "'") break;
+                i++;
+            }
+            continue;
+        }
+        if (ch === '"' || ch === '`') {
+            const q = ch; i++;
+            while (i < n) {
+                if (sql[i] === q) { if (sql[i + 1] === q) { i += 2; continue; } break; }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '(') { depth++; continue; }
+        if (ch === ')') { if (depth > 0) depth--; continue; }
+        if (ch === '?' && depth >= 0) count++;
+    }
+    return count;
+}
+
 export function extractWhereClause(normalized) {
-    const re = /\bWHERE\b/i;
-    const m = re.exec(normalized);
-    if (!m) return null;
-    const start = m.index + m[0].length;
-    const remaining = normalized.slice(start);
-    const endRe = /\b(ORDER\s+BY|GROUP\s+BY|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT)\b|;/i;
-    const endMatch = endRe.exec(remaining);
-    const end = endMatch ? start + endMatch.index : normalized.length;
-    return { start, end, text: normalized.slice(start, end) };
+    // 서브쿼리 안의 WHERE 가 아니라 **바깥 문장**의 WHERE 만 사용한다.
+    // (예: UPDATE ... SET x=(SELECT ... WHERE user_id=?) WHERE id=? → 바깥 WHERE)
+    const { whereEnd, tailStart } = _scanOuterWhere(normalized);
+    if (whereEnd < 0) return null;
+    const end = tailStart >= 0 ? tailStart : normalized.length;
+    return { start: whereEnd, end, text: normalized.slice(whereEnd, end) };
 }
 
 /**
@@ -258,7 +333,9 @@ function findTenantConditionInUpper(upper, alias, col) {
         let m;
         while ((m = re.exec(upper)) !== null) {
             let depth = 0;
-            for (let i = 0; i < m.index; i++) {
+            // 매치의 첫 글자가 '(' 인 경우(패턴이 앞 문자를 소비)도 깊이에 포함해야 한다.
+            const depthEnd = m.index + (upper[m.index] === '(' ? 1 : 0);
+            for (let i = 0; i < depthEnd; i++) {
                 if (upper[i] === '(') depth++;
                 else if (upper[i] === ')') depth--;
             }
@@ -280,6 +357,10 @@ export function findTenantCondition(whereText, alias, col) {
         const subUpper = upper.slice(sp.start, sp.end);
         const { inner, relOffset } = peelWrappedConjunct(sub);
         if (!inner) continue;
+        // 괄호로 감싼 "서브쿼리" 내부의 tenant 조건은 바깥 행 필터가 아니다.
+        if (/\bSELECT\b/i.test(inner)) continue;
+        // (tenant = ? OR ...) 처럼 OR 로 느슨해진 conjunct 는 인정하지 않는다.
+        if (hasTopLevelOr(inner)) continue;
         const innerUpper = subUpper.slice(relOffset, relOffset + inner.length);
         r = findTenantConditionInUpper(innerUpper, alias, col);
         if (r) {
@@ -348,10 +429,27 @@ export function findTablePolicy(tables, name) {
  *
  * @returns {[string, unknown]} [선택된 claim 이름, 세션에서 읽은 값]
  */
+/**
+ * optional 모드에서 "모호하지 않은" 테넌트 매핑만 강제할지 판단.
+ *   - 테이블에 sessionClaim 이 명시됨 → 강제
+ *   - tenantColumn 이름 == 전역 claim 이름 → 강제 (예: sites.user_id / user_id)
+ *   - 그 외 (예: inquiries.site_id + 전역 user_id) → 매핑이 모호하므로 스킵(공개)
+ *     ※ 이 경우 테이블에 sessionClaim 을 명시해야 격리가 켜진다.
+ */
+function optionalEnforceable(tp, globalClaim) {
+    if (!tp) return false;
+    if (tp.sessionClaim) return true;
+    return String(tp.tenantColumn || '').toLowerCase() === String(globalClaim || '').toLowerCase();
+}
+
 export function _resolveTenantClaim(tenantContext, tableClaim, globalClaim, tenantCol) {
+    // sessionClaim 명시 시 그 클레임만 사용 (FK 컬럼에 user_id 가 들어가는 오매핑 방지)
+    if (tableClaim) {
+        const tv = tenantContext ? tenantContext[tableClaim] : undefined;
+        return [tableClaim, tv];
+    }
     const candidates = [];
-    if (tableClaim) candidates.push(tableClaim);
-    if (globalClaim && globalClaim !== tableClaim) candidates.push(globalClaim);
+    if (globalClaim) candidates.push(globalClaim);
     if (tenantCol && !candidates.includes(tenantCol)) candidates.push(tenantCol);
     if (candidates.length === 0) return ['user_id', undefined];
 
@@ -406,8 +504,10 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
         const tp = findTablePolicy(policy.tables, ref.name);
         if (!tp) continue; // 선언 안 된 테이블은 스킵 (defaultMode='none' 과 동일)
         const mode = tp.mode;
-        if (mode === 'none' || mode === 'optional') continue;
-        if (mode !== 'enforce' && mode !== 'inject') continue;
+        if (mode === 'none') continue;
+        // optional: 클레임이 있으면 enforce, 없으면 공개(스킵) — 문서화된 동작.
+        if (mode !== 'enforce' && mode !== 'inject' && mode !== 'optional') continue;
+        if (mode === 'optional' && !optionalEnforceable(tp, globalClaim)) continue;
 
         const tenantCol = tp.tenantColumn;
         if (!tenantCol) continue;
@@ -419,6 +519,7 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
         //      (notofly 처럼 테이블마다 다른 해시 토큰을 tenant 로 쓰는 경우 편의)
         const [claim, expected] = _resolveTenantClaim(tenantContext, tp.sessionClaim, globalClaim, tenantCol);
 
+        if (mode === 'optional' && (expected === undefined || expected === null)) continue;
         if (expected === undefined || expected === null) {
             return {
                 ok: false,
@@ -564,7 +665,8 @@ export function injectTenantPolicy(sql, params, tenantContext, policy, opts = {}
     for (const ref of refs) {
         const tp = findTablePolicy(policy.tables, ref.name);
         if (!tp) continue;
-        if ((tp.mode === 'enforce' || tp.mode === 'inject') && tp.tenantColumn) {
+        const _optionalOk = tp.mode !== 'optional' || optionalEnforceable(tp, globalClaim);
+        if ((tp.mode === 'enforce' || tp.mode === 'inject' || (tp.mode === 'optional' && _optionalOk)) && tp.tenantColumn) {
             targets.push({ ref, policy: tp });
         }
     }
@@ -591,7 +693,17 @@ export function injectTenantPolicy(sql, params, tenantContext, policy, opts = {}
 
         const normalizedCur = normalizeSql(curSql);
         const curRefs = extractTableRefs(normalizedCur);
-        const tRef = curRefs.find((r) => r.name.toLowerCase() === failingTable.toLowerCase());
+        const curOp = detectPrimaryOp(normalizedCur.toUpperCase());
+        const outerStart = detectOuterOp(normalizedCur.toUpperCase()).index;
+        const opKeyword = curOp === 'INSERT' ? 'INTO' : curOp === 'UPDATE' ? 'UPDATE' : 'FROM';
+        const candidateRefs = curRefs
+            .filter((r) => r.name.toLowerCase() === failingTable.toLowerCase())
+            .filter((r) => (outerStart < 0 ? true : r.offset >= outerStart))
+            .filter((r) => r.keyword === opKeyword || (curOp === 'SELECT' && r.keyword === 'FROM'))
+            .sort((a, b) => a.offset - b.offset);
+        const tRef = candidateRefs[0] || curRefs
+            .filter((r) => r.name.toLowerCase() === failingTable.toLowerCase())
+            .sort((a, b) => a.offset - b.offset)[0];
         if (!tRef) break;
         const tp = findTablePolicy(policy.tables, failingTable);
         if (!tp || !tp.tenantColumn) break;
@@ -608,7 +720,6 @@ export function injectTenantPolicy(sql, params, tenantContext, policy, opts = {}
             };
         }
 
-        const curOp = detectPrimaryOp(normalizedCur.toUpperCase());
         const rewrite = _rewriteOne(curSql, curParams, curOp, tRef, tenantCol, failingExpected, failingCode);
         if (!rewrite) {
             if (strict) {
@@ -712,42 +823,21 @@ function _injectWhere(sql, params, op, ref, tenantCol, expected) {
     const colExpr = (ref.alias ? ref.alias + '.' : '') + tenantCol;
     const cond = colExpr + ' = ?';
 
-    // 현재 SQL 에 WHERE 가 있는지 검사 (원문 상)
-    const whereRe = /\bWHERE\b/i;
-    const wm = whereRe.exec(sql);
+    // 바깥 문장의 WHERE 만 대상으로 한다 (서브쿼리 WHERE 오삽입 방지).
+    const { whereEnd, tailStart } = _scanOuterWhere(sql);
+    const insertAt = tailStart >= 0 ? tailStart : sql.length;
     let newSql;
-
-    if (wm) {
-        // 기존 WHERE 뒤에 AND 로 부착. ORDER BY / GROUP BY / LIMIT 등의 앞에 삽입.
-        const after = sql.slice(wm.index + wm[0].length);
-        const tailRe = /\b(ORDER\s+BY|GROUP\s+BY|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT)\b|;/i;
-        const tm = tailRe.exec(after);
-        const insertAtRel = tm ? tm.index : after.length;
-        const insertAtAbs = wm.index + wm[0].length + insertAtRel;
-        // 기존 WHERE 문 뒤에 ' AND (cond) ' 삽입 (괄호로 보호)
-        newSql = sql.slice(0, insertAtAbs).trimEnd() + ' AND (' + cond + ') ' + sql.slice(insertAtAbs).trimStart();
-        // 깔끔하게: 단순 공백 정리
-        newSql = newSql.replace(/\s+/g, ' ');
+    if (whereEnd >= 0) {
+        newSql = sql.slice(0, insertAt).trimEnd() + ' AND (' + cond + ') ' + sql.slice(insertAt).trimStart();
     } else {
-        // WHERE 없음 → 추가. ORDER BY/GROUP BY/LIMIT 앞에 삽입.
-        // SELECT ... FROM ... [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT ...]
-        // UPDATE t SET ... [WHERE ...]
-        // DELETE FROM t [WHERE ...]
-        const tailRe = /\b(ORDER\s+BY|GROUP\s+BY|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT)\b|;\s*$/i;
-        const tm = tailRe.exec(sql);
-        const insertAt = tm ? tm.index : sql.length;
         newSql = sql.slice(0, insertAt).trimEnd() + ' WHERE ' + cond + ' ' + sql.slice(insertAt).trimStart();
-        newSql = newSql.replace(/\s+/g, ' ');
     }
+    newSql = newSql.replace(/\s+/g, ' ');
 
-    // params 처리:
-    //   SELECT/DELETE/UPDATE 모두 WHERE 의 ? 는 기존 ? 뒤 (또는 기존 WHERE 끝) 에 오게 됨.
-    //   하지만 "AND (cond)" 를 삽입한 위치 기준으로 paramIdx 를 계산해야 정확.
-    //   새 SQL 에서 주입된 '?' 위치 = newSql 중 cond 의 '?' 위치.
-    //   그 위치 이전 '?' 개수가 삽입 인덱스.
     const markerIdx = _findInjectedQMarkIndex(newSql, cond);
     if (markerIdx < 0) return null;
-    const beforeCount = countQMarksBefore(newSql, markerIdx);
+    // 문자열/주석 내부 '?' 는 제외하고 센다.
+    const beforeCount = _countQMarksRaw(newSql, markerIdx);
     const newParams = params.slice();
     newParams.splice(beforeCount, 0, expected);
     return { sql: newSql, params: newParams };
@@ -780,16 +870,24 @@ function _findInjectedQMarkIndex(newSql, cond) {
 
 /**
  * dokkebi.config.js 의 policy 섹션을 allowlist v2 에 병합할 수 있는 형태로 정규화.
+ *
  * @param {object | undefined} configPolicy
- * @returns {{ enabled: boolean, mode: 'off'|'verify'|'inject', claim: string, strict: boolean, tables: Record<string, {tenantColumn?: string, mode: string}> } | null}
+ * @param {{ authorizationEnabled?: boolean, authLoginEnabled?: boolean }} [opts]
+ *   - requireJwtTenant 미지정 시: authorization/auth.login 이 켜져 있으면 JWT 전용
+ *     (worker 측 로그인·JWT 로 서버가 신분을 아는 구성에서 세션 tenant 위조를 막는다)
+ * @returns {{ enabled: boolean, mode: 'off'|'verify'|'inject', claim: string, strict: boolean, requireJwtTenant: boolean, tables: Record<string, {tenantColumn?: string, mode: string}> } | null}
  */
-export function normalizePolicyConfig(configPolicy) {
+export function normalizePolicyConfig(configPolicy, opts = {}) {
     if (!configPolicy || configPolicy.enabled === false) {
-        return { enabled: false, mode: 'off', claim: 'user_id', strict: true, tables: {} };
+        return { enabled: false, mode: 'off', claim: 'user_id', strict: true, requireJwtTenant: false, tables: {} };
     }
     const mode = (configPolicy.mode || 'verify').toLowerCase();
     const claim = configPolicy.sessionClaim || configPolicy.claim || 'user_id';
     const strict = configPolicy.strict !== false;
+    // JWT 전용 테넌트: 명시값 우선, 없으면 JWT 기반 인증이 구성돼 있을 때 자동 적용.
+    const requireJwtTenant = configPolicy.requireJwtTenant === undefined
+        ? !!(opts.authorizationEnabled || opts.authLoginEnabled)
+        : configPolicy.requireJwtTenant === true;
     const tables = {};
     const rawTables = configPolicy.tables || {};
     for (const [tname, tcfg] of Object.entries(rawTables)) {
@@ -803,5 +901,5 @@ export function normalizePolicyConfig(configPolicy) {
             sessionClaim: tcfg.sessionClaim || undefined,
         };
     }
-    return { enabled: true, mode, claim, strict, tables };
+    return { enabled: true, mode, claim, strict, requireJwtTenant, tables };
 }

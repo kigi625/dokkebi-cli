@@ -111,6 +111,16 @@ function randHex(n: number) {
   const arr = new Uint8Array(n); crypto.getRandomValues(arr);
   return Array.from(arr).map(b => b.toString(16).padStart(2,'0')).join('');
 }
+function _ctEqual(a: string, b: string): boolean {
+  // 길이가 달라도 끝까지 비교해 타이밍 차이를 줄인다 (best-effort constant time).
+  const ae = new TextEncoder().encode(String(a ?? ''));
+  const be = new TextEncoder().encode(String(b ?? ''));
+  let diff = ae.length ^ be.length;
+  const n = Math.max(ae.length, be.length);
+  for (let i = 0; i < n; i++) diff |= (ae[i] ?? 0) ^ (be[i] ?? 0);
+  return diff === 0;
+}
+
 async function hmacHex(key: string, msg: string) {
   const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(key),
     {name:'HMAC',hash:'SHA-256'}, false, ['sign']);
@@ -131,7 +141,7 @@ async function verifyToken(token: string, password: string): Promise<boolean> {
   const sig = token.slice(lastDot + 1);
   if (!payload || !sig) return false;
   const expected = await hmacHex(password+':admin:token', payload);
-  if (sig !== expected) return false;
+  if (!_ctEqual(sig, expected)) return false;
   const exp = parseInt(payload.split(':')[0], 10);
   return !isNaN(exp) && Date.now() < exp;
 }
@@ -183,7 +193,7 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     const ip = _authIp(request);
     if (!_authAllow(ip)) return json({error:'요청이 너무 많습니다. 잠시 후 다시 시도하세요.'}, 429);
     const body = await request.json<any>().catch(() => ({} as Record<string,unknown>));
-    if (!body?.password || body.password !== adminPassword) {
+    if (!body?.password || !_ctEqual(String(body.password), adminPassword)) {
       _authFail(ip);
       return json({error:'비밀번호가 올바르지 않습니다.'}, 401);
     }

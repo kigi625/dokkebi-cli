@@ -353,6 +353,7 @@ export default {
   // policy: {
   //   enabled: true,
   //   mode: 'inject',                        // 'verify' | 'inject' | 'off'
+  //   requireJwtTenant: true,                // 테넌트는 검증된 JWT 에서만 (기본: authorization/auth.login 활성 시 ON)
   //   tables: {
   //     posts: { tenantColumn: 'user_id', sessionClaim: 'user_id' },
   //   },
@@ -449,11 +450,14 @@ dok build --skip-migration   # 빌드만
 
 ```typescript
 // backend/controllers/foo.controller.ts
-const apiKey = process.env.STRIPE_SECRET_KEY;  // 빌드 타임에 치환됨
+const apiKey = process.env.STRIPE_SECRET_KEY;  // → __dokkebi_env__("…") — 브라우저로 전달되지 않음 (worker/api 로 이동)
 ```
 
 이름에 `SECRET / KEY / TOKEN / PASSWORD / PRIVATE / CREDENTIAL` 이 포함된 변수는
-**자동으로 Opaque Handle 보호** (번들에 평문 미포함, 핸드셰이크로 암호화 전달).
+**브라우저로 전달되지 않습니다** (번들에는 `__dokkebi_env__("KEY")` 호출만 들어가고, 핸드셰이크로는
+번들 복호화 키만 전달). 백엔드 WASM 에서 이 값은 런타임에 `''` 이며, 백엔드가 직접 읽으면
+`dok deploy` 및 `security.level: 'strict'` 빌드가 **실패**합니다. 외부 API 키·서버 전용 Secret 은
+`worker/api/**` 로 옮겨 HTTP 로 호출하세요. (`DOKKEBI_ALLOW_WASM_SECRETS=true` 는 명시적·비권장 예외)
 
 ### 4.4 인증 (로그인/세션)
 
@@ -542,6 +546,16 @@ router.post('/api/ai/image', async (ctx) => {
 });
 ```
 
+> 자동 guard 는 **브라우저 번들**에서 돌기 때문에 패치될 수 있다. 실제 작업을 수행하는
+> Worker 라우트에서 토큰을 다시 검증해야 한다:
+> ```ts
+> // worker/api/ai/image.ts
+> import { verifyCapability } from '../_dokkebi/capability.js';
+> const cap = await verifyCapability(ctx.request, ctx.env, 'image.generate', { stateHash });
+> if (!cap.ok) return new Response(JSON.stringify({ code: cap.code }), { status: 403 });
+> ```
+> `worker/api/_dokkebi/capability.ts` 는 `dok build` 가 생성한다 (`SECURITY.md` §3.5).
+
 state binding 이 더 필요하면 수동 API 를 추가로 사용한다.
 
 ```typescript
@@ -616,8 +630,10 @@ DOKKEBI_PANEL_ALLOWED_IPS=203.0.113.10,198.51.100.0/24
 
 ### ❌ `process.env.SECRET_*` 평문 노출
 
-도깨비는 자동으로 Opaque Handle 처리한다. 단, **클라이언트 코드 (`frontend/`) 에서는
-사용 금지**. `frontend/` 는 일반 브라우저 환경이므로 `import.meta.env.VITE_*` 만 사용.
+도깨비는 Secret 을 브라우저로 전달하지 않는다(핸드셰이크는 번들 키만). 백엔드에서
+`process.env.SECRET_*` 를 읽으면 런타임 값은 `''` 이고, 배포/ strict 빌드는 실패한다.
+**클라이언트 코드 (`frontend/`) 에서도 사용 금지** — `frontend/` 는 일반 브라우저 환경이므로
+`import.meta.env.VITE_*` 만 사용.
 
 ### ❌ `dist/` 또는 `functions/` 에 직접 작성
 
