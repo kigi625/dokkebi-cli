@@ -1768,6 +1768,56 @@ function _pe_peelWrappedConjunct(sub: string): { inner: string; relOffset: numbe
   }
   return { inner: s, relOffset: rel };
 }
+function _pe_hasNonPositionalParameters(sql: string): boolean {
+  const masked = _pe_maskQuotedNonIdentifiers(_pe_stripStringsAndComments(sql));
+  let plain = '';
+  for (let i = 0; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch === "'") {
+      i++;
+      while (i < masked.length) {
+        if (masked[i] === "'" && masked[i + 1] === "'") { i += 2; continue; }
+        if (masked[i] === "'") break;
+        i++;
+      }
+      plain += ' ';
+      continue;
+    }
+    if (ch === '-' && masked[i + 1] === '-') { while (i < masked.length && masked[i] !== '\n') i++; plain += ' '; continue; }
+    if (ch === '/' && masked[i + 1] === '*') { i += 2; while (i < masked.length && !(masked[i] === '*' && masked[i + 1] === '/')) i++; i++; plain += ' '; continue; }
+    plain += ch;
+  }
+  if (/\?\d/.test(plain)) return true;
+  if (/(^|[^A-Za-z0-9_$])(?::|@|\$)[A-Za-z_][A-Za-z0-9_]*/.test(plain)) return true;
+  return false;
+}
+
+function _pe_tenantCondIsPositive(upper: string, start: number, end: number): boolean {
+  const before = upper.slice(0, start);
+  const bm = /([A-Z_]+)\s*$/.exec(before);
+  if (bm && (bm[1] === 'NOT' || bm[1] === 'WHEN' || bm[1] === 'THEN' || bm[1] === 'ELSE')) return false;
+
+  let i = end;
+  while (i < upper.length && /\s/.test(upper[i])) i++;
+  if (i >= upper.length) return true;
+  const rest = upper.slice(i);
+
+  if (/^COLLATE\b/.test(rest)) {
+    const cm = /^COLLATE\s+(?:"[^"]*"|`[^`]*`|\[[^\]]*\]|[A-Za-z_]\w*)\s*/.exec(rest);
+    if (!cm) return false;
+    const after = rest.slice(cm[0].length).trimStart();
+    if (!after) return true;
+    if (/^[=<>!|&+\-*/%]/.test(after)) return false;
+    if (/^(?:IS|NOT|IN|LIKE|GLOB|MATCH|REGEXP|BETWEEN|THEN|ELSE|END|OR|ESCAPE|ISNULL|NOTNULL)\b/.test(after)) return false;
+    return /^(?:AND\b|\)|;|(?:ORDER|GROUP|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT|WINDOW)\b)/.test(after);
+  }
+
+  if (/^[=<>!|&+\-*/%]/.test(rest)) return false;
+  if (/^(?:IS|NOT|IN|LIKE|GLOB|MATCH|REGEXP|BETWEEN|THEN|ELSE|END|OR|ESCAPE|ISNULL|NOTNULL)\b/.test(rest)) return false;
+
+  return /^(?:AND\b|\)|;|(?:ORDER|GROUP|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT|WINDOW)\b)/.test(rest);
+}
+
 function _pe_findTenantCondInUpper(upper: string, alias: string | null, col: string, tableName: string | null = null, requireQualified = false): { index: number; length: number; qIndex: number } | null {
   const colUp = col.toUpperCase();
   const aliasUp = alias ? alias.toUpperCase() : null;
@@ -1798,6 +1848,7 @@ function _pe_findTenantCondInUpper(upper: string, alias: string | null, col: str
         else if (upper[i] === ')') depth--;
       }
       if (depth !== 0) continue;
+      if (!_pe_tenantCondIsPositive(upper, m.index, m.index + m[0].length)) continue;
       const qRel = m[0].lastIndexOf('?');
       return { index: m.index, length: m[0].length, qIndex: m.index + qRel };
     }
@@ -2142,6 +2193,9 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
   const globalClaim = policy.claim || 'user_id';
   if (tenantContext && tenantContext._isAdmin === true) return { ok: true };
   const normalized = _pe_normalize(sql);
+  if (_pe_hasNonPositionalParameters(normalized)) {
+    return { ok: false, code: 'NON_POSITIONAL_PARAM', reason: '위치 기반(?) 이외의 파라미터 표기는 허용되지 않습니다.' };
+  }
   const upper = normalized.toUpperCase();
   const op = _pe_detectOp(upper);
   if (!op) return strict ? { ok: false, code: 'UNPARSEABLE', reason: 'SQL 연산을 파싱할 수 없습니다.' } : { ok: true };
@@ -2330,6 +2384,9 @@ function injectTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
   if (!policy || !policy.tables || Object.keys(policy.tables).length === 0) return { ok: true, sql, params, injected: false };
   const strict = opts.strict ?? (policy.strict !== false);
   if (tenantContext && tenantContext._isAdmin === true) return { ok: true, sql, params, injected: false };
+  if (_pe_hasNonPositionalParameters(_pe_normalize(sql))) {
+    return { ok: false, code: 'NON_POSITIONAL_PARAM', reason: '위치 기반(?) 이외의 파라미터 표기는 허용되지 않습니다.' };
+  }
   const pre = verifyTenantPolicy(sql, params, tenantContext, policy, { strict: false });
   if (pre.ok) return { ok: true, sql, params, injected: false };
   const globalClaim = policy.claim || 'user_id';
@@ -2417,6 +2474,10 @@ function validateSqlAllowlist(sql: string, opts: { strict?: boolean } = {}): { a
 
   const normalized = stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
   const upper = normalized.toUpperCase();
+
+  if (_pe_hasNonPositionalParameters(normalized)) {
+    return { allowed: false, reason: '위치 기반(?) 이외의 파라미터 표기는 허용되지 않습니다.' };
+  }
 
   if (hasMultipleStatements(normalized)) {
     return { allowed: false, reason: '다중 SQL 문장은 허용되지 않습니다.' };

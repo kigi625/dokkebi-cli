@@ -13,7 +13,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { detectOuterOp, outerStatement, detectPrimaryTableOf, extractTableRefs } from './sqlShape.js';
+import { detectOuterOp, outerStatement, detectPrimaryTableOf, extractTableRefs, hasNonPositionalParameters } from './sqlShape.js';
 
 // ─────────────────────────────────────────────────────────────
 // 내부 시스템 테이블 접근 차단
@@ -582,6 +582,12 @@ export function validateSqlAllowlist(sql, allowlist, opts = {}) {
     // 1) 문자열/주석 제거 → 토큰 분석용 정규화 (항상 수행)
     const normalized = stripStringsAndComments(sql).replace(/\s+/g, ' ').trim();
     const upper = normalized.toUpperCase();
+
+    // 1-b) 위치 기반(?) 이외의 파라미터 표기 차단 (항상 수행)
+    //      `?2` 는 정책 엔진의 파라미터 인덱스 계산을 어긋나게 한다.
+    if (hasNonPositionalParameters(normalized)) {
+        return { allowed: false, reason: '위치 기반(?) 이외의 파라미터 표기는 허용되지 않습니다.' };
+    }
 
     // 2) 다중 문장 차단 (항상 수행)
     if (hasMultipleStatements(normalized)) {

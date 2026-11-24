@@ -24,6 +24,7 @@ import {
     normalizePolicyConfig,
     _resolveTenantClaim,
 } from '../src/core/policyEngine.js';
+import { validateSqlAllowlist } from '../src/core/sqlAllowlist.js';
 
 // ─────────────────────────────────────────────────────────────
 // 1. extractTableDefinitions — 모델 DSL 파싱
@@ -606,4 +607,58 @@ test('verifyTenantPolicy: 따옴표 내부 ? 로 placeholder 인덱스를 흔들
     const fake = verifyTenantPolicy('SELECT * FROM posts WHERE "posts.user_id = ?" = ?', ['u1', 'u1'], ctx, policy);
     assert.equal(fake.ok, false);
     assert.equal(fake.code, 'NO_TENANT_FILTER');
+});
+
+test('verifyTenantPolicy: 위치 기반(?) 외 파라미터 표기를 거부', () => {
+    const policy = normalizePolicyConfig({
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    });
+    const ctx = { user_id: 'u1' };
+    const allow = { tables: [{ name: 'posts', ops: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] }] };
+
+    // ?2 는 SQLite 에서 params[1] 에 바인딩되어 검증 인덱스를 흔들 수 있었다.
+    const bad = verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ?2', ['u1', 'victim'], ctx, policy);
+    assert.equal(bad.ok, false);
+    assert.equal(bad.code, 'NON_POSITIONAL_PARAM');
+
+    for (const sql of [
+        'SELECT * FROM posts WHERE user_id = :uid',
+        'SELECT * FROM posts WHERE user_id = @uid',
+        'SELECT * FROM posts WHERE user_id = $uid',
+    ]) {
+        assert.equal(verifyTenantPolicy(sql, ['u1'], ctx, policy).code, 'NON_POSITIONAL_PARAM', sql);
+    }
+
+    const allowed = validateSqlAllowlist('SELECT * FROM posts WHERE user_id = ?2', allow);
+    assert.equal(allowed.allowed, false);
+
+    // 문자열/식별자 안의 ?2, :name 등은 오탐하지 않는다.
+    assert.equal(validateSqlAllowlist('SELECT * FROM posts WHERE title = ? AND "a:b" = ?', allow).allowed, true);
+});
+
+test('verifyTenantPolicy: 부정/추가 비교가 붙은 테넌트 조건은 인정하지 않음', () => {
+    const policy = normalizePolicyConfig({
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    });
+    const ctx = { user_id: 'u1' };
+
+    for (const sql of [
+        'SELECT * FROM posts WHERE NOT user_id = ?',
+        'SELECT * FROM posts WHERE user_id = ? IS NOT TRUE',
+        'SELECT * FROM posts WHERE user_id = ? = 0',
+        'SELECT * FROM posts WHERE CASE WHEN user_id = ? THEN 1 END',
+        'SELECT * FROM posts WHERE user_id = ? IS NULL',
+        'SELECT * FROM posts WHERE user_id = ? OR 1=1',
+    ]) {
+        const r = verifyTenantPolicy(sql, ['u1'], ctx, policy);
+        assert.equal(r.ok, false, sql);
+        assert.ok(r.code === 'NO_TENANT_FILTER' || r.code === 'LOOSE_OR', sql + ' → ' + r.code);
+    }
+
+    // 정상 조건과 COLLATE 는 계속 허용
+    assert.equal(verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ?', ['u1'], ctx, policy).ok, true);
+    assert.equal(verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ? COLLATE NOCASE', ['u1'], ctx, policy).ok, true);
+    assert.equal(verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ? COLLATE NOCASE AND title = ?', ['u1', 'x'], ctx, policy).ok, true);
 });

@@ -29,7 +29,7 @@ export const POLICY_ENGINE_VERSION = 1;
  * 큰따옴표·백틱 식별자는 원형 유지 (SQLite 호환).
  * 작은따옴표 문자열은 ''(빈 문자열) 로 대체 — 토큰 카운팅에는 영향 없음.
  */
-import { detectOuterOp, outerStatement, extractTableRefs as extractTableRefsRobust, maskQuotedNonIdentifiers } from './sqlShape.js';
+import { detectOuterOp, outerStatement, extractTableRefs as extractTableRefsRobust, maskQuotedNonIdentifiers, hasNonPositionalParameters } from './sqlShape.js';
 
 export function stripStringsAndComments(sql) {
     let out = '';
@@ -305,6 +305,35 @@ function peelWrappedConjunct(sub) {
  * @returns {{ index: number, length: number, qIndex: number } | null}
  *   qIndex: whereText 내에서 '?' 가 위치한 문자 인덱스
  */
+function _tenantCondIsPositive(upper, start, end) {
+    // 앞 토큰이 NOT/WHEN/THEN/ELSE 이면 "참" 조건이 아니다.
+    const before = upper.slice(0, start);
+    const bm = /([A-Z_]+)\s*$/.exec(before);
+    if (bm && (bm[1] === 'NOT' || bm[1] === 'WHEN' || bm[1] === 'THEN' || bm[1] === 'ELSE')) return false;
+
+    let i = end;
+    while (i < upper.length && /\s/.test(upper[i])) i++;
+    if (i >= upper.length) return true;
+    const rest = upper.slice(i);
+
+    // 콜레이션은 비교 연산의 일부이므로 건너뛴 뒤 다시 판정한다.
+    if (/^COLLATE\b/.test(rest)) {
+        const cm = /^COLLATE\s+(?:"[^"]*"|`[^`]*`|\[[^\]]*\]|[A-Za-z_]\w*)\s*/.exec(rest);
+        if (!cm) return false;
+        const after = rest.slice(cm[0].length).trimStart();
+        if (!after) return true;
+        if (/^[=<>!|&+\-*/%]/.test(after)) return false;
+        if (/^(?:IS|NOT|IN|LIKE|GLOB|MATCH|REGEXP|BETWEEN|THEN|ELSE|END|OR|ESCAPE|ISNULL|NOTNULL)\b/.test(after)) return false;
+        return /^(?:AND\b|\)|;|(?:ORDER|GROUP|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT|WINDOW)\b)/.test(after);
+    }
+
+    // `user_id = ? = 0`, `... IS NOT TRUE`, `... NOT NULL` 등은 필터를 무력화한다.
+    if (/^[=<>!|&+\-*/%]/.test(rest)) return false;
+    if (/^(?:IS|NOT|IN|LIKE|GLOB|MATCH|REGEXP|BETWEEN|THEN|ELSE|END|OR|ESCAPE|ISNULL|NOTNULL)\b/.test(rest)) return false;
+
+    return /^(?:AND\b|\)|;|(?:ORDER|GROUP|LIMIT|HAVING|RETURNING|UNION|INTERSECT|EXCEPT|WINDOW)\b)/.test(rest);
+}
+
 function findTenantConditionInUpper(upper, alias, col, tableName = null, requireQualified = false) {
     const colUp = col.toUpperCase();
     const aliasUp = alias ? alias.toUpperCase() : null;
@@ -340,6 +369,7 @@ function findTenantConditionInUpper(upper, alias, col, tableName = null, require
                 else if (upper[i] === ')') depth--;
             }
             if (depth !== 0) continue;
+            if (!_tenantCondIsPositive(upper, m.index, m.index + m[0].length)) continue;
             const qRel = m[0].lastIndexOf('?');
             const qIdx = m.index + qRel;
             return { index: m.index, length: m[0].length, qIndex: qIdx };
@@ -801,6 +831,9 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
     if (tenantContext && tenantContext._isAdmin === true) return { ok: true };
 
     const normalized = normalizeSql(sql);
+    if (hasNonPositionalParameters(normalized)) {
+        return { ok: false, code: 'NON_POSITIONAL_PARAM', reason: '위치 기반(?) 이외의 파라미터 표기는 허용되지 않습니다.' };
+    }
     const upper = normalized.toUpperCase();
     const op = detectPrimaryOp(upper);
 
@@ -1036,6 +1069,11 @@ export function injectTenantPolicy(sql, params, tenantContext, policy, opts = {}
 
     if (tenantContext && tenantContext._isAdmin === true) {
         return { ok: true, sql, params, injected: false };
+    }
+
+    // 번호/이름 기반 파라미터는 인덱스 계산을 어긋나게 하므로 주입 대상에서 제외.
+    if (hasNonPositionalParameters(normalizeSql(sql))) {
+        return { ok: false, code: 'NON_POSITIONAL_PARAM', reason: '위치 기반(?) 이외의 파라미터 표기는 허용되지 않습니다.' };
     }
 
     // 일단 verify 시도 — 이미 안전하면 건드리지 않음

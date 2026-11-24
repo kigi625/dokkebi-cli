@@ -375,3 +375,41 @@ test('워커 템플릿: UNION/INTERSECT/EXCEPT 브랜치별 테넌트 필터 검
     assert.equal(nested.ok, false);
     assert.equal(nested.code, 'COMPOUND_SELECT_UNSUPPORTED');
 });
+
+test('워커 템플릿: 위치 기반 외 파라미터(?2/:name) 거부', () => {
+    const p = {
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    };
+    const ctx = { user_id: 'u1' };
+
+    const bad = worker.verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ?2', ['u1', 'victim'], ctx, p);
+    assert.equal(bad.ok, false);
+    assert.equal(bad.code, 'NON_POSITIONAL_PARAM');
+
+    const allow = worker.validateSqlAllowlist('SELECT * FROM posts WHERE user_id = :uid', ALLOWLIST);
+    assert.equal(allow.allowed, false);
+});
+
+test('워커 템플릿: 부정/추가 비교 테넌트 조건 거부', () => {
+    const p = {
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    };
+    const ctx = { user_id: 'u1' };
+
+    for (const sql of [
+        'SELECT * FROM posts WHERE NOT user_id = ?',
+        'SELECT * FROM posts WHERE user_id = ? IS NOT TRUE',
+        'SELECT * FROM posts WHERE user_id = ? = 0',
+        'SELECT * FROM posts WHERE CASE WHEN user_id = ? THEN 1 END',
+        'SELECT * FROM posts WHERE user_id = ? OR 1=1',
+    ]) {
+        const r = worker.verifyTenantPolicy(sql, ['u1'], ctx, p);
+        assert.equal(r.ok, false, sql);
+        assert.ok(r.code === 'NO_TENANT_FILTER' || r.code === 'LOOSE_OR', sql + ' → ' + r.code);
+    }
+
+    assert.equal(worker.verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ?', ['u1'], ctx, p).ok, true);
+    assert.equal(worker.verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ? COLLATE NOCASE', ['u1'], ctx, p).ok, true);
+});

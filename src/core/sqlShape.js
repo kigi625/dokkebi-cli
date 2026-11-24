@@ -152,6 +152,52 @@ export function maskQuotedNonIdentifiers(text) {
     return out;
 }
 
+/**
+ * 위치 기반(`?`) 이외의 파라미터 표기를 감지한다.
+ *
+ * SQLite 는 `?NNN`, `:name`, `@name`, `$name` 을 지원하는데, `?NNN` 의 경우
+ * 정책 엔진이 `?` 개수로 파라미터 인덱스를 계산하면 실제 바인딩과 어긋난다.
+ * (예: `user_id = ?2` 가 `params[1]` 을 참조) → 혼동을 원천 차단한다.
+ *
+ * 따옴표 문자열/식별자와 주석 내부는 제외한다.
+ *
+ * @param {string} sql
+ * @returns {boolean}
+ */
+export function hasNonPositionalParameters(sql) {
+    const masked = maskQuotedNonIdentifiers(String(sql || ''));
+    let plain = '';
+    for (let i = 0; i < masked.length; i++) {
+        const ch = masked[i];
+        if (ch === "'") {
+            i++;
+            while (i < masked.length) {
+                if (masked[i] === "'" && masked[i + 1] === "'") { i += 2; continue; }
+                if (masked[i] === "'") break;
+                i++;
+            }
+            plain += ' ';
+            continue;
+        }
+        if (ch === '-' && masked[i + 1] === '-') {
+            while (i < masked.length && masked[i] !== '\n') i++;
+            plain += ' ';
+            continue;
+        }
+        if (ch === '/' && masked[i + 1] === '*') {
+            i += 2;
+            while (i < masked.length && !(masked[i] === '*' && masked[i + 1] === '/')) i++;
+            i++;
+            plain += ' ';
+            continue;
+        }
+        plain += ch;
+    }
+    if (/\?\d/.test(plain)) return true;
+    if (/(^|[^A-Za-z0-9_$])(?::|@|\$)[A-Za-z_][A-Za-z0-9_]*/.test(plain)) return true;
+    return false;
+}
+
 export function extractTableRefs(normalized) {
     const s = String(normalized || '');
     const n = s.length;
