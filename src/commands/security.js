@@ -10,6 +10,7 @@ import {
 import { normalizePolicyConfig } from '../core/policyEngine.js';
 import { normalizeAuthorizationConfig } from '../core/authorizationPolicy.js';
 import { runSecurityInteractive } from './securityInteractive.js';
+import { collectSecurityAudit, formatSecurityAudit } from '../core/securityAudit.js';
 import { isBundleEncryptEnabled } from '../core/buildWasm.js';
 import { t } from '../i18n/index.js';
 
@@ -103,14 +104,36 @@ export async function runSecurityStatus(src = '.') {
 }
 
 /**
+ * 읽기 전용 보안 감사 (dok security --audit)
  * @param {string} src
- * @param {{ status?: boolean, interactive?: boolean }} [options]
+ * @param {{ json?: boolean }} [options]
+ */
+export async function runSecurityAudit(src = '.', options = {}) {
+    const sourceRoot = path.resolve(process.cwd(), src);
+    const report = await collectSecurityAudit(sourceRoot);
+    if (options.json === true) {
+        console.log(JSON.stringify(report, null, 2));
+    } else {
+        console.log(formatSecurityAudit(report));
+    }
+    // CI 에서 사용할 수 있도록 error 가 있으면 실패 코드.
+    if (report.counts.error > 0) process.exitCode = 1;
+}
+
+/**
+ * @param {string} src
+ * @param {{ status?: boolean, interactive?: boolean, audit?: boolean, json?: boolean }} [options]
  */
 export async function runSecurity(src = '.', options = {}) {
     const sourceRoot = path.resolve(process.cwd(), src);
     const forceStatus = options.status === true;
     const forceInteractive = options.interactive === true;
     const tty = process.stdin.isTTY === true;
+
+    if (options.audit === true) {
+        await runSecurityAudit(sourceRoot, { json: options.json === true });
+        return;
+    }
 
     if (forceInteractive) {
         await runSecurityInteractive(sourceRoot);

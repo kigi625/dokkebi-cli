@@ -334,12 +334,13 @@ export default {
   // 보안 — 가장 중요한 섹션
   // ═══════════════════════════════════════════════════════════
   security: {
-    // 한 줄 보안 프리셋. 'basic' | 'standard' | 'strict' 중 선택.
-    //   'basic'    — 추가 강제 없음. 기존 호환 모드.
-    //   'standard' — Tenant Policy verify, Authorization warn, 자동 추론.
-    //                → 일반 앱에 권장 (기본값으로 사용 권장)
-    //   'strict'   — Tenant Policy inject, Authorization strict,
-    //                queryRegistry strict. → 유료/금융/admin 앱.
+    // 한 줄 하드닝 프리셋 (운영 권장):
+    //   strict + Strict CSP + 패널 IP 가드 + ADL enforce 를 한 번에 켠다.
+    //   필수 시크릿/설정이 없으면 빌드·배포가 실패한다.
+    preset: 'production',
+
+    // 또는 레벨을 직접 선택. 'basic' | 'standard' | 'strict'.
+    //   'strict' — Tenant Policy inject, Authorization strict, queryRegistry strict.
     level: 'strict',
 
     strictCsp: false,

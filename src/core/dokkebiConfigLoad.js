@@ -138,19 +138,22 @@ export async function loadDokkebiConfigMerged(sourceRoot, opts = {}) {
 export function applySecurityPreset(rawConfig, opts = {}) {
     const quiet = opts.quiet === true;
     const config = { ...(rawConfig || {}) };
-    const level = String(config?.security?.level || '').toLowerCase();
+    const secIn = config.security && typeof config.security === 'object' ? config.security : {};
+    const preset = String(secIn.preset || '').toLowerCase();
+    const levelRaw = String(secIn.level || '').toLowerCase();
+    // preset: 'production' 은 level 미지정 시 strict 를 기본값으로 사용한다.
+    const level = levelRaw || (preset === 'production' ? 'strict' : '');
 
-    // 미지정 시 동작은 변경하지 않음(기존 프로젝트 호환). 베이스라인은 `security.level` 로 opt-in.
-    if (!level) return config;
-
-    if (level === 'basic') {
-        if (!quiet) console.log('[dokkebi] 🔓 보안 레벨: basic — 추가 강제 없음 (legacy 호환 모드)');
-        return config;
+    if (preset && preset !== 'production') {
+        if (!quiet) console.warn(`[dokkebi] ⚠ 알 수 없는 security.preset "${preset}" — 무시됨 (production)`);
     }
+    if (!level) return config;
 
     const out = { ...config };
 
-    if (level === 'standard') {
+    if (level === 'basic') {
+        if (!quiet) console.log('[dokkebi] 🔓 보안 레벨: basic — 추가 강제 없음 (legacy 호환 모드)');
+    } else if (level === 'standard') {
         if (!quiet) console.log('[dokkebi] 🔒 보안 레벨: standard — Tenant Policy verify + Authorization warn + 자동 추론 적용');
         out.queryRegistry = {
             enabled: true,
@@ -191,6 +194,22 @@ export function applySecurityPreset(rawConfig, opts = {}) {
     } else {
         if (!quiet) console.warn(`[dokkebi] ⚠ 알 수 없는 security.level "${level}" — 무시됨 (basic | standard | strict 중 하나여야 함)`);
         return config;
+    }
+
+    if (preset === 'production') {
+        const sec = { ...secIn };
+        // 파생 level 을 실제 config 에 반영해 build/deploy 의 strict 검사가 동작하게 한다.
+        if (!levelRaw) sec.level = level;
+        if (sec.strictCsp === undefined) sec.strictCsp = true;
+        if (sec.panelIpGuard === undefined) sec.panelIpGuard = true;
+        sec.activeDefense = { enabled: true, mode: 'enforce', ...(sec.activeDefense || {}) };
+        // capabilities 는 feature 선언이 있을 때만 자동 활성 (secret 없는 빈 활성화 방지)
+        const cap = sec.capabilities && typeof sec.capabilities === 'object' ? sec.capabilities : null;
+        if (cap && cap.features && Object.keys(cap.features).length > 0 && cap.enabled === undefined) {
+            sec.capabilities = { ...cap, enabled: true };
+        }
+        out.security = sec;
+        if (!quiet) console.log('[dokkebi] 🛡 보안 프리셋: production — strict + Strict CSP + 패널 IP 가드 + ADL enforce');
     }
 
     return out;

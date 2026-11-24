@@ -444,6 +444,28 @@ export default {
 | `SESSION_INVALID` | Session expired or missing | ✅ re-handshake |
 | `REQUEST_MALFORMED` | Required field missing | ❌ code bug |
 
+### 3.8 One-line production preset & audit
+
+```js
+// dokkebi.config.js
+security: { preset: 'production' }
+```
+
+Enables, in one line:
+
+- `level: 'strict'` — Tenant inject, Authorization strict, Query Registry strict, `requireJwtTenant`
+- `strictCsp: true`, `panelIpGuard: true`, `activeDefense: { enabled: true, mode: 'enforce' }`
+- `capabilities` only when `security.capabilities.features` is declared (then the secret is required)
+
+Build/deploy **fails** when a required value is missing: JWT secret (authorization on), panel IP
+list (panelIpGuard on), CORS `allowedOrigins` empty/`*`, or authorization mode not `strict`.
+Explicit user values always override the preset.
+
+`dok security --audit` performs a **read-only** audit (no build/deploy): missing secrets,
+policy/authz gaps, ambiguous tenant mappings, CORS/CSP/panel settings, `.gitignore` coverage,
+and stale worker templates. It exits `1` on errors (CI-friendly); `--json` prints machine-readable
+output.
+
 ---
 
 ## 4. Remaining concerns

@@ -24,6 +24,7 @@ import { extractAllowlist } from '../core/sqlAllowlist.js';
 import { buildRegistry, writeRegistry } from '../core/queryRegistry.js';
 import { normalizePolicyConfig } from '../core/policyEngine.js';
 import { normalizeAuthorizationConfig, resolveJwtSecret } from '../core/authorizationPolicy.js';
+import { checkProductionPreflight } from '../core/securityAudit.js';
 import { inferPolicyFromProject, mergeInferredIntoConfig } from '../core/policyInference.js';
 import { scanPolicyAnnotations, mergeAnnotationsIntoInferred } from '../core/policyAnnotations.js';
 import { workerDb, workerAdmin, workerAdminApi, workerHandshake, workerCapability, workerLog, workerRootMiddleware } from '../core/projectGenerator.js';
@@ -1096,6 +1097,25 @@ export async function runBuild(src, options = {}) {
     const adlMeta = normalizeActiveDefenseConfig(effectiveConfig?.security);
     const capabilityMeta = normalizeCapabilitiesConfig(effectiveConfig?.security, capabilityAnnotations);
     const panelIpGuardMeta = normalizePanelIpGuardConfig(effectiveConfig?.security);
+
+    // ── security.preset: 'production' preflight ────────────────
+    //   "한 줄 프리셋"이 실제로 성립하려면 필수 시크릿/설정이 있어야 한다.
+    //   누락 시 빌드를 중단해 반쯤 켜진 보안 상태로 배포되는 것을 막는다.
+    if (String(effectiveConfig?.security?.preset || '').toLowerCase() === 'production') {
+        const _pf = checkProductionPreflight({
+            security: effectiveConfig?.security,
+            policyMeta,
+            authzMeta,
+            panelIpGuardEnabled: panelIpGuardMeta.enabled,
+            env: { ...envVars, ...process.env },
+        });
+        for (const w of _pf.warnings) console.warn('[dokkebi] ⚠ production preset: ' + w);
+        if (_pf.issues.length > 0) {
+            throw new Error('[dokkebi] security.preset: production preflight 실패\n - ' + _pf.issues.join('\n - ')
+                + '\n[dokkebi]   해결 후 다시 빌드하거나, 프리셋 대신 개별 설정을 사용하세요.');
+        }
+    }
+
     const allowlist = await extractAllowlist(sourceRoot, { policy: policyMeta });
 
     // ── Cost-Route Advisory ────────────────────────────────────

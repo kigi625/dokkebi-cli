@@ -360,11 +360,15 @@ program
     .description(t('cli.cmd.security'))
     .option('--status', t('cli.opt.securityStatus'))
     .option('--interactive', t('cli.opt.securityInteractive'))
+    .option('--audit', 'Run a read-only security audit (config/env/worker checks)')
+    .option('--json', 'With --audit: output machine-readable JSON')
     .action(async (src = '.', options) => {
         try {
             await runSecurity(src, {
                 status:       options.status === true,
                 interactive:  options.interactive === true,
+                audit:        options.audit === true,
+                json:         options.json === true,
             });
         } catch (e) {
             console.error(t('cli.errSecurity'), e.message);

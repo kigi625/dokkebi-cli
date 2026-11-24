@@ -445,6 +445,28 @@ export default {
 
 ---
 
+### 3.8 운영 프리셋과 보안 감사
+
+```js
+// dokkebi.config.js
+security: { preset: 'production' }
+```
+
+한 줄로 다음을 켠다:
+
+- `level: 'strict'` — Tenant inject, Authorization strict, Query Registry strict, `requireJwtTenant`
+- `strictCsp: true`, `panelIpGuard: true`, `activeDefense: { enabled: true, mode: 'enforce' }`
+- `security.capabilities.features` 가 선언된 경우에만 capabilities 활성(시크릿 필요)
+
+필수 값이 없으면 빌드/배포가 **실패**한다: JWT 시크릿(authorization on), 패널 IP 목록(panelIpGuard on),
+CORS `allowedOrigins` 비어있음/`*`, authorization mode 가 strict 가 아님. 사용자 명시값은 항상 프리셋보다 우선한다.
+
+`dok security --audit` 는 **읽기 전용** 감사다(빌드/배포 없음): 시크릿 누락, policy/authz 공백,
+모호한 테넌트 매핑, CORS/CSP/패널 설정, `.gitignore` 커버리지, 워커 템플릿 구버전 여부를 출력한다.
+error 가 있으면 `1` 로 종료(CI 친화적), `--json` 으로 기계 판독 출력.
+
+---
+
 ## 4. 현재도 남아있는 우려 사항
 
 ### 4.1 🟡 Tenant Policy 만 켜고 Authorization 없으면 — role 기반 권한 미방어

@@ -331,12 +331,13 @@ export default {
   // Security — most important section
   // ═══════════════════════════════════════════════════════════
   security: {
-    // One-line security preset. Choose 'basic' | 'standard' | 'strict'.
-    //   'basic'    — no extra enforcement. Legacy-compatible mode.
-    //   'standard' — Tenant Policy verify, Authorization warn, auto inference.
-    //                → recommended for general apps (recommended default)
-    //   'strict'   — Tenant Policy inject, Authorization strict,
-    //                queryRegistry strict. → paid/finance/admin apps.
+    // One-line hardening preset (recommended for production):
+    //   Turns on strict level + Strict CSP + panel IP guard + ADL enforce.
+    //   Build/deploy fails if required secrets/values are missing.
+    preset: 'production',
+
+    // Or choose a level manually. 'basic' | 'standard' | 'strict'.
+    //   'strict' — Tenant Policy inject, Authorization strict, queryRegistry strict.
     level: 'strict',
 
     strictCsp: false,
