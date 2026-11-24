@@ -135,8 +135,8 @@ Parameter binding is handled by D1/Supabase/Appwrite SDK via `prepare().bind()`.
 |---|---|
 | CORS | `/api/_dokkebi/{db,log,handshake}` honor `security.cors.allowedOrigins`: only a listed `Origin` is echoed (plus `Vary: Origin`); empty or `*` keeps legacy `*`. |
 | HSTS | `dok deploy` writes `Strict-Transport-Security: max-age=31536000; includeSubDomains` into `_headers` (disable with `security.hsts: false`). |
-| Ops panel | Serverless/serve panel responses add `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`. |
-| Local DB (sql.js) | `localDbMode` builds copy `sql-wasm.js/.wasm` into `/dokkebi/` and load same-origin; CDN fallback is SRI-pinned (`sha384-…`). |
+| Ops panel | Serverless/serve panel responses add `Content-Security-Policy` (`frame-ancestors 'none'`), `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`. Log fields are HTML-escaped including quotes for attribute contexts. |
+| Local DB (sql.js) | `localDbMode` builds copy `sql-wasm.js/.wasm` into `/dokkebi/` and load same-origin; the CDN fallback pins the script with SRI and verifies the wasm SHA-384 digest before passing it as `wasmBinary`. |
 
 ### 2.6 Information disclosure
 

@@ -721,7 +721,7 @@ async function doLogin(){const pw=document.getElementById('pw').value;if(!pw)ret
 function doLogout(){sessionStorage.removeItem(TK);location.reload();}
 document.getElementById('pw').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
 async function api(p){const r=await fetch(_BASE+'/api/'+p,{headers:{'Authorization':'Bearer '+_t}});if(r.status===401){doLogout();throw new Error('auth');}return r.json();}
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function ft(ts){try{return new Date(ts.endsWith('Z')?ts:ts+'Z').toLocaleString('ko-KR',{timeZone:'Asia/Seoul',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});}catch{return ts;}}
 function go(t,b){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));document.getElementById('tab-'+t).classList.add('active');b.classList.add('active');
   if(t==='errors'){_errPage=0;loadE();}if(t==='security'){_secPage=0;loadS();}if(t==='status')loadSt();if(t==='adl')loadAdl();if(t==='ai')loadAiHistory();}
@@ -748,7 +748,7 @@ function _secRiskMeta(type, detail){
 async function loadS(){try{let u='security?limit='+_PZ+'&offset='+(_secPage*_PZ);const ip=document.getElementById('sec-ip').value.trim();if(ip)u+='&ip='+encodeURIComponent(ip);const f=_dtVal('sec-from');if(f)u+='&from='+encodeURIComponent(f);const t=_dtVal('sec-to');if(t)u+='&to='+encodeURIComponent(t);
   const d=await api(u);const LBL={request:'요청',db_audit:'DB Audit',hmac_fail:'HMAC',rate_limit:'레이트',sql_inject:'SQL',replay_attempt:'Replay',mutation_budget:'Mutation',query_fallback:'쿼리폴백',query_not_registered:'미등록쿼리',adl_detect:'ADL감지',adl_block:'ADL차단'};
   const tb=document.getElementById('sec-tb');if(!d.rows?.length){tb.innerHTML='<tr><td colspan=6 class=empty>이벤트 없음 ✅</td></tr>';document.getElementById('sec-pager').innerHTML='';return;}
-  tb.innerHTML=d.rows.map(r=>{const risk=_secRiskMeta(r.type,r.detail);return '<tr><td style="white-space:nowrap">'+ft(r.ts)+'</td><td><span class="badge '+risk.cls+'">'+(LBL[r.type]||r.type)+'</span></td><td><span class="badge '+risk.cls+'">'+risk.label+'</span></td><td>'+esc(r.ip)+'</td><td>'+esc(r.path)+'</td><td>'+esc(r.detail)+'</td></tr>';}).join('');_pager(document.getElementById('sec-pager'),_secPage,d.total,'secGo');}catch{}}
+  tb.innerHTML=d.rows.map(r=>{const risk=_secRiskMeta(r.type,r.detail);return '<tr><td style="white-space:nowrap">'+ft(r.ts)+'</td><td><span class="badge '+risk.cls+'">'+esc(LBL[r.type]||r.type)+'</span></td><td><span class="badge '+risk.cls+'">'+risk.label+'</span></td><td>'+esc(r.ip)+'</td><td>'+esc(r.path)+'</td><td>'+esc(r.detail)+'</td></tr>';}).join('');_pager(document.getElementById('sec-pager'),_secPage,d.total,'secGo');}catch{}}
 async function loadSt(){try{const d=await api('security-info');_renderStatus(d);}catch{}}
 async function loadAdl(){try{const s=await api('adl/status');_renderAdlSummary(s);
   const [r,rs]=await Promise.all([api('adl/blacklist?limit=50'),api('adl/suspicion?limit=50')]);const tb=document.getElementById('adl-tb');

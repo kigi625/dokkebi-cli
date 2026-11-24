@@ -789,6 +789,7 @@ function _dokkebiScheduleVersionProbeForPath(path) {
     // (파일이 없거나 로드 실패 시에만 CDN 으로 fallback, 이때는 SRI 검증)
     var _SQLJS_CDN = 'https://cdn.jsdelivr.net/npm/sql.js@1.11.0/dist/';
     var _SQLJS_SRI = 'sha384-1fHJox8K973mCCD3PTAOc0ljrAGXD2VeK8zf+vNIdx55pWPULNlpxKMkU8bF4nUd';
+    var _SQLJS_WASM_SRI = 'sha384-R/MwdqDq6/VfWyY+p8u2RAFr+3gVOgzxeJqDeDxCnpQaVqOc9tEFLu4wdQfoDpb5';
     var _sqlBase = "__DOKKEBI_PH_SQLJS_BASE__" || _SQLJS_CDN;
     function _loadSqlJsScript(base, withSri) {
       return new Promise(function(resolve, reject) {
@@ -812,9 +813,30 @@ function _dokkebiScheduleVersionProbeForPath(path) {
       await _loadSqlJsScript(_SQLJS_CDN, true);
     }
 
-    var SQL = await initSqlJs({
+    async function _sha384B64(bytes) {
+      if (!(globalThis.crypto && crypto.subtle)) throw new Error('crypto.subtle 를 사용할 수 없어 sql.js wasm 무결성을 검증할 수 없습니다.');
+      var digest = await crypto.subtle.digest('SHA-384', bytes);
+      var view = new Uint8Array(digest);
+      var bin = '';
+      for (var i = 0; i < view.length; i++) bin += String.fromCharCode(view[i]);
+      return 'sha384-' + btoa(bin);
+    }
+    var _sqlOpts = {
       locateFile: function(file) { return _sqlBase + file; }
-    });
+    };
+    // CDN fallback 은 wasm 까지 해시 검증한 뒤 메모리에서 로드한다.
+    // (script integrity 는 JS 만 보호하므로 wasm 공급망 변조를 별도로 막는다)
+    if (_sqlBase === _SQLJS_CDN) {
+      var _wasmRes = await fetch(_SQLJS_CDN + 'sql-wasm.wasm');
+      if (!_wasmRes.ok) throw new Error('sql.js wasm 다운로드 실패: ' + _wasmRes.status);
+      var _wasmBytes = new Uint8Array(await _wasmRes.arrayBuffer());
+      var _wasmHash = await _sha384B64(_wasmBytes);
+      if (_wasmHash !== _SQLJS_WASM_SRI) {
+        throw new Error('sql.js wasm 무결성 검증 실패 (CDN 변조 의심)');
+      }
+      _sqlOpts.wasmBinary = _wasmBytes;
+    }
+    var SQL = await initSqlJs(_sqlOpts);
 
     var existing = await _loadLocalDbData();
     _localSqlDb = existing ? new SQL.Database(existing) : new SQL.Database();

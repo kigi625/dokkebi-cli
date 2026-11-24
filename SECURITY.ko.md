@@ -135,8 +135,8 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 |---|---|
 | CORS | `/api/_dokkebi/{db,log,handshake}` 가 `security.cors.allowedOrigins` 를 적용: 목록에 있는 `Origin` 만 echo(+`Vary: Origin`). 비어있거나 `*` 면 기존 `*` 유지. |
 | HSTS | `dok deploy` 가 `_headers` 에 `Strict-Transport-Security: max-age=31536000; includeSubDomains` 추가 (`security.hsts: false` 로 해제). |
-| 관제 패널 | 서버리스/serve 패널 응답에 `Content-Security-Policy`(`frame-ancestors 'none'`), `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` 추가. |
-| 로컬 DB(sql.js) | `localDbMode` 빌드는 `sql-wasm.js/.wasm` 을 `/dokkebi/` 로 복사해 same-origin 로드. CDN fallback 은 SRI(`sha384-…`) 고정. |
+| 관제 패널 | 서버리스/serve 패널 응답에 `Content-Security-Policy`(`frame-ancestors 'none'`), `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` 추가. 로그 필드는 속성 컨텍스트까지 포함해 HTML 이스케이프. |
+| 로컬 DB(sql.js) | `localDbMode` 빌드는 `sql-wasm.js/.wasm` 을 `/dokkebi/` 로 복사해 same-origin 로드. CDN fallback 은 스크립트 SRI + wasm SHA-384 검증 후 `wasmBinary` 로 전달. |
 
 ### 2.6 정보 노출
 

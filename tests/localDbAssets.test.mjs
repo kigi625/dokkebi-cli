@@ -44,4 +44,5 @@ test('admin panel: CSP / XFO 헤더 포함', () => {
     const src = workerAdmin('demo');
     assert.match(src, /frame-ancestors 'none'/);
     assert.match(src, /X-Frame-Options/);
+    assert.match(src, /&quot;/, 'esc must escape quotes for attribute contexts');
 });
