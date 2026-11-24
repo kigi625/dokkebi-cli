@@ -2010,6 +2010,78 @@ function _pe_findTablePolicy(tables: any, name: string): any {
   }
   return null;
 }
+// depth 0 의 UNION/INTERSECT/EXCEPT 로 브랜치를 분리
+function _pe_splitTopLevelCompound(normalized: string): Array<{ start: number; end: number }> | null {
+  const s = normalized;
+  const parts: Array<{ start: number; end: number }> = [];
+  let depth = 0;
+  let last = 0;
+  let found = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const close = ch === '[' ? ']' : ch;
+      i++;
+      while (i < s.length) {
+        if (s[i] === close) {
+          if (ch !== '[' && s[i + 1] === close) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') { if (depth > 0) depth--; continue; }
+    if (!/[A-Za-z_]/.test(ch)) continue;
+    let j = i;
+    while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+    const word = s.slice(i, j).toUpperCase();
+    i = j - 1;
+    if (depth !== 0) continue;
+    if (word !== 'UNION' && word !== 'INTERSECT' && word !== 'EXCEPT') continue;
+    parts.push({ start: last, end: j - word.length });
+    let k = j;
+    while (k < s.length && /\s/.test(s[k])) k++;
+    let m = k;
+    while (m < s.length && /[A-Za-z0-9_]/.test(s[m])) m++;
+    const next = s.slice(k, m).toUpperCase();
+    last = word === 'UNION' && (next === 'ALL' || next === 'DISTINCT') ? m : j;
+    found = true;
+  }
+  if (!found) return null;
+  parts.push({ start: last, end: s.length });
+  return parts;
+}
+function _pe_hasNestedCompound(normalized: string): boolean {
+  const s = normalized;
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const close = ch === '[' ? ']' : ch;
+      i++;
+      while (i < s.length) {
+        if (s[i] === close) {
+          if (ch !== '[' && s[i + 1] === close) { i += 2; continue; }
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') { if (depth > 0) depth--; continue; }
+    if (depth === 0 || !/[A-Za-z_]/.test(ch)) continue;
+    let j = i;
+    while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+    const word = s.slice(i, j).toUpperCase();
+    if (word === 'UNION' || word === 'INTERSECT' || word === 'EXCEPT') return true;
+    i = j - 1;
+  }
+  return false;
+}
+
 function _pe_optionalEnforceable(tp: any, globalClaim: string): boolean {
   if (!tp) return false;
   if (tp.sessionClaim) return true;
@@ -2044,6 +2116,37 @@ function verifyTenantPolicy(sql: string, params: unknown[], tenantContext: any, 
   if (op === 'CREATE') return { ok: true };
   const refs = _pe_extractTableRefs(normalized);
   const requireQualified = refs.length > 1;
+
+  // 복합 SELECT 는 브랜치별로 테넌트 WHERE 를 검증한다.
+  const tenantActive = refs.some((ref: any) => {
+    const tp = _pe_findTablePolicy(policy.tables, ref.name);
+    if (!tp || !tp.tenantColumn) return false;
+    if (tp.mode === 'enforce' || tp.mode === 'inject') return true;
+    if (tp.mode !== 'optional') return false;
+    if (!_pe_optionalEnforceable(tp, globalClaim)) return false;
+    const [, exp] = _pe_resolveClaim(tenantContext, tp.sessionClaim, globalClaim, tp.tenantColumn);
+    return exp !== undefined && exp !== null;
+  });
+  if (tenantActive) {
+    if (_pe_hasNestedCompound(normalized)) {
+      return { ok: false, code: 'COMPOUND_SELECT_UNSUPPORTED', reason: '서브쿼리 내부의 UNION/INTERSECT/EXCEPT 는 테넌트 격리를 검증할 수 없습니다.' };
+    }
+    const branches = _pe_splitTopLevelCompound(normalized);
+    if (branches) {
+      if (op !== 'SELECT') {
+        return { ok: false, code: 'COMPOUND_SELECT_UNSUPPORTED', reason: 'DML 에 포함된 UNION/INTERSECT/EXCEPT 는 테넌트 격리를 검증할 수 없습니다.' };
+      }
+      for (const br of branches) {
+        const text = normalized.slice(br.start, br.end).trim();
+        if (!text) continue;
+        const before = _pe_countQMarksRaw(normalized, br.start);
+        const r = verifyTenantPolicy(text, params.slice(before), tenantContext, policy, opts);
+        if (!r.ok) return r;
+      }
+      return { ok: true };
+    }
+  }
+
   for (const ref of refs) {
     const tp = _pe_findTablePolicy(policy.tables, ref.name);
     if (!tp) continue;

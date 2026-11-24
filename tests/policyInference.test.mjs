@@ -527,3 +527,57 @@ test('verifyTenantPolicy: 테넌트 컬럼 재할당(SET user_id) 차단', () =>
         assert.equal(r.code, 'TENANT_COLUMN_REASSIGN', sql);
     }
 });
+
+test('verifyTenantPolicy: UNION/INTERSECT/EXCEPT 브랜치별 테넌트 필터 검증', () => {
+    const policy = normalizePolicyConfig({
+        enabled: true,
+        mode: 'verify',
+        strict: true,
+        claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    });
+    const ctx = { user_id: 'u1' };
+
+    assert.equal(verifyTenantPolicy(
+        'SELECT * FROM posts WHERE posts.user_id = ? UNION SELECT * FROM posts WHERE posts.user_id = ?',
+        ['u1', 'u1'], ctx, policy
+    ).ok, true);
+    assert.equal(verifyTenantPolicy(
+        'SELECT * FROM posts p WHERE p.user_id = ? UNION ALL SELECT * FROM posts p WHERE p.user_id = ?',
+        ['u1', 'u1'], ctx, policy
+    ).ok, true);
+    assert.equal(verifyTenantPolicy(
+        'SELECT * FROM posts WHERE posts.user_id = ? UNION SELECT * FROM posts WHERE user_id = ?',
+        ['u1', 'u1'], ctx, policy
+    ).ok, true);
+
+    for (const sql of [
+        'SELECT * FROM posts WHERE posts.user_id = ? UNION SELECT * FROM posts',
+        'SELECT * FROM posts p WHERE p.user_id = ? UNION ALL SELECT * FROM posts p',
+        'SELECT * FROM posts WHERE posts.user_id = ? INTERSECT SELECT * FROM posts',
+        'SELECT * FROM posts WHERE posts.user_id = ? EXCEPT SELECT * FROM posts',
+    ]) {
+        assert.equal(verifyTenantPolicy(sql, ['u1', 'u1'], ctx, policy).ok, false, sql);
+    }
+
+    // 서브쿼리 내부의 compound 는 fail-closed
+    const nested = verifyTenantPolicy(
+        'SELECT * FROM posts WHERE posts.user_id = ? AND id IN (SELECT id FROM posts UNION SELECT id FROM posts)',
+        ['u1'], ctx, policy
+    );
+    assert.equal(nested.ok, false);
+    assert.equal(nested.code, 'COMPOUND_SELECT_UNSUPPORTED');
+});
+
+test('injectTenantPolicy: 복합 SELECT 는 브랜치별 주입을 보장하지 못하면 실패', () => {
+    const policy = normalizePolicyConfig({
+        enabled: true, mode: 'inject', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'inject' } },
+    });
+    const r = injectTenantPolicy(
+        'SELECT * FROM posts UNION SELECT * FROM posts',
+        [], { user_id: 'u1' }, policy, { strict: true }
+    );
+    assert.equal(r.ok, false);
+    assert.equal(r.code, 'INJECT_INCOMPLETE');
+});

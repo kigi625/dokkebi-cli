@@ -323,3 +323,41 @@ test('워커 템플릿: 테넌트 컬럼 재할당(SET user_id) 차단', () => {
         assert.equal(r.code, 'TENANT_COLUMN_REASSIGN', sql);
     }
 });
+
+
+test('워커 템플릿: UNION/INTERSECT/EXCEPT 브랜치별 테넌트 필터 검증', () => {
+    const p = {
+        enabled: true, mode: 'verify', strict: true, claim: 'user_id',
+        tables: { posts: { tenantColumn: 'user_id', mode: 'enforce' } },
+    };
+    const ctx = { user_id: 'u1' };
+
+    assert.equal(worker.verifyTenantPolicy(
+        'SELECT * FROM posts WHERE posts.user_id = ? UNION SELECT * FROM posts WHERE posts.user_id = ?',
+        ['u1', 'u1'], ctx, p
+    ).ok, true);
+    assert.equal(worker.verifyTenantPolicy(
+        'SELECT * FROM posts p WHERE p.user_id = ? UNION ALL SELECT * FROM posts p WHERE p.user_id = ?',
+        ['u1', 'u1'], ctx, p
+    ).ok, true);
+    assert.equal(worker.verifyTenantPolicy(
+        'SELECT * FROM posts WHERE posts.user_id = ? UNION SELECT * FROM posts WHERE user_id = ?',
+        ['u1', 'u1'], ctx, p
+    ).ok, true);
+
+    for (const sql of [
+        'SELECT * FROM posts WHERE posts.user_id = ? UNION SELECT * FROM posts',
+        'SELECT * FROM posts p WHERE p.user_id = ? UNION ALL SELECT * FROM posts p',
+        'SELECT * FROM posts WHERE posts.user_id = ? INTERSECT SELECT * FROM posts',
+        'SELECT * FROM posts WHERE posts.user_id = ? EXCEPT SELECT * FROM posts',
+    ]) {
+        assert.equal(worker.verifyTenantPolicy(sql, ['u1', 'u1'], ctx, p).ok, false, sql);
+    }
+
+    const nested = worker.verifyTenantPolicy(
+        'SELECT * FROM posts WHERE posts.user_id = ? AND id IN (SELECT id FROM posts UNION SELECT id FROM posts)',
+        ['u1'], ctx, p
+    );
+    assert.equal(nested.ok, false);
+    assert.equal(nested.code, 'COMPOUND_SELECT_UNSUPPORTED');
+});

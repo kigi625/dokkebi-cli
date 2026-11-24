@@ -654,6 +654,92 @@ function detectTenantColumnReassign(normalized, upper, op, ref, tenantCol, expec
     return null;
 }
 
+// ─────────────────────────────────────────────────────────────
+// 복합 SELECT(UNION/INTERSECT/EXCEPT) 브랜치 분리
+//   기존 verify 는 첫 WHERE 절만 보고 모든 테이블 참조를 통과시켜,
+//   두 번째 브랜치의 필터 누락을 놓쳤다.
+// ─────────────────────────────────────────────────────────────
+
+/** depth 0 의 compound 연산자 위치를 찾는다. */
+function _splitTopLevelCompound(normalized) {
+    const s = String(normalized || '');
+    const parts = [];
+    let depth = 0;
+    let last = 0;
+    let found = false;
+
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+            const close = ch === '[' ? ']' : ch;
+            i++;
+            while (i < s.length) {
+                if (s[i] === close) {
+                    if (ch !== '[' && s[i + 1] === close) { i += 2; continue; }
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '(') { depth++; continue; }
+        if (ch === ')') { if (depth > 0) depth--; continue; }
+        if (!/[A-Za-z_]/.test(ch)) continue;
+        let j = i;
+        while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+        const word = s.slice(i, j).toUpperCase();
+        i = j - 1;
+        if (depth !== 0) continue;
+        if (word !== 'UNION' && word !== 'INTERSECT' && word !== 'EXCEPT') continue;
+
+        parts.push({ start: last, end: j - word.length });
+        let k = j;
+        while (k < s.length && /\s/.test(s[k])) k++;
+        let m = k;
+        while (m < s.length && /[A-Za-z0-9_]/.test(s[m])) m++;
+        const next = s.slice(k, m).toUpperCase();
+        if (word === 'UNION' && (next === 'ALL' || next === 'DISTINCT')) {
+            last = m;
+        } else {
+            last = j;
+        }
+        found = true;
+    }
+    if (!found) return null;
+    parts.push({ start: last, end: s.length });
+    return parts;
+}
+
+/** 괄호 안(depth > 0)에 compound 연산자가 있는지 */
+function _hasNestedCompound(normalized) {
+    const s = String(normalized || '');
+    let depth = 0;
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+            const close = ch === '[' ? ']' : ch;
+            i++;
+            while (i < s.length) {
+                if (s[i] === close) {
+                    if (ch !== '[' && s[i + 1] === close) { i += 2; continue; }
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '(') { depth++; continue; }
+        if (ch === ')') { if (depth > 0) depth--; continue; }
+        if (depth === 0 || !/[A-Za-z_]/.test(ch)) continue;
+        let j = i;
+        while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+        const word = s.slice(i, j).toUpperCase();
+        if (word === 'UNION' || word === 'INTERSECT' || word === 'EXCEPT') return true;
+        i = j - 1;
+    }
+    return false;
+}
+
 /**
  * 테넌트 테이블에 대한 위험한 upsert 형태를 감지한다.
  *
@@ -727,6 +813,46 @@ export function verifyTenantPolicy(sql, params, tenantContext, policy, opts = {}
 
     const refs = extractTableRefs(normalized);
     const requireQualified = refs.length > 1;
+
+    // 복합 SELECT(UNION/INTERSECT/EXCEPT) 는 브랜치별로 WHERE 를 검증한다.
+    // (첫 브랜치의 테넌트 조건이 다른 브랜치까지 통과시키는 우회 방지)
+    const tenantActive = refs.some((ref) => {
+        const tp = findTablePolicy(policy.tables, ref.name);
+        if (!tp || !tp.tenantColumn) return false;
+        if (tp.mode === 'enforce' || tp.mode === 'inject') return true;
+        if (tp.mode !== 'optional') return false;
+        if (!optionalEnforceable(tp, globalClaim)) return false;
+        const [, exp] = _resolveTenantClaim(tenantContext, tp.sessionClaim, globalClaim, tp.tenantColumn);
+        return exp !== undefined && exp !== null;
+    });
+    if (tenantActive) {
+        if (_hasNestedCompound(normalized)) {
+            return {
+                ok: false,
+                code: 'COMPOUND_SELECT_UNSUPPORTED',
+                reason: '서브쿼리 내부의 UNION/INTERSECT/EXCEPT 는 테넌트 격리를 검증할 수 없습니다.',
+            };
+        }
+        const branches = _splitTopLevelCompound(normalized);
+        if (branches) {
+            if (op !== 'SELECT') {
+                return {
+                    ok: false,
+                    code: 'COMPOUND_SELECT_UNSUPPORTED',
+                    reason: 'DML 에 포함된 UNION/INTERSECT/EXCEPT 는 테넌트 격리를 검증할 수 없습니다.',
+                };
+            }
+            for (const br of branches) {
+                const text = normalized.slice(br.start, br.end).trim();
+                if (!text) continue;
+                const before = _countQMarksRaw(normalized, br.start);
+                const r = verifyTenantPolicy(text, params.slice(before), tenantContext, policy, opts);
+                if (!r.ok) return r;
+            }
+            return { ok: true };
+        }
+    }
+
     for (const ref of refs) {
         const tp = findTablePolicy(policy.tables, ref.name);
         if (!tp) continue; // 선언 안 된 테이블은 스킵 (defaultMode='none' 과 동일)
