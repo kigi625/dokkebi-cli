@@ -66,7 +66,10 @@ test("production preflight: 필수 값 누락 시 issue", () => {
         panelIpGuardEnabled: true,
         env: {},
     });
-    assert.equal(r.issues.length, 3); // jwt + panel IP + cors
+    // CORS/패널 IP 는 선택 옵션이므로 issue 가 아니다. JWT 만 차단한다.
+    assert.equal(r.issues.length, 1);
+    assert.ok(r.issues[0].includes('JWT'));
+    assert.equal(r.issues.some((w) => w.includes('CORS') || w.includes('PANEL_ALLOWED_IPS')), false);
     assert.ok(r.warnings.some((w) => w.includes('DOKKEBI_ADMIN_PASSWORD')));
 });
 

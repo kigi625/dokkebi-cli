@@ -62,7 +62,7 @@ import { runBuild } from './build.js';
 import { loadWireRuntimeForLocalProxy, denormalizePayload, verifyAndStripPow } from '../core/payloadWireRuntime.js';
 import { buildBundleBootPayload, injectBundleBootScript } from '../core/bundleBoot.js';
 import { t } from '../i18n/index.js';
-import { normalizeCorsConfig, corsHeadersFor } from '../core/cors.js';
+import { resolveCorsConfig, corsHeadersFor } from '../core/cors.js';
 import { sanitizeLogText, sanitizeLogTag } from '../core/logSanitize.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -365,7 +365,7 @@ export async function runServe(src, options = {}) {
     ).trim();
     const bcKeyHexServe = String(handshakeSecretSource.__DOKKEBI_BC_KEY__ || '').replace(/\s/g, '');
 
-    const _corsCfg = normalizeCorsConfig(dokConfig?.security);
+    const _corsCfg = resolveCorsConfig(dokConfig?.security, dokConfig, { projectName: path.basename(sourceRoot) });
 
     const server = http.createServer(async (req, res) => {
         const urlPath = req.url?.split('?')[0] || '/';

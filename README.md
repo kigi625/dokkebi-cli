@@ -151,7 +151,7 @@ The browser bootstrap (`/api/_dokkebi/db` client injected by `dokkebi-cli`) uses
 | `dok deploy [src]` | Cloudflare Pages deploy (R2/S3 frontend + domain automation) |
 | `dok migrate [src]` | Apply SQL migrations |
 | `dok update [src]` | Apply latest version to existing project (preserves user code) |
-| `dok security [src]` | Security opt-in **interactive** (`--status` for text-only) |
+| `dok security [src]` | Security opt-in **interactive** (`--status`, `--audit`, `--fix [--write]`) |
 | `dok policy:scaffold [src]` | Auto-generate Tenant/Authorization Policy from model analysis |
 | `dok lang [code]` | Change CLI language (12 languages supported) |
 

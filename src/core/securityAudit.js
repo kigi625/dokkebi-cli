@@ -60,18 +60,13 @@ export function checkProductionPreflight({
             issues.push('authorization.mode 가 strict 가 아닙니다 (production preset 은 strict 를 요구).');
         }
     }
+    // 패널 IP allowlist / CORS 오리진은 선택 옵션이다.
+    // - panelIpGuard 는 운영자가 명시적으로 켤 때만 강제한다.
+    // - CORS 는 build 시 배포 설정에서 자동 유도되며, 커스텀 오리진이 필요하면 수동 보강한다.
     if (panelIpGuardEnabled) {
-        const ips = String(e.DOKKEBI_PANEL_ALLOWED_IPS || e.DOKKEBI_ADMIN_ALLOWED_IPS || '').trim();
-        if (!ips) issues.push('security.panelIpGuard 가 켜져 있는데 DOKKEBI_PANEL_ALLOWED_IPS 가 비어 있습니다.');
         const pw = String(e.DOKKEBI_ADMIN_PASSWORD || '');
         if (!pw) warnings.push('DOKKEBI_ADMIN_PASSWORD 미설정 — 관제 패널이 503 으로 비활성화됩니다.');
         else if (pw.length < 20) warnings.push('DOKKEBI_ADMIN_PASSWORD 길이가 20자 미만입니다.');
-    }
-    const origins = Array.isArray(security?.cors?.allowedOrigins)
-        ? security.cors.allowedOrigins.filter(Boolean)
-        : [];
-    if (origins.length === 0 || origins.includes('*')) {
-        issues.push('security.cors.allowedOrigins 에 실제 프론트 오리진을 지정하세요 (현재 비어있거나 `*`).');
     }
     if (policyMeta?.enabled && Object.keys(policyMeta.tables || {}).length === 0) {
         warnings.push('Tenant Policy 가 켜져 있지만 policy.tables 가 비어 있습니다 — 테이블별 tenantColumn 을 지정하세요.');

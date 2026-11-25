@@ -177,7 +177,8 @@
       "appwrite": "📦  Appwrite       (Document DB, Storage, Functions)",
       "server": "🖥  Server (dok serve)          — Node.js direct hosting / local dev",
       "serverless": "☁  Serverless (Cloudflare Pages) — Edge deploy, no dok serve needed"
-    }
+    },
+    "promptProductionPreset": "Apply the production security preset? [No = standard]"
   },
   "build": {
     "header": "dokkebi v2 WASM build started",

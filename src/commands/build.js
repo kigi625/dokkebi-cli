@@ -25,7 +25,7 @@ import { buildRegistry, writeRegistry } from '../core/queryRegistry.js';
 import { normalizePolicyConfig } from '../core/policyEngine.js';
 import { normalizeAuthorizationConfig, resolveJwtSecret } from '../core/authorizationPolicy.js';
 import { checkProductionPreflight } from '../core/securityAudit.js';
-import { normalizeCorsConfig } from '../core/cors.js';
+import { resolveCorsConfig } from '../core/cors.js';
 import { copySqlJsAssets } from '../core/localDbAssets.js';
 import { inferPolicyFromProject, mergeInferredIntoConfig } from '../core/policyInference.js';
 import { scanPolicyAnnotations, mergeAnnotationsIntoInferred } from '../core/policyAnnotations.js';
@@ -1099,7 +1099,12 @@ export async function runBuild(src, options = {}) {
     const adlMeta = normalizeActiveDefenseConfig(effectiveConfig?.security);
     const capabilityMeta = normalizeCapabilitiesConfig(effectiveConfig?.security, capabilityAnnotations);
     const panelIpGuardMeta = normalizePanelIpGuardConfig(effectiveConfig?.security);
-    const corsMeta = normalizeCorsConfig(effectiveConfig?.security);
+    const corsMeta = resolveCorsConfig(effectiveConfig?.security, effectiveConfig, {
+        projectName: path.basename(sourceRoot),
+    });
+    if (corsMeta.derived?.length > 0) {
+        console.log('[dokkebi]   🌐 CORS 자동 유도: ' + corsMeta.derived.join(', '));
+    }
 
     // ── security.preset: 'production' preflight ────────────────
     //   "한 줄 프리셋"이 실제로 성립하려면 필수 시크릿/설정이 있어야 한다.

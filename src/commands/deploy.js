@@ -22,9 +22,10 @@ import https from 'https';
 import { execFileSync } from 'child_process';
 import { createHmac, createHash } from 'crypto';
 import { runBuild } from './build.js';
-import { loadDokkebiConfigMerged } from '../core/dokkebiConfigLoad.js';
+import { loadDokkebiConfigMerged, applySecurityPreset } from '../core/dokkebiConfigLoad.js';
 import { CSP_FRAME_SRC_ALLOWLIST, CSP_SCRIPT_SRC_LEMON_SQUEEZY } from '../core/cspFrameSrc.js';
 import { isBundleEncryptEnabled } from '../core/buildWasm.js';
+import { resolveJwtSecret } from '../core/authorizationPolicy.js';
 import { purgeBuildArtifactsFromDist } from '../core/buildArtifactPurge.js';
 import { t } from '../i18n/index.js';
 
@@ -1378,16 +1379,28 @@ async function runPreflight(sourceRoot, dokkebiConfig, { strict = false } = {}) 
         else ok.push(t('deploy.pfOkQueryRegistry', { count: cnt }));
     } catch { /* query registry 없음 — 이미 build 에서 안내 */ }
 
-    // 9) CORS 기본값(*) 운영 노출 — security.cors.allowedOrigins 미설정 시 경고.
-    //    SECURITY.md §4.7 / §7 체크리스트의 "실제 프론트 오리진으로 제한" 강제용.
+    // 9) 필수 시크릿 — 인증/캐퍼빌리티가 켜진 경우에만 차단.
+    //    CORS 오리진과 패널 IP allowlist 는 선택 옵션이므로 배포를 막지 않는다.
     try {
-        const corsCfg = dokkebiConfig?.security?.cors;
-        const origins = Array.isArray(corsCfg?.allowedOrigins) ? corsCfg.allowedOrigins.filter(Boolean) : null;
-        const widePattern = !origins || origins.length === 0 || origins.includes('*');
-        if (widePattern) {
-            warnings.push('CORS Access-Control-Allow-Origin 이 `*` 으로 노출됩니다 — security.cors.allowedOrigins 에 실제 프론트 오리진을 명시하세요. (SECURITY.md §4.7)');
-        } else {
-            ok.push(`CORS allowed origins: ${origins.length}개 명시`);
+        const envObj = { ...(await loadEnvFile(sourceRoot).catch(() => ({}))), ...process.env };
+        const effective = applySecurityPreset(dokkebiConfig, { quiet: true });
+        const authzCfg = effective?.authorization;
+        const authzEnabled = authzCfg?.enabled === true
+            || !!(authzCfg?.rules && Object.keys(authzCfg.rules).length > 0)
+            || effective?.auth?.login?.enabled === true;
+        if (authzEnabled && !resolveJwtSecret(envObj, authzCfg).secret) {
+            errors.push('Authorization/로그인이 켜져 있는데 JWT 시크릿이 없습니다 — JWT_SECRET 또는 DOKKEBI_JWT_SECRET 를 설정하세요.');
+        } else if (authzEnabled) {
+            ok.push('JWT 시크릿 확인');
+        }
+        const cap = effective?.security?.capabilities;
+        if (cap?.enabled === true) {
+            const name = String(cap.secretEnv || 'DOKKEBI_CAPABILITY_SECRET');
+            if (!String(envObj[name] || '')) {
+                errors.push(`capabilities.enabled=true 인데 ${name} 가 없습니다.`);
+            } else {
+                ok.push(`Capability 시크릿 확인 (${name})`);
+            }
         }
     } catch { /* 무시 */ }
 

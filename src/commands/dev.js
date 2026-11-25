@@ -74,7 +74,7 @@ import { loadWireRuntimeForLocalProxy, denormalizePayload, verifyAndStripPow } f
 import { loadPlugins, generatePluginBootstrapCode } from '../core/pluginLoader.js';
 import { loadDokkebiConfigMerged } from '../core/dokkebiConfigLoad.js';
 import { t } from '../i18n/index.js';
-import { normalizeCorsConfig, corsHeadersFor } from '../core/cors.js';
+import { resolveCorsConfig, corsHeadersFor } from '../core/cors.js';
 import { sanitizeLogText, sanitizeLogTag } from '../core/logSanitize.js';
 
 // ─────────────────────────────────────────────────────────────
@@ -993,7 +993,7 @@ export async function runDev(src, options = {}) {
     const watcher          = startBackendWatcher(sourceRoot, distRoot);
     const frontendProcess  = startFrontendWatch(sourceRoot, distRoot);
 
-    const _corsCfg = normalizeCorsConfig(dokConfig?.security);
+    const _corsCfg = resolveCorsConfig(dokConfig?.security, dokConfig, { projectName: path.basename(sourceRoot) });
 
     const server = http.createServer(async (req, res) => {
         const urlPath = req.url?.split('?')[0] || '/';

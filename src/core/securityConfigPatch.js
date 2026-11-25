@@ -62,6 +62,8 @@ export function patchDokkebiConfigText(text, baseline, draft) {
     };
 
     tryPatch('security.level', patchSecurityLevel);
+    tryPatch('security.preset', patchSecurityPreset);
+    tryPatch('security.cors.allowedOrigins', patchCorsAllowedOrigins);
     tryPatch('security.panelIpGuard', patchPanelIpGuard);
     tryPatch('security.strictCsp', patchStrictCsp);
     // security.bundleEncrypt 는 항상 강제 ON — 토글/패치 경로 제거.
@@ -130,33 +132,117 @@ function insertAfterActiveDefenseBlock(text, snippet) {
     return null;
 }
 
+function _findSecurityBlock(text) {
+    const m = /^[ \t]*security:\s*\{/m.exec(text);
+    if (!m) return null;
+    const open = m.index + m[0].lastIndexOf('{');
+    let depth = 0;
+    for (let i = open; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === "'" || ch === '"' || ch === '`') {
+            const q = ch;
+            i++;
+            while (i < text.length) {
+                if (text[i] === '\\') { i += 2; continue; }
+                if (text[i] === q) break;
+                i++;
+            }
+            continue;
+        }
+        if (ch === '/' && text[i + 1] === '/') {
+            while (i < text.length && text[i] !== '\n') i++;
+            continue;
+        }
+        if (ch === '/' && text[i + 1] === '*') {
+            i += 2;
+            while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+            i++;
+            continue;
+        }
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+            depth--;
+            if (depth === 0) return { start: m.index, end: i + 1 };
+        }
+    }
+    return null;
+}
+
+function _replaceInSecurityBlock(text, fn) {
+    const b = _findSecurityBlock(text);
+    if (!b) return null;
+    const block = text.slice(b.start, b.end);
+    const next = fn(block);
+    if (next === null || next === block) return null;
+    return text.slice(0, b.start) + next + text.slice(b.end);
+}
+
 function patchSecurityLevel(text, baseline, draft) {
     const b = String(getAtPath(baseline, 'security.level') || '').replace(/['"]/g, '');
     const d = String(getAtPath(draft, 'security.level') || '').replace(/['"]/g, '');
     if (eq(b, d)) return { ok: true, text };
 
-    if (!d) {
-        const re = /^\s*level:\s*['"][^'"]*['"],?\s*$/m;
-        if (!re.test(text)) {
-            return {
-                ok: false,
-                reason: t('security.patch.levelRemoveNotFound'),
-                snippet:
-                    '// security.level 을 끄려면 해당 줄을 삭제하세요 (미설정 = 프리셋 없음).\n',
-            };
+    const next = _replaceInSecurityBlock(text, (block) => {
+        if (!d) {
+            const re = /^[ \t]*level:\s*['"][^'"]*['"],?[ \t]*\r?\n?/m;
+            return re.test(block) ? block.replace(re, '') : null;
         }
-        return { ok: true, text: text.replace(re, '') };
-    }
+        const re = /^([ \t]*level:\s*)(['"])([^'"]*)\2/m;
+        if (re.test(block)) return block.replace(re, `$1$2${d}$2`);
+        return block.replace(/^([ \t]*security:\s*\{)/m, `$1\n    level: '${d}',`);
+    });
+    if (next) return { ok: true, text: next };
+    return {
+        ok: false,
+        reason: t('security.patch.securityBlockMissing'),
+        snippet: `    level: '${d}',   // security 블록 안에 추가\n`,
+    };
+}
 
-    const re = /(\blevel:\s*)(['"])([^'"]*)\2/;
-    if (!re.test(text)) {
-        return {
-            ok: false,
-            reason: t('security.patch.levelKeyNotFound'),
-            snippet: `    level: '${d}',   // security 블록 안에 추가\n`,
-        };
-    }
-    return { ok: true, text: text.replace(re, `$1$2${d}$2`) };
+function patchSecurityPreset(text, baseline, draft) {
+    const b = String(getAtPath(baseline, 'security.preset') || '').replace(/['"]/g, '');
+    const d = String(getAtPath(draft, 'security.preset') || '').replace(/['"]/g, '');
+    if (eq(b, d)) return { ok: true, text };
+
+    const next = _replaceInSecurityBlock(text, (block) => {
+        if (!d) {
+            const re = /^[ \t]*preset:\s*['"][^'"]*['"],?[ \t]*\r?\n?/m;
+            return re.test(block) ? block.replace(re, '') : null;
+        }
+        const re = /^([ \t]*preset:\s*)(['"])([^'"]*)\2/m;
+        if (re.test(block)) return block.replace(re, `$1$2${d}$2`);
+        return block.replace(/^([ \t]*security:\s*\{)/m, `$1\n    preset: '${d}',`);
+    });
+    if (next) return { ok: true, text: next };
+    return {
+        ok: false,
+        reason: t('security.patch.securityBlockMissing'),
+        snippet: `    preset: '${d}',   // security 블록 안에 추가\n`,
+    };
+}
+
+function patchCorsAllowedOrigins(text, baseline, draft) {
+    const b = getAtPath(baseline, 'security.cors.allowedOrigins');
+    const d = getAtPath(draft, 'security.cors.allowedOrigins');
+    const bj = JSON.stringify(Array.isArray(b) ? b : []);
+    const dj = JSON.stringify(Array.isArray(d) ? d : []);
+    if (bj === dj) return { ok: true, text };
+    if (!Array.isArray(d)) return { ok: true, text };
+    const arr = JSON.stringify(d);
+
+    const next = _replaceInSecurityBlock(text, (block) => {
+        const reBlock = /(^[ \t]*cors:\s*\{[\s\S]*?^[ \t]*allowedOrigins:\s*)\[[^\]]*\]/m;
+        if (reBlock.test(block)) return block.replace(reBlock, `$1${arr}`);
+        const reInline = /(^[ \t]*cors:\s*\{\s*allowedOrigins:\s*)\[[^\]]*\]/m;
+        if (reInline.test(block)) return block.replace(reInline, `$1${arr}`);
+        return block.replace(/^([ \t]*security:\s*\{)/m, `$1\n    cors: { allowedOrigins: ${arr} },`);
+    });
+    if (next) return { ok: true, text: next };
+    return {
+        ok: false,
+        reason: t('security.patch.securityBlockMissing'),
+        snippet: `    cors: { allowedOrigins: ${arr} },\n`,
+    };
 }
 
 function patchPanelIpGuard(text, baseline, draft) {

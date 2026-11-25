@@ -473,14 +473,21 @@ Enables, in one line:
 - `strictCsp: true`, `panelIpGuard: true`, `activeDefense: { enabled: true, mode: 'enforce' }`
 - `capabilities` only when `security.capabilities.features` is declared (then the secret is required)
 
-Build/deploy **fails** when a required value is missing: JWT secret (authorization on), panel IP
-list (panelIpGuard on), CORS `allowedOrigins` empty/`*`, or authorization mode not `strict`.
+Build/deploy **fails** when a required value is missing: JWT secret (authorization/login on),
+capability secret (capabilities on), or authorization mode not `strict`.
 Explicit user values always override the preset.
+
+**Optional values**: `DOKKEBI_PANEL_ALLOWED_IPS` (only when panelIpGuard is enabled), CORS `allowedOrigins`
+(auto-derived from deploy settings when empty; disable with `security.cors.auto: false`).
 
 `dok security --audit` performs a **read-only** audit (no build/deploy): missing secrets,
 policy/authz gaps, ambiguous tenant mappings, CORS/CSP/panel settings, `.gitignore` coverage,
 and stale worker templates. It exits `1` on errors (CI-friendly); `--json` prints machine-readable
 output.
+
+`dok security --fix` derives CORS origins from deploy settings and, with `--preset production`, patches
+`security.preset`/`level`. It is dry-run by default; `--write` updates `dokkebi.config.js` and creates a `.bak`.
+Secrets are never generated or written — only reported as present/missing.
 
 ---
 
@@ -523,7 +530,7 @@ Shipping backend business logic to the browser is **by design**. Minify only, no
 
 ### 4.7 🟡 Default CORS settings
 
-Default template starts with `Access-Control-Allow-Origin: *` — restrict to actual frontend origin before deploy (especially when mixed with cookie-based other services).
+When `allowedOrigins` is empty, the build derives it from `deploy.cloudflarePages.domain`, `deploy.cloudflare.project` (`https://<project>.pages.dev`), and `deploy.r2/s3.domain`. Custom frontend origins and preview deployments (`<hash>.<project>.pages.dev`) cannot be inferred; add them manually. Disable derivation with `security.cors.auto: false`.
 
 ### 4.8 🟡 Observability
 

@@ -82,6 +82,12 @@ export async function runCreate(options = {}) {
         },
         {
             type: 'confirm',
+            name: 'productionPreset',
+            message: t('create.promptProductionPreset'),
+            default: false,
+        },
+        {
+            type: 'confirm',
             name: 'installDeps',
             message: t('create.promptInstall'),
             default: true,
@@ -91,7 +97,7 @@ export async function runCreate(options = {}) {
     const projectName = options.name || answers.name;
     const frontend = options.frontend || answers.frontend;
     const database = options.database || answers.database;
-    const { withAuth, withWebAuthn = false, proxyMode = 'server', installDeps } = answers;
+    const { withAuth, withWebAuthn = false, productionPreset = false, proxyMode = 'server', installDeps } = answers;
 
     const targetDir = path.resolve(process.cwd(), projectName);
 
@@ -131,6 +137,7 @@ export async function runCreate(options = {}) {
         withAuth,
         proxyMode,
         withWebAuthn,
+        securityPreset: productionPreset ? 'production' : 'standard',
     });
 
     if (installDeps) {

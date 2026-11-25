@@ -29,3 +29,58 @@ export function corsHeadersFor(origin, config) {
     }
     return out;
 }
+
+function _normalizeOrigin(value) {
+    let s = String(value || '').trim();
+    if (!s) return '';
+    if (!/^https?:\/\//i.test(s)) s = 'https://' + s.replace(/^\/+/, '');
+    return s.replace(/\/+$/, '');
+}
+
+/**
+ * 배포 설정에서 CORS 오리진 후보를 유도한다.
+ * - deploy.cloudflarePages.domain / deploy.cloudflare.domain
+ * - deploy.r2.domain / deploy.s3.domain
+ * - <project>.pages.dev (project 는 deploy.cloudflare.project 또는 프로젝트 디렉터리명)
+ *
+ * @param {object} config
+ * @param {{ projectName?: string }} [opts]
+ * @returns {string[]}
+ */
+export function deriveCorsOrigins(config, opts = {}) {
+    const out = [];
+    const add = (v) => {
+        const origin = _normalizeOrigin(v);
+        if (origin && !out.includes(origin)) out.push(origin);
+    };
+    const deploy = config && typeof config === 'object' ? (config.deploy || {}) : {};
+    add(deploy.cloudflarePages?.domain);
+    add(deploy.cloudflare?.domain);
+    add(deploy.r2?.domain);
+    add(deploy.s3?.domain);
+    const project = deploy.cloudflare?.project
+        || deploy.cloudflarePages?.project
+        || opts.projectName
+        || '';
+    if (project) add(`${project}.pages.dev`);
+    return out;
+}
+
+/**
+ * 기존 allowedOrigins 가 있으면 그대로 존중하고, 비어 있을 때만 자동 유도한다.
+ * security.cors.auto === false 로 끌 수 있다.
+ *
+ * @param {object} security
+ * @param {object} config
+ * @param {{ projectName?: string }} [opts]
+ * @returns {{ origins: string[], derived: string[] }}
+ */
+export function resolveCorsConfig(security, config, opts = {}) {
+    const base = normalizeCorsConfig(security);
+    const auto = security?.cors?.auto !== false;
+    if (base.origins.length > 0 || !auto) {
+        return { origins: base.origins, derived: [] };
+    }
+    const derived = deriveCorsOrigins(config, opts);
+    return { origins: derived, derived };
+}

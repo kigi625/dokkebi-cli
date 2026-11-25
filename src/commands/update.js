@@ -21,7 +21,7 @@ import readline from 'readline';
 import { pathToFileURL } from 'url';
 
 import { workerHandshake, workerDb, workerLog, workerAdmin, workerAdminApi, systemTableSql } from '../core/projectGenerator.js';
-import { normalizeCorsConfig } from '../core/cors.js';
+import { resolveCorsConfig } from '../core/cors.js';
 import { emitPayloadWireTs, disabledWireRuntimeJson } from '../core/payloadWireRuntime.js';
 import { applyDokkebiConfigAliases } from '../core/dokkebiConfigLoad.js';
 import { dokkebiClientTsSource } from '../../packages/dokkebi-vite-plugin/src/index.js';
@@ -45,7 +45,7 @@ C.muted = C.gray;
 const WORKER_FILES = [
     {
         rel:      'worker/api/_dokkebi/handshake.ts',
-        generate: (cfg) => workerHandshake(normalizeCorsConfig(cfg?.security)),
+        generate: (cfg) => workerHandshake(resolveCorsConfig(cfg?.security, cfg, { projectName: cfg?._name || '' })),
         version:  4,
         desc:     'ECDH 핸드셰이크 Worker',
     },
@@ -60,26 +60,26 @@ const WORKER_FILES = [
         // allowlist / query-registry / tenant-policy / authorization / ADL 은 dok build
         // 단계에서 임베드됩니다. update 직후에는 모두 null 자리 표시자 상태이며
         // 반드시 `dok build` 재실행 필요. Tenant Policy / Authorization / ADL 은 opt-in.
-        generate: (cfg) => workerDb(cfg.database?.type || 'd1', null, null, null, null, null, null, null, null, null, null, normalizeCorsConfig(cfg?.security)),
+        generate: (cfg) => workerDb(cfg.database?.type || 'd1', null, null, null, null, null, null, null, null, null, null, resolveCorsConfig(cfg?.security, cfg, { projectName: cfg?._name || '' })),
         version:  11,
         desc:     'DB 프록시 Worker (Allowlist + Query Registry + Tenant Policy + Authorization + Active Defense)',
         requiresRebuild: true,
     },
     {
         rel:      'worker/api/_dokkebi/log.ts',
-        generate: (cfg) => workerLog(normalizeCorsConfig(cfg?.security)),
+        generate: (cfg) => workerLog(resolveCorsConfig(cfg?.security, cfg, { projectName: cfg?._name || '' })),
         version:  4,
         desc:     '로그 수집 Worker',
     },
     {
         rel:      'worker/api/_dokkebi/_panel.ts',
-        generate: (cfg) => workerAdmin(cfg._name || 'dokkebi', null, { enabled: panelIpGuardConfigEnabled(cfg) }, normalizeCorsConfig(cfg?.security)),
+        generate: (cfg) => workerAdmin(cfg._name || 'dokkebi', null, { enabled: panelIpGuardConfigEnabled(cfg) }, resolveCorsConfig(cfg?.security, cfg, { projectName: cfg?._name || '' })),
         version:  5,
         desc:     '관제 어드민 HTML Worker (능동방어 탭 추가)',
     },
     {
         rel:      'worker/api/_dokkebi/_panel/[[path]].ts',
-        generate: (cfg) => workerAdminApi(cfg._name || 'dokkebi', null, { enabled: panelIpGuardConfigEnabled(cfg) }, normalizeCorsConfig(cfg?.security)),
+        generate: (cfg) => workerAdminApi(cfg._name || 'dokkebi', null, { enabled: panelIpGuardConfigEnabled(cfg) }, resolveCorsConfig(cfg?.security, cfg, { projectName: cfg?._name || '' })),
         version:  5,
         desc:     '관제 어드민 API Worker (능동방어 엔드포인트 추가)',
     },

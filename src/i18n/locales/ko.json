@@ -177,7 +177,8 @@
       "appwrite": "📦  Appwrite       (Document DB, Storage, Functions)",
       "server": "🖥  서버 (dok serve)          — Node.js 직접 운영 / 로컬 개발",
       "serverless": "☁  서버리스 (Cloudflare Pages) — 엣지 배포, dok serve 불필요"
-    }
+    },
+    "promptProductionPreset": "운영용 보안 프리셋(production)을 적용할까요? [아니오면 standard]"
   },
   "build": {
     "header": "dokkebi v2 WASM 빌드 시작",

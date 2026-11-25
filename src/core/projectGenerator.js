@@ -37,10 +37,10 @@ async function readCliPackageDocSafe(relPath) {
  * @param {'server'|'serverless'} opts.proxyMode - 프록시 모드
  * @param {boolean} [opts.withWebAuthn=false] - WebAuthn (Passkey) 요청 서명 활성 (v5.5+)
  */
-export async function generateProject({ name, targetDir, frontend, database, withAuth, proxyMode = 'server', withWebAuthn = false }) {
+export async function generateProject({ name, targetDir, frontend, database, withAuth, proxyMode = 'server', withWebAuthn = false, securityPreset = 'standard' }) {
     await fs.mkdir(targetDir, { recursive: true });
 
-    const files = buildFileTree({ name, frontend, database, withAuth, proxyMode, withWebAuthn });
+    const files = buildFileTree({ name, frontend, database, withAuth, proxyMode, withWebAuthn, securityPreset });
 
     const [agentsMd, securityMd] = await Promise.all([
         readCliPackageDocSafe('AGENTS.md'),
@@ -60,13 +60,13 @@ export async function generateProject({ name, targetDir, frontend, database, wit
 // 파일 트리 빌더 — 모든 조합 파일 생성
 // ─────────────────────────────────────────────────────────────
 
-function buildFileTree({ name, frontend, database, withAuth, proxyMode = 'server', withWebAuthn = false }) {
+function buildFileTree({ name, frontend, database, withAuth, proxyMode = 'server', withWebAuthn = false, securityPreset = 'standard' }) {
     const files = {};
 
     // ── 루트 파일 ──────────────────────────────────────────
 
     files['package.json'] = packageJson(name, frontend, database, proxyMode);
-    files['dokkebi.config.js'] = dokkebiConfig(database, proxyMode, { withWebAuthn });
+    files['dokkebi.config.js'] = dokkebiConfig(database, proxyMode, { withWebAuthn, securityPreset });
     files['.gitignore'] = gitignore(proxyMode);
     files['.env.example'] = envExample(database, proxyMode);
     files['README.md'] = readme(name, frontend, database, proxyMode);
@@ -192,7 +192,10 @@ function packageJson(name, frontend, database, proxyMode = 'server') {
 }
 
 function dokkebiConfig(database, proxyMode = 'server', opts = {}) {
-    const { withWebAuthn = false } = opts;
+    const { withWebAuthn = false, securityPreset = 'standard' } = opts;
+    const secLine = securityPreset === 'production'
+        ? "    preset: 'production',"
+        : "    level: 'standard',";
     const dbConfigs = {
         d1: `  database: {
     type: 'd1',
@@ -287,6 +290,7 @@ ${dbConfigs[database]}
   //     → docs/design/WEBAUTHN.md  (dokkebi-cli 저장소)
   //
 ${withWebAuthn ? `  security: {
+${secLine}
     // replay: { timestampWindowMs: 5000, nonceTtlMs: 35000 },  // 기본값이면 생략
     // ── Caller Guard (opt-in) ──────────────────────────────────
     // 페이지 frontend 번들에서 온 dokkebi 호출만 허용. DevTools 콘솔 / inline XSS
@@ -310,7 +314,12 @@ ${withWebAuthn ? `  security: {
       //   호출 안 하면 "enabled: true" 만으로는 아무 보호도 되지 않습니다.
       //   (client SDK 는 v5.5+ 빌드 시 자동 주입됩니다.)
     },
-  },` : `  // security: {
+  },` : `  // 기본 보안 레벨 — 운영 전환 시 preset: 'production' 권장
+  security: {
+${secLine}
+  },
+
+  // security: {
   //   replay:   { timestampWindowMs: 5000, nonceTtlMs: 35000 },
   //   webauthn: { enabled: false },  // v5.5+ — Passkey 요청 서명 (필요 시 true 로 전환 + 회원가입/로그인에 배선)
   //   panelIpGuard: false,           // 관제 어드민 IP allowlist. true면 DOKKEBI_PANEL_ALLOWED_IPS 필요
@@ -473,7 +482,13 @@ APPWRITE_DATABASE_ID=
 # DOKKEBI_CAPABILITY_SECRET=
 `,
     };
-    return templates[database] || '';
+    const common = `
+# ── 인증 JWT (Authorization / Tenant Policy 사용 시 필수) ────
+# 32+ bytes random — 예: openssl rand -hex 32
+# JWT_SECRET 이 없으면 Authorization/로그인 검증이 모두 실패합니다.
+JWT_SECRET=
+`;
+    return (templates[database] || '') + common;
 }
 
 function dokkebiTypeDeclarations() {

@@ -10,7 +10,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { collectSecurityAudit, formatSecurityAudit } from '../src/core/securityAudit.js';
+import { collectSecurityAudit, formatSecurityAudit, checkProductionPreflight } from '../src/core/securityAudit.js';
 
 async function makeProject({ config, env = '', gitignore = '', worker = '' }) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dok-audit-'));
@@ -138,4 +138,16 @@ test('audit: .gitignore 누락 경고', async () => {
     } finally {
         await fs.rm(root, { recursive: true, force: true });
     }
+});
+
+test('checkProductionPreflight: CORS/패널 IP 는 선택 옵션이라 차단하지 않는다', () => {
+    const r = checkProductionPreflight({
+        security: { cors: { allowedOrigins: [] }, panelIpGuard: true },
+        policyMeta: null,
+        authzMeta: null,
+        panelIpGuardEnabled: true,
+        env: {},
+    });
+    assert.deepEqual(r.issues, []);
+    assert.ok(r.warnings.some((w) => w.includes('DOKKEBI_ADMIN_PASSWORD')));
 });

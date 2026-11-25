@@ -361,13 +361,19 @@ program
     .option('--status', t('cli.opt.securityStatus'))
     .option('--interactive', t('cli.opt.securityInteractive'))
     .option('--audit', 'Run a read-only security audit (config/env/worker checks)')
-    .option('--json', 'With --audit: output machine-readable JSON')
+    .option('--fix', 'Derive CORS origins and report required secrets (dry-run by default)')
+    .option('--write', 'With --fix: write the patched dokkebi.config.js (creates .bak)')
+    .option('--preset <name>', 'With --fix: apply a security preset (production)')
+    .option('--json', 'With --audit/--fix: output machine-readable JSON')
     .action(async (src = '.', options) => {
         try {
             await runSecurity(src, {
                 status:       options.status === true,
                 interactive:  options.interactive === true,
                 audit:        options.audit === true,
+                fix:          options.fix === true,
+                write:        options.write === true,
+                preset:       options.preset,
                 json:         options.json === true,
             });
         } catch (e) {

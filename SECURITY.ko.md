@@ -474,12 +474,19 @@ security: { preset: 'production' }
 - `strictCsp: true`, `panelIpGuard: true`, `activeDefense: { enabled: true, mode: 'enforce' }`
 - `security.capabilities.features` 가 선언된 경우에만 capabilities 활성(시크릿 필요)
 
-필수 값이 없으면 빌드/배포가 **실패**한다: JWT 시크릿(authorization on), 패널 IP 목록(panelIpGuard on),
-CORS `allowedOrigins` 비어있음/`*`, authorization mode 가 strict 가 아님. 사용자 명시값은 항상 프리셋보다 우선한다.
+필수 값이 없으면 빌드/배포가 **실패**한다: JWT 시크릿(authorization/로그인 on),
+capability 시크릿(capabilities on), authorization mode 가 strict 가 아님. 사용자 명시값은 항상 프리셋보다 우선한다.
+
+**선택 값**: `DOKKEBI_PANEL_ALLOWED_IPS`(panelIpGuard 를 켤 때만), CORS `allowedOrigins`
+(비어 있으면 빌드 시 배포 설정에서 자동 유도, `security.cors.auto: false` 로 해제).
 
 `dok security --audit` 는 **읽기 전용** 감사다(빌드/배포 없음): 시크릿 누락, policy/authz 공백,
 모호한 테넌트 매핑, CORS/CSP/패널 설정, `.gitignore` 커버리지, 워커 템플릿 구버전 여부를 출력한다.
 error 가 있으면 `1` 로 종료(CI 친화적), `--json` 으로 기계 판독 출력.
+
+`dok security --fix` 는 배포 설정에서 CORS 오리진을 유도하고, `--preset production` 을 명시하면
+`security.preset`/`level` 을 패치한다. 기본은 dry-run 이며 `--write` 로 `dokkebi.config.js` 에 반영한다
+(`.bak` 백업 생성). 시크릿 값은 생성/기록하지 않고 누락 여부만 보고한다.
 
 ---
 
@@ -522,7 +529,10 @@ XSS 발생 시 공격자는:
 
 ### 4.7 🟡 CORS 기본 설정
 
-기본 템플릿은 `Access-Control-Allow-Origin: *` 로 시작 — 배포 전 실제 프론트 오리진으로 제한 필수 (특히 쿠키 기반 다른 서비스와 혼용될 때).
+`allowedOrigins` 가 비어 있으면 빌드 시 `deploy.cloudflarePages.domain`, `deploy.cloudflare.project`
+(`https://<project>.pages.dev`), `deploy.r2/s3.domain` 에서 자동 유도한다. 커스텀 프론트 오리진이나
+프리뷰 배포(`<hash>.<project>.pages.dev`)는 자동으로 알 수 없으므로 필요 시 수동 추가한다.
+`security.cors.auto: false` 로 자동 유도를 끌 수 있다.
 
 ### 4.8 🟡 관찰 가능성
 
