@@ -115,8 +115,9 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 | 범주 | 상한 |
 |---|---|
 | 핸드셰이크 | IP당 20/분(아이솔레이트 단위, `DOKKEBI_HANDSHAKE_RPM`) + 8KB 본문 |
-| DB 쿼리 | IP당 300/분 + 유효 세션 |
+| DB 쿼리 | 아이솔레이트당 IP별 1,200/분(`DOKKEBI_DB_RPM`, D1 앞 단) + 세션당 300/분 |
 | 로그 | IP당 600/분 + 64KB body |
+| 워커 로그인 | IP당 5분에 10회 실패, 식별자당 5분에 5회 실패, 10분 잠금(아이솔레이트 단위, Cloudflare WAF 병행 권장) |
 | Body 크기 | handshake 8KB / db 128KB / log 64KB / admin 2KB — `Content-Length` 선체크 + 스트리밍 중 중단 |
 | 세션 | 전역 최대 500(`DOKKEBI_MAX_SESSIONS`) + IP별 20(`DOKKEBI_MAX_SESSIONS_PER_IP`). 전역 초과 시 **가장 많이 만든 IP**에서 먼저 축출(오래된 전역 세션 축출 아님) |
 | Nonce 캐시 | TTL 35s + 60s 주기 정리 |

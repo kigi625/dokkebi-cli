@@ -56,7 +56,7 @@ const POLICY = normalizePolicyConfig(
 
 async function loadWorkerInternals() {
     const source = workerDb('d1', ALLOWLIST, null, POLICY, AUTHZ, null, null, null, null, null, null, { origins: ['https://app.example.com'] })
-        + '\nexport { validateSqlAllowlist, findInternalTableRef, _az_checkSql, verifyTenantPolicy, injectTenantPolicy, _pe_detectOp, _isReadOnlySelectSql, _az_resolveJwtSecret, _az_verifyJwtHs256, _jwtClaimIdentity, _corsHeadersFor };\n';
+        + '\nexport { validateSqlAllowlist, findInternalTableRef, _az_checkSql, verifyTenantPolicy, injectTenantPolicy, _pe_detectOp, _isReadOnlySelectSql, _az_resolveJwtSecret, _az_verifyJwtHs256, _jwtClaimIdentity, _corsHeadersFor, _dbIpRateLimited, _loginRateCheck, _loginRateFail, _loginRateReset, _cap_verifyToken };\n';
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dokkebi-worker-sec-'));
     const tsPath = path.join(dir, 'worker.ts');
     await fs.writeFile(tsPath, source, 'utf-8');
@@ -469,4 +469,35 @@ test('워커 템플릿: 부정/추가 비교 테넌트 조건 거부', () => {
 
     assert.equal(worker.verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ?', ['u1'], ctx, p).ok, true);
     assert.equal(worker.verifyTenantPolicy('SELECT * FROM posts WHERE user_id = ? COLLATE NOCASE', ['u1'], ctx, p).ok, true);
+});
+
+test('워커 템플릿: per-IP pre-gate 로 임의 sid D1 증폭을 제한', () => {
+    const env = { DOKKEBI_DB_RPM: '60' };
+    for (let i = 0; i < 60; i++) {
+        assert.equal(worker._dbIpRateLimited(env, '203.0.113.9'), false, 'call ' + i);
+    }
+    assert.equal(worker._dbIpRateLimited(env, '203.0.113.9'), true);
+    assert.equal(worker._dbIpRateLimited(env, '203.0.113.10'), false);
+});
+
+test('워커 템플릿: 로그인 실패 횟수 제한 / 성공 시 초기화', () => {
+    const key = 'id:test-' + Date.now();
+    for (let i = 0; i < 5; i++) worker._loginRateFail(key, 5);
+    assert.equal(worker._loginRateCheck(key, 5).allowed, false);
+    worker._loginRateReset(key);
+    assert.equal(worker._loginRateCheck(key, 5).allowed, true);
+});
+
+test('워커 템플릿: malformed capability prev token 은 throw 없이 거부', async () => {
+    const env = { DOKKEBI_CAPABILITY_SECRET: 'x'.repeat(32) };
+    const r = await worker._cap_verifyToken(env, 'sid', 'a.b.%%%');
+    assert.equal(r.ok, false);
+    assert.match(String(r.reason), /TOKEN_(HEADER_INVALID|MALFORMED)/);
+});
+
+test('워커 템플릿: malformed JWT 서명은 throw 없이 거부', async () => {
+    const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    const token = b64({ alg: 'HS256', typ: 'JWT' }) + '.' + b64({ exp: 9999999999 }) + '.%%%';
+    const r = await worker._az_verifyJwtHs256(token, { DOKKEBI_JWT_SECRET: JWT_SECRET });
+    assert.equal(r.valid, false);
 });

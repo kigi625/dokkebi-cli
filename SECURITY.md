@@ -115,8 +115,9 @@ Parameter binding is handled by D1/Supabase/Appwrite SDK via `prepare().bind()`.
 | Category | Limit |
 |---|---|
 | Handshake | 20/min per IP per isolate (`DOKKEBI_HANDSHAKE_RPM`) + 8KB body |
-| DB query | 300/min per IP + valid session |
+| DB query | 1,200/min per IP per isolate (`DOKKEBI_DB_RPM`, pre-D1) + 300/min per session |
 | Log | 600/min per IP + 64KB body |
+| Worker login | 10 failures / 5 min per IP, 5 failures / 5 min per identifier, 10 min lock (isolate-level; Cloudflare WAF recommended) |
 | Body size | handshake 8KB / db 128KB / log 64KB / admin 2KB — `Content-Length` pre-check + abort during streaming |
 | Sessions | max 500 global (`DOKKEBI_MAX_SESSIONS`) + per-IP cap 20 (`DOKKEBI_MAX_SESSIONS_PER_IP`). When over the global cap, the **most crowded IP** is evicted first (not the oldest global session) |
 | Nonce cache | TTL 35s + cleanup every 60s |

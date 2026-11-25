@@ -1,4 +1,4 @@
-// @dokkebi-version: 11
+// @dokkebi-version: 12
 // worker/api/_dokkebi/db.ts
 // Cloudflare Pages Function — DB 프록시 (D1 세션 + AES-256-GCM 양방향 암호화 + Nonce 재전송 방어)
 //
@@ -150,6 +150,39 @@ const _PREGATE_RPM = Number(_replayCfg?.pregate?.rpm ?? 300);
 const _BUCKET_CAPACITY = Math.max(10, Math.min(10_000, _PREGATE_RPM));
 const _BUCKET_REFILL_MS = Math.max(50, Math.floor(60_000 / Math.max(1, _PREGATE_RPM)));
 
+// ── Phase 2-⑤b Per-IP pre-gate (pre-D1) ───────────────────
+//   sid 는 클라이언트가 임의로 만들 수 있어, per-session 버킷만으로는
+//   매 요청마다 새 버킷을 받아 D1 조회를 무제한으로 유발할 수 있다.
+//   저렴한 per-IP 버킷을 D1 앞에 두어 증폭/비용 공격을 막는다.
+const _DB_IP_RPM = Math.max(60, Math.min(6_000, Number(_replayCfg?.ipGate?.rpm ?? 1_200)));
+const _DB_IP_BUCKETS_MAX = 10_000;
+const _dbIpBuckets = new Map<string, { tokens: number; refillAt: number }>();
+function _dbIpRateLimited(env: Env, ip: string): boolean {
+  const cap = Math.max(60, Math.min(6_000, Number((env as any).DOKKEBI_DB_RPM || _DB_IP_RPM) || _DB_IP_RPM));
+  const refillMs = Math.max(50, Math.floor(60_000 / cap));
+  const now = Date.now();
+  const key = String(ip || 'unknown');
+  let b = _dbIpBuckets.get(key);
+  if (!b) {
+    if (_dbIpBuckets.size >= _DB_IP_BUCKETS_MAX) {
+      for (const [k, v] of _dbIpBuckets) {
+        if (now - v.refillAt > 60_000) _dbIpBuckets.delete(k);
+      }
+      if (_dbIpBuckets.size >= _DB_IP_BUCKETS_MAX) _dbIpBuckets.clear();
+    }
+    b = { tokens: cap, refillAt: now };
+    _dbIpBuckets.set(key, b);
+  }
+  const n = Math.floor((now - b.refillAt) / refillMs);
+  if (n > 0) {
+    b.tokens = Math.min(cap, b.tokens + n);
+    b.refillAt = now;
+  }
+  if (b.tokens <= 0) return true;
+  b.tokens -= 1;
+  return false;
+}
+
 // ── Phase 2-⑦ Mutation budget (per-session, sliding window) ─
 //   WRITE (INSERT/UPDATE/DELETE) 및 DELETE 의 분당 상한.
 //   security.mutationBudget.{writesPerMinute,deletesPerMinute} 로 조정.
@@ -247,6 +280,7 @@ function _adlCachePrune<T>(map: Map<string, T>) {
 // Phase 2-⑤ — 세션 캐시가 아직 없을 때(콜드패스 직전) 임시로 토큰 버킷을
 // 유지하기 위한 Map. 프루닝: 10분 아이들 시 제거.
 const _pregateTmp = new Map<string, { tokens: number; refillAt: number }>();
+const _PREGATE_TMP_MAX = 20_000;
 let _pregateTmpPruneAt = 0;
 function prunePregateTmp() {
   const now = Date.now();
@@ -1223,10 +1257,13 @@ async function _az_verifyJwtHs256(token: string, env: Env): Promise<{ valid: boo
   }
   const secret = _az_resolveJwtSecret(env);
   if (!secret) return { valid: false, reason: 'DOKKEBI_JWT_SECRET 또는 JWT_SECRET 미설정' };
-  const sig = _az_b64urlToBytes(s64);
-  const data = new TextEncoder().encode(`${h64}.${p64}`);
-  const key = await _az_getJwtKey(secret);
-  const ok = await crypto.subtle.verify('HMAC', key, sig, data);
+  let ok = false;
+  try {
+    const sig = _az_b64urlToBytes(s64);
+    const data = new TextEncoder().encode(`${h64}.${p64}`);
+    const key = await _az_getJwtKey(secret);
+    ok = await crypto.subtle.verify('HMAC', key, sig, data);
+  } catch { ok = false; }
   if (!ok) return { valid: false, reason: '서명 불일치' };
 
   const now = Date.now();
@@ -1288,6 +1325,47 @@ async function _login_signJwt(env: Env, claims: Record<string, unknown>): Promis
   const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
   return h64 + '.' + p64 + '.' + _cap_b64url(sig);
 }
+// ── 워커 로그인 브루트포스 방어 ─────────────────────────────
+//   세션 HMAC 은 핸드셰이크만으로 누구나 얻을 수 있으므로, 로그인 시도 자체를
+//   IP / 식별자 단위로 제한한다. (서버리스 아이솔레이트 단위 방어)
+const _LOGIN_ATTEMPTS_MAX = 5_000;
+const _LOGIN_IP_LIMIT = 10;
+const _LOGIN_ID_LIMIT = 5;
+const _LOGIN_WINDOW_MS = 5 * 60_000;
+const _LOGIN_LOCK_MS = 10 * 60_000;
+const _loginAttempts = new Map<string, { count: number; resetAt: number; lockedUntil: number }>();
+function _loginRateCheck(key: string, limit: number): { allowed: boolean; retryAfterSec?: number } {
+  const now = Date.now();
+  const e = _loginAttempts.get(key);
+  if (!e) return { allowed: true };
+  if (e.lockedUntil && now < e.lockedUntil) {
+    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((e.lockedUntil - now) / 1000)) };
+  }
+  if (now > e.resetAt) { _loginAttempts.delete(key); return { allowed: true }; }
+  if (e.count >= limit) {
+    e.lockedUntil = now + _LOGIN_LOCK_MS;
+    return { allowed: false, retryAfterSec: Math.ceil(_LOGIN_LOCK_MS / 1000) };
+  }
+  return { allowed: true };
+}
+function _loginRateFail(key: string, limit: number): void {
+  const now = Date.now();
+  if (_loginAttempts.size >= _LOGIN_ATTEMPTS_MAX) {
+    for (const [k, v] of _loginAttempts) {
+      if (now > v.resetAt && (!v.lockedUntil || now > v.lockedUntil)) _loginAttempts.delete(k);
+    }
+    if (_loginAttempts.size >= _LOGIN_ATTEMPTS_MAX) _loginAttempts.clear();
+  }
+  let e = _loginAttempts.get(key);
+  if (!e || now > e.resetAt) e = { count: 0, resetAt: now + _LOGIN_WINDOW_MS, lockedUntil: 0 };
+  e.count += 1;
+  if (e.count >= limit) e.lockedUntil = now + _LOGIN_LOCK_MS;
+  _loginAttempts.set(key, e);
+}
+function _loginRateReset(key: string): void {
+  _loginAttempts.delete(key);
+}
+
 function _login_b64urlToBytes(s: string): Uint8Array {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
   const b64 = (s + pad).replace(/-/g, '+').replace(/_/g, '/');
@@ -1581,9 +1659,20 @@ async function _cap_verifyToken(env: Env, sid: string, token: string): Promise<{
   if (parts.length !== 3) return { ok: false, reason: 'TOKEN_MALFORMED' };
   const [h64, p64, proof] = parts;
   const data = new TextEncoder().encode(h64 + '.' + p64);
-  const sigBin = atob(proof.replace(/-/g, '+').replace(/_/g, '/').padEnd(proof.length + ((4 - proof.length % 4) % 4), '='));
-  const sigBytes = new Uint8Array(sigBin.length);
-  for (let i = 0; i < sigBin.length; i++) sigBytes[i] = sigBin.charCodeAt(i);
+  let header: any = null;
+  try {
+    const paddedH = h64.replace(/-/g, '+').replace(/_/g, '/').padEnd(h64.length + ((4 - h64.length % 4) % 4), '=');
+    header = JSON.parse(atob(paddedH));
+  } catch { return { ok: false, reason: 'TOKEN_HEADER_INVALID' }; }
+  if (!header || header.typ !== 'DOKKEBI-CAP' || header.alg !== 'HS256') {
+    return { ok: false, reason: 'TOKEN_HEADER_INVALID' };
+  }
+  let sigBytes: Uint8Array;
+  try {
+    const sigBin = atob(proof.replace(/-/g, '+').replace(/_/g, '/').padEnd(proof.length + ((4 - proof.length % 4) % 4), '='));
+    sigBytes = new Uint8Array(sigBin.length);
+    for (let i = 0; i < sigBin.length; i++) sigBytes[i] = sigBin.charCodeAt(i);
+  } catch { return { ok: false, reason: 'TOKEN_MALFORMED' }; }
   const sigKey = await _cap_getSignKey(env);
   const ok = await crypto.subtle.verify('HMAC', sigKey, sigBytes, data).catch(() => false);
   if (!ok) return { ok: false, reason: 'TOKEN_BAD_SIGNATURE' };
@@ -2739,8 +2828,17 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
   }
 
   const headers = { 'Content-Type': 'application/json; charset=utf-8', ..._corsHeadersFor(request) };
-  const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || '';
+  const clientIp = (request.headers.get('CF-Connecting-IP')
+    || (request.headers.get('X-Forwarded-For') || '').split(',')[0]
+    || '').trim();
   const reqStart = Date.now();
+
+  // D1 조회 전 per-IP 게이트 — 임의 sid 로 매 요청 새 세션 버킷을 받는 우회 차단.
+  if (_dbIpRateLimited(env, clientIp)) {
+    return new Response(JSON.stringify({
+      ok: false, code: 'IP_RATE_LIMIT', error: '요청이 너무 많습니다. 잠시 후 다시 시도하세요.',
+    }), { status: 429, headers });
+  }
 
   // ── Phase 1-② Envelope size cap (pre-parse) ─────────────
   //   파싱/복호화 전에 거대 페이로드를 잘라 CPU DoS 차단.
@@ -2775,7 +2873,17 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
         tokens = bucket.bucketTokens; refillAt = bucket.bucketRefillAt;
       } else {
         let tmp = _pregateTmp.get(sid as string);
-        if (!tmp) { tmp = { tokens: _BUCKET_CAPACITY, refillAt: now0 }; _pregateTmp.set(sid as string, tmp); }
+        if (!tmp) {
+          // 임의 sid 로 Map 이 무한히 커지지 않도록 상한을 둔다.
+          if (_pregateTmp.size >= _PREGATE_TMP_MAX) {
+            for (const [k, v] of _pregateTmp) {
+              if (now0 - v.refillAt > 60_000) _pregateTmp.delete(k);
+            }
+            if (_pregateTmp.size >= _PREGATE_TMP_MAX) _pregateTmp.clear();
+          }
+          tmp = { tokens: _BUCKET_CAPACITY, refillAt: now0 };
+          _pregateTmp.set(sid as string, tmp);
+        }
         tokens = tmp.tokens; refillAt = tmp.refillAt;
       }
       const elapsed = Math.max(0, now0 - refillAt);
@@ -2914,8 +3022,11 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
 
     // ── 4. 요청 HMAC 검증 (CPU only) ─────────────────────────
     const sigInput = new TextEncoder().encode(`${nonce}:${reqTs}:${enc}`);
-    const providedSig = Uint8Array.from(atob(sig), (c) => c.charCodeAt(0));
-    const isValidSig = await crypto.subtle.verify('HMAC', cached.sigKey, providedSig, sigInput);
+    let isValidSig = false;
+    try {
+      const providedSig = Uint8Array.from(atob(String(sig)), (c) => c.charCodeAt(0));
+      isValidSig = await crypto.subtle.verify('HMAC', cached.sigKey, providedSig, sigInput);
+    } catch { isValidSig = false; }
     if (!isValidSig) {
       logSecurity(_internalDb(env), 'hmac_fail', clientIp, '/api/_dokkebi/db', 'request HMAC-SHA256 mismatch');
       return new Response(JSON.stringify({
@@ -3174,6 +3285,15 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
       if (identifier.length > 256 || password.length > 1024) {
         return _loginErr('LOGIN_BAD_INPUT', '입력이 너무 깁니다.', 400);
       }
+      const _loginIpKey = 'ip:' + (clientIp || 'unknown');
+      const _loginIdKey = 'id:' + identifier.toLowerCase();
+      const _gateIp = _loginRateCheck(_loginIpKey, _LOGIN_IP_LIMIT);
+      const _gateId = _loginRateCheck(_loginIdKey, _LOGIN_ID_LIMIT);
+      if (!_gateIp.allowed || !_gateId.allowed) {
+        const retry = Math.max(_gateIp.retryAfterSec || 0, _gateId.retryAfterSec || 0, 1);
+        ctx.waitUntil(logSecurity(_internalDb(env), 'login_rate_limited', clientIp, '/api/_dokkebi/db', 'retryAfterSec=' + retry));
+        return _loginErr('LOGIN_RATE_LIMIT', '로그인 시도가 너무 많습니다. ' + retry + '초 후 다시 시도하세요.', 429);
+      }
       let row: Record<string, unknown> | null = null;
       try {
         row = (await _userDbForSql(env).prepare(String(_authLoginMeta.query)).bind(identifier).first()) as any;
@@ -3186,9 +3306,13 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
       // 사용자 부재 시에도 더미 검증을 수행해 타이밍 기반 유저 열거를 줄인다.
       const pwOk = await _login_verifyPassword(password, typeof stored === 'string' ? stored : 'pbkdf2$100000$AAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
       if (!row || typeof stored !== 'string' || !pwOk) {
+        _loginRateFail(_loginIpKey, _LOGIN_IP_LIMIT);
+        _loginRateFail(_loginIdKey, _LOGIN_ID_LIMIT);
         ctx.waitUntil(logSecurity(_internalDb(env), 'login_fail', clientIp, '/api/_dokkebi/db', 'invalid credentials'));
         return _loginErr('LOGIN_INVALID', '아이디 또는 비밀번호가 올바르지 않습니다.', 401);
       }
+      _loginRateReset(_loginIpKey);
+      _loginRateReset(_loginIdKey);
       // 클레임 매핑 { claimName: dbColumn } — 예약(`_`) 클레임은 차단(C-2 와 동일 원칙).
       const claims: Record<string, unknown> = {};
       const claimMap = (_authLoginMeta.claims && typeof _authLoginMeta.claims === 'object') ? _authLoginMeta.claims : { user_id: 'id' };
