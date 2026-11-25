@@ -6,7 +6,7 @@ function _internalDb(env: any): D1Database {
   const b = env && (env as any)[_DOKKEBI_INTERNAL_BINDING];
   return (b as D1Database) || (env && _internalDb(env));
 }
-// @dokkebi-version: 4
+// @dokkebi-version: 5
 // worker/api/_dokkebi/_panel.ts
 // Cloudflare Pages Function — 관제 어드민 API
 // GET  /_dokkebi/_panel          → 대시보드 HTML

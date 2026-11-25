@@ -8,7 +8,7 @@ function _internalDb(env: any): D1Database {
   if (env && env.DB) return env.DB as D1Database; // 내부 바인딩 미설정 시 기본 DB
   throw new Error('[dokkebi] D1 바인딩 "' + _DOKKEBI_INTERNAL_BINDING + '" 이 없습니다. wrangler.toml 의 d1_databases 를 확인하세요.');
 }
-// @dokkebi-version: 3
+// @dokkebi-version: 4
 // worker/api/_dokkebi/log.ts
 // Cloudflare Pages Function — WASM VM 로그 수집
 // POST /api/_dokkebi/log {level, tag, messages}

@@ -1,4 +1,4 @@
-// @dokkebi-version: 3
+// @dokkebi-version: 4
 // worker/api/_dokkebi/handshake.ts
 // Cloudflare Pages Function — ECDH P-256 핸드셰이크 (Ephemeral 키 — Forward Secrecy)
 //

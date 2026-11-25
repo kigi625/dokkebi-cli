@@ -1,4 +1,4 @@
-// @dokkebi-version: 10
+// @dokkebi-version: 11
 // worker/api/_dokkebi/db.ts
 // Cloudflare Pages Function — DB 프록시 (D1 세션 + AES-256-GCM 양방향 암호화 + Nonce 재전송 방어)
 //

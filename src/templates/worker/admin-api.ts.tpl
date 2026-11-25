@@ -6,7 +6,7 @@ function _internalDb(env: any): D1Database {
   const b = env && (env as any)[_DOKKEBI_INTERNAL_BINDING];
   return (b as D1Database) || (env && _internalDb(env));
 }
-// @dokkebi-version: 4
+// @dokkebi-version: 5
 // worker/api/_dokkebi/_panel/[[path]].ts
 // Cloudflare Pages Function — 관제 어드민 API (서브패스 캐치올)
 // POST /api/_dokkebi/_panel/auth          → 비밀번호 인증 → 토큰 발급
