@@ -62,6 +62,8 @@ import { runBuild } from './build.js';
 import { loadWireRuntimeForLocalProxy, denormalizePayload, verifyAndStripPow } from '../core/payloadWireRuntime.js';
 import { buildBundleBootPayload, injectBundleBootScript } from '../core/bundleBoot.js';
 import { t } from '../i18n/index.js';
+import { normalizeCorsConfig, corsHeadersFor } from '../core/cors.js';
+import { sanitizeLogText, sanitizeLogTag } from '../core/logSanitize.js';
 
 // ─────────────────────────────────────────────────────────────
 // ECDH P-256 — 핸드셰이크마다 새 키쌍 (Forward Secrecy)
@@ -363,6 +365,8 @@ export async function runServe(src, options = {}) {
     ).trim();
     const bcKeyHexServe = String(handshakeSecretSource.__DOKKEBI_BC_KEY__ || '').replace(/\s/g, '');
 
+    const _corsCfg = normalizeCorsConfig(dokConfig?.security);
+
     const server = http.createServer(async (req, res) => {
         const urlPath = req.url?.split('?')[0] || '/';
         const reqUrl = new URL(req.url || '/', 'http://dokkebi.serve');
@@ -379,9 +383,16 @@ export async function runServe(src, options = {}) {
         });
 
         // ── CORS preflight ──────────────────────────────────
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Dokkebi-Session, Authorization');
+        // 관제 패널은 same-origin 전용 — ACAO 를 내보내지 않는다.
+        // 그 외 경로는 security.cors.allowedOrigins 를 따른다(미설정 시 기존 '*').
+        const _isPanelPath = urlPath.startsWith('/_dokkebi/_panel') || urlPath.startsWith('/api/_dokkebi/_panel');
+        if (!_isPanelPath) {
+            for (const [k, v] of Object.entries(corsHeadersFor(req.headers.origin || '', _corsCfg))) {
+                res.setHeader(k, v);
+            }
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Dokkebi-Session, Authorization');
+        }
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
         // ── Local GIF encode (ffmpeg) — sticker editor ────────
@@ -1160,6 +1171,7 @@ async function handleLogCollect(req, res, ctx = {}) {
     catch (e) { handleReadJsonError(res, e); return; }
 
     let { level = 'log', tag = 'backend', messages = [] } = body;
+    tag = sanitizeLogTag(tag);
     if (tag === 'uncaught' || tag === 'unhandled-promise') level = 'error';
 
     const levelColor = LOG_LEVEL_COLOR[level] || C.gray;
@@ -1167,9 +1179,13 @@ async function handleLogCollect(req, res, ctx = {}) {
     const icon       = level === 'error' ? '✗' : level === 'warn' ? '⚠' : level === 'info' ? 'ℹ' : '▸';
     const prefix     = `${ts()} ${tagColor}[${tag}]${C.reset} ${levelColor}${icon}${C.reset}`;
 
-    const formatted = messages
-        .map(m => (typeof m === 'object' ? JSON.stringify(m) : String(m)))
-        .join(' ');
+    const formatted = sanitizeLogText(
+        (Array.isArray(messages) ? messages : [])
+            .slice(0, 50)
+            .map(m => (typeof m === 'object' ? JSON.stringify(m) : String(m)))
+            .join(' '),
+        8000,
+    );
 
     const lines = formatted.split('\n');
     const first = lines[0];

@@ -135,9 +135,10 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 
 | 항목 | 동작 |
 |---|---|
-| CORS | `/api/_dokkebi/{db,log,handshake}` 가 `security.cors.allowedOrigins` 를 적용: 목록에 있는 `Origin` 만 echo(+`Vary: Origin`). 비어있거나 `*` 면 기존 `*` 유지. |
+| CORS | `/api/_dokkebi/{db,log,handshake}` 와 `dok serve`/`dok dev` 가 `security.cors.allowedOrigins` 를 적용: 목록에 있는 `Origin` 만 echo(+`Vary: Origin`). 비어있거나 `*` 면 기존 `*` 유지. |
 | HSTS | `dok deploy` 가 `_headers` 에 `Strict-Transport-Security: max-age=31536000; includeSubDomains` 추가 (`security.hsts: false` 로 해제). |
-| 관제 패널 | 서버리스/serve 패널 응답에 `Content-Security-Policy`(`frame-ancestors 'none'`), `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` 추가. 로그 필드는 속성 컨텍스트까지 포함해 HTML 이스케이프. |
+| 관제 패널 | 서버리스/serve 패널 응답에 `Content-Security-Policy`(`frame-ancestors 'none'`), `X-Frame-Options: DENY`, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` 추가. 로그 필드는 속성 컨텍스트까지 포함해 HTML 이스케이프. **패널/인증/API 응답은 same-origin 전용으로 `Access-Control-Allow-Origin` 을 내보내지 않는다** (교차 출처 비밀번호 브루트포스 응답·토큰 탈취 방지). |
+| 로그 | `/api/_dokkebi/log` 는 인증이 없으므로 본문의 ANSI/OSC/제어문자·개행을 제거해 터미널 조작과 로그 라인 위조를 막는다. |
 | 로컬 DB(sql.js) | `localDbMode` 빌드는 `sql-wasm.js/.wasm` 을 `/dokkebi/` 로 복사해 same-origin 로드. CDN fallback 은 스크립트 SRI + wasm SHA-384 검증 후 `wasmBinary` 로 전달. |
 
 ### 2.6 정보 노출
@@ -744,14 +745,14 @@ dokkebi 는 다음 3중 방어로 이 race 를 제거합니다 (모두 자동, �
 | 16 | **Bundle Attestation (chunk SHA-256)** | 백엔드 로직/번들 무결성 | (opt-in, capabilities 켜면 자동) 변조된 번들 차단 | `dok build` 가 `backend-bundle.chunks.json` (16KB chunk SHA-256 매니페스트) 생성 → 워커 코드에 임베드 (클라이언트 비노출). `_attest` challenge → 클라가 메모리 번들 슬라이싱 응답. 실패시 `attest_failed` / `CAPABILITY_ATTEST_REQUIRED`. `requires: { attest: true }` 시 capability 발급 게이트 | 클라이언트 번들 패치(권한 분기 우회·자유 capability 발급) | ✅ 정상 |
 | 17 | **Active Defense Layer (ADL)** | 백엔드 로직/봇·자동화 | (opt-in) 위험 점수 기반 차단 | `_adlRisk` 계산 (`ADL_RISK_BLOCK` threshold). `mode: 'monitor'` 로그만 / `'enforce'` 차단. `sampleRate`, `riskBlockThreshold`, `trigger: 'lazy'/'cron'`, Workers AI 옵션 | 자동화 스크래핑, 403/인증 실패 다발, 가격 fuzzing | ✅ 정상 |
 | 18 | **Panel IP Guard (CIDR)** | 네트워크/관제 | (opt-in) 관제 패널 외부 IP 차단 | `workerAdmin`/`workerAdminApi` 에 `panelIpAllowed` + CIDR 매칭. `CF-Connecting-IP` 우선 → `X-Forwarded-For` fallback. 차단 시 403 + `panel_ip_block` 이벤트 (`_dokkebi_security`) | 패널 비밀번호 무차별 대입, 외부 IP 관제 API 호출, 로그/이벤트 무단 조회·삭제 | ✅ 정상 |
-| 19 | **관리자 패널 보안 (PW + 락 + 토큰)** | 백엔드 로직/관제 | 항상 ON | `timingSafeEqual` 상수-시간 PW 비교, 5회 실패 → 5분 락, HMAC 서명 + 만료 토큰, 2KB body 상한, 600/min 로그 한도 | 패널 PW 브루트포스, 타이밍 공격, 토큰 위조, 관제 DoS | ✅ 정상 |
+| 19 | **관리자 패널 보안 (PW + 락 + 토큰)** | 백엔드 로직/관제 | 항상 ON | `timingSafeEqual` 상수-시간 PW 비교, 5회 실패 → 5분 락, HMAC 서명 + 만료 토큰, 2KB body 상한, 600/min 로그 한도, 패널 응답 ACAO 미전송(same-origin 전용) | 패널 PW 브루트포스, 타이밍 공격, 토큰 위조, 교차 출처 토큰 탈취, 관제 DoS | ✅ 정상 |
 | 20 | **Strict CSP (hash-pinned)** | 네트워크/XSS 심층방어 | (opt-in) | `deploy.js _writeSecurityHeaders` → `dist/_headers`. 인라인 `<script>/<style>` 콘텐츠를 SHA-256 해싱해 `script-src 'self' 'sha256-…'` 자동 부여, `unsafe-inline` 제거. CSP 전 directive 명시 | XSS 후속 외부 스크립트 주입, eval, 데이터 유출 (자료/키 탈취) | ✅ 정상 |
 | 21 | **Opaque Handle (번들 키 한정)** | 백엔드 로직/시크릿 | 항상 ON | `__DOKKEBI_BC_KEY__` 만 AES-GCM 으로 감싸 OPFS 저장, host 클로저에서만 복호화. 서버 전용 `.env` Secret 은 브라우저로 전달되지 않으며 백엔드 `process.env.SECRET` 은 배포/strict 빌드에서 차단. `.dokkebi/env-secrets.json` 정적 서빙 차단 | 브라우저 콘솔/DevTools 환경변수 노출, 클라이언트 코드 dump | ✅ 정상 (XSS 시 같은 origin 재현 가능 — §4.3) |
 | 22 | **번들 무결성 SHA-256** | 빌드/번들 | 항상 ON | `dok build` 가 `backend.bundle.enc` SHA-256 → `backend.bundle.<hash12>.enc` immutable 파일명 + 런타임 `crypto.subtle.digest` 검증 | 번들 교체/변조, MITM 번들 swap | ✅ 정상 |
 | 23 | **무중단 배포 — BC_KEY_MAP** | 빌드/배포 | 항상 ON (v6.x+) | `__DOKKEBI_BC_KEY_MAP__` (최근 5개 빌드 키 FIFO) Worker Secret 등록. 클라가 `bh=<hash12>` 동봉 → `pickClientHandshakeSecrets()` 가 매칭 키로 응답 | 캐시·전파 race로 인한 핸드셰이크 실패 (시나리오 A·B) | ✅ 정상 |
 | 24 | **무중단 배포 — `prop_pending` 흡수** | 빌드/배포 | 항상 ON | `_pickBcKeyForBundle()` 가 `bh` 미매칭 + direct 키도 현재 번들용 아님 시 `status: 'pending'` 반환. 핸드셰이크 핸들러는 잘못된 키로 폴백하지 않고 `200 + { pending: true, code: 'prop_pending', retryAfterMs: 5000 }` 응답 → 클라 SDK 자동 백오프 재시도 | 새 deploy 직후 ~수십초의 Worker Secret 전파 지연 시 사용자에게 빨간 콘솔 에러로 노출되는 문제, 잘못된 키로 복호화 실패 후 무한 재시도 | ✅ 정상 |
 | 25 | **무중단 배포 — 전파 슬립** | 빌드/배포 | 항상 ON | `dok deploy` 순서: Secret 등록 → `DOKKEBI_SECRET_PROPAGATION_MS` (기본 15s) sleep → 정적자산 push | 새 정적 자산 ↔ 옛 Worker Secret race | ✅ 정상 |
-| 26 | **CORS 정책** | 네트워크 | 항상 ON | `security.cors.allowedOrigins` 가 워커에 임베드되어 `/api/_dokkebi/{db,log,handshake}` 는 목록의 Origin 만 echo(+`Vary: Origin`). 미설정/`*` 면 기존 `*` 유지, `dok deploy` preflight 경고. | 목록에 없는 출처의 교차 읽기 | ✅ 강제 |
+| 26 | **CORS 정책** | 네트워크 | 항상 ON | `security.cors.allowedOrigins` 가 워커에 임베드되어 `/api/_dokkebi/{db,log,handshake}` 는 목록의 Origin 만 echo(+`Vary: Origin`). `dok serve`/`dok dev` 도 동일 설정을 적용하며, 관제 패널 경로는 ACAO 를 내보내지 않는다. 미설정/`*` 면 기존 `*` 유지, `dok deploy` preflight 경고. | 목록에 없는 출처의 교차 읽기, 패널 토큰 탈취 | ✅ 강제 |
 | 27 | **plugin-fetch 도메인 화이트리스트** | 백엔드 로직/외부 호출 | 항상 ON | http/https 강제, TLD 단독 거부, 프로젝트별 화이트리스트 | SSRF, 임의 외부 fetch | ✅ 정상 |
 | 28 | **plugin-ai 빌드 차단** | 빌드 | 항상 ON | `NODE_ENV=production` + `acknowledgeKeyExposure` 미명시 → 빌드 실패 (`pluginLoader.js`) | API 키 브라우저 노출 (구조적 위험) | ✅ 정상 |
 | 29 | **Build-time Advisor** | 빌드/사람 실수 | (opt-out) | OpenAI/Stripe/LemonSqueezy URL, `points.deduct(`, `wallet.charge(`, secret env 직접 사용 라우트 스캔 → capability 미선언 시 경고 | capability 선언 누락 인적 실수 (간접 방어) | ✅ 정상 |

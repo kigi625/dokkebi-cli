@@ -19,7 +19,15 @@ export interface Env {
 }
 
 // 내부 도깨비 경로는 집계에서 제외 (이중 집계 방지 + 관제 패널 자체 트래픽 제외)
-const SKIP_PATHS = ['/_dokkebi/db', '/_dokkebi/handshake', '/_dokkebi/log', '/_dokkebi/_panel'];
+// 주의: includes() 로 판정하면 `/api/foo/_dokkebi/db` 같은 경로가 로그를 회피한다.
+//       정확히 일치하거나 하위 경로일 때만 제외한다.
+const SKIP_PATHS = [
+  '/api/_dokkebi/db', '/api/_dokkebi/handshake', '/api/_dokkebi/log', '/api/_dokkebi/_panel',
+  '/_dokkebi/db', '/_dokkebi/handshake', '/_dokkebi/log', '/_dokkebi/_panel',
+];
+function _isInternalPath(path: string): boolean {
+  return SKIP_PATHS.some((p) => path === p || path.startsWith(p + '/'));
+}
 const LOW_VALUE_PATHS = ['/api/health', '/favicon.ico'];
 
 const _reqDedup = new Map<string, number>();
@@ -74,7 +82,7 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
   const path = url.pathname;
   const method = request.method;
 
-  const isInternal = SKIP_PATHS.some(p => path.includes(p));
+  const isInternal = _isInternalPath(path);
 
   if (!env.DB || isInternal || method === 'OPTIONS') {
     return next();

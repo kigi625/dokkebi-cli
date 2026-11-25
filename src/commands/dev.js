@@ -74,6 +74,8 @@ import { loadWireRuntimeForLocalProxy, denormalizePayload, verifyAndStripPow } f
 import { loadPlugins, generatePluginBootstrapCode } from '../core/pluginLoader.js';
 import { loadDokkebiConfigMerged } from '../core/dokkebiConfigLoad.js';
 import { t } from '../i18n/index.js';
+import { normalizeCorsConfig, corsHeadersFor } from '../core/cors.js';
+import { sanitizeLogText, sanitizeLogTag } from '../core/logSanitize.js';
 
 // ─────────────────────────────────────────────────────────────
 // 개발 서버용 부트스트랩 캐시 (vite watch가 index.html 덮어쓸 때 재주입)
@@ -674,10 +676,11 @@ async function handleLogCollect(req, res, ctx = {}) {
     catch (e) { handleReadJsonError(res, e); return; }
 
     // 배치 형식 { entries: [...] } 또는 단일 형식 { level, tag, messages } 모두 지원
-    const entries = Array.isArray(body.entries) ? body.entries : [body];
+    const entries = (Array.isArray(body.entries) ? body.entries : [body]).slice(0, 50);
 
     for (const entry of entries) {
         let { level = 'log', tag = 'backend', messages = [] } = entry;
+        tag = sanitizeLogTag(tag);
 
         if (tag === 'uncaught' || tag === 'unhandled-promise') level = 'error';
 
@@ -686,9 +689,13 @@ async function handleLogCollect(req, res, ctx = {}) {
         const icon       = level === 'error' ? '✗' : level === 'warn' ? '⚠' : level === 'info' ? 'ℹ' : '▸';
         const prefix     = `${ts()} ${tagColor}[${tag}]${C.reset} ${levelColor}${icon}${C.reset}`;
 
-        const formatted = (Array.isArray(messages) ? messages : [messages])
-            .map(m => (typeof m === 'object' ? JSON.stringify(m) : String(m)))
-            .join(' ');
+        const formatted = sanitizeLogText(
+            (Array.isArray(messages) ? messages : [messages])
+                .slice(0, 50)
+                .map(m => (typeof m === 'object' ? JSON.stringify(m) : String(m)))
+                .join(' '),
+            8000,
+        );
 
         const lines = formatted.split('\n');
         const first = lines[0];
@@ -986,6 +993,8 @@ export async function runDev(src, options = {}) {
     const watcher          = startBackendWatcher(sourceRoot, distRoot);
     const frontendProcess  = startFrontendWatch(sourceRoot, distRoot);
 
+    const _corsCfg = normalizeCorsConfig(dokConfig?.security);
+
     const server = http.createServer(async (req, res) => {
         const urlPath = req.url?.split('?')[0] || '/';
         const reqUrl = new URL(req.url || '/', 'http://dokkebi.dev');
@@ -1001,9 +1010,15 @@ export async function runDev(src, options = {}) {
             connectSrcExtra: Array.isArray(_cspExtraDev.connectSrc) ? _cspExtraDev.connectSrc : [],
         });
 
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Dokkebi-Session, Authorization');
+        // 관제 패널은 same-origin 전용 — ACAO 를 내보내지 않는다.
+        const _isPanelPath = urlPath.startsWith('/_dokkebi/_panel') || urlPath.startsWith('/api/_dokkebi/_panel');
+        if (!_isPanelPath) {
+            for (const [k, v] of Object.entries(corsHeadersFor(req.headers.origin || '', _corsCfg))) {
+                res.setHeader(k, v);
+            }
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Dokkebi-Session, Authorization');
+        }
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
         // ── 어드민 패널 (dev: /_dokkebi/_panel, serverless 호환: /api/_dokkebi/_panel) ──

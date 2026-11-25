@@ -33,6 +33,21 @@ function _corsHeadersFor(req: Request): Record<string, string> {
   return out;
 }
 
+// 로그 본문은 인증 없이 들어오는 공격자 제어값이다. ANSI/제어문자를 제거해
+// 터미널 조작과 개행 기반 로그 라인 위조를 막는다.
+function _logSanitize(value: unknown, maxLen = 2000): string {
+  let s = String(value ?? '');
+  s = s.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+  s = s.replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '');
+  s = s.replace(/[\u0000-\u001F\u007F]/g, ' ');
+  s = s.replace(/[ \t]{2,}/g, ' ').trim();
+  return s.slice(0, Math.max(0, maxLen));
+}
+function _logSanitizeTag(value: unknown): string {
+  const s = String(value ?? '').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 64);
+  return s || 'log';
+}
+
 const LEVEL_ICON: Record<string, string> = {
   error: '✗',
   warn:  '⚠',
@@ -113,7 +128,7 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
       return new Response('ok', { headers: { 'Content-Type': 'text/plain', ..._corsHeadersFor(request) } });
     }
     const level = (typeof parsed.level === 'string' && Object.prototype.hasOwnProperty.call(LEVEL_ICON, parsed.level)) ? parsed.level : 'log';
-    const tag = (typeof parsed.tag === 'string' ? parsed.tag : 'wasm').slice(0, 64);
+    const tag = _logSanitizeTag(parsed.tag || 'wasm');
     const rawMessages = Array.isArray(parsed.messages) ? parsed.messages.slice(0, _LOG_MAX_MESSAGES) : [];
     const icon = LEVEL_ICON[level] || '▸';
     const prefix = `[dokkebi:${tag}] ${icon}`;
@@ -122,9 +137,9 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
       .map((m: unknown) => {
         if (m === null || m === undefined) return '';
         if (typeof m === 'object') {
-          try { return JSON.stringify(m).slice(0, 2000); } catch { return '[object]'; }
+          try { return _logSanitize(JSON.stringify(m), 2000); } catch { return '[object]'; }
         }
-        return String(m).slice(0, 2000);
+        return _logSanitize(m, 2000);
       })
       .join(' ')
       .slice(0, 8000);

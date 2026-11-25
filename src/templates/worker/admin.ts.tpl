@@ -30,10 +30,12 @@ export interface Env {
   DB?: D1Database;           // D1 사용 시
 }
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
+// 관제 패널은 same-origin 전용이다. ACAO 를 내보내지 않아
+// 교차 출처에서 비밀번호 브루트포스 응답/토큰을 읽어가지 못하게 한다.
+const PANEL_OPTIONS_HEADERS = {
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Vary': 'Origin',
 };
 // 관제 패널은 프레임 삽입/외부 스크립트를 금지한다.
 // (인라인 script/style/onclick 사용 → 'unsafe-inline' 필요)
@@ -166,7 +168,7 @@ async function verifyToken(token: string, password: string): Promise<boolean> {
 
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
-    status, headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS, ...JSON_HEADERS },
+    status, headers: { 'Content-Type': 'application/json; charset=utf-8', ...JSON_HEADERS },
   });
 }
 
@@ -185,7 +187,7 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
   const adminPassword = env.DOKKEBI_ADMIN_PASSWORD || '';
 
   if (request.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS });
+    return new Response(null, { status: 204, headers: PANEL_OPTIONS_HEADERS });
   }
 
   const ipGate = _panelIpAllowed(request, env);

@@ -12,7 +12,7 @@ import path from 'node:path';
 
 import { copySqlJsAssets } from '../src/core/localDbAssets.js';
 import { generateBootstrapScript } from '../src/core/opaqueHandle.js';
-import { workerAdmin } from '../src/core/projectGenerator.js';
+import { workerAdmin, workerAdminApi, workerMiddleware } from '../src/core/projectGenerator.js';
 
 test('copySqlJsAssets: sql-wasm.js / .wasm 를 대상 디렉터리로 복사', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dok-sqljs-'));
@@ -45,4 +45,16 @@ test('admin panel: CSP / XFO 헤더 포함', () => {
     assert.match(src, /frame-ancestors 'none'/);
     assert.match(src, /X-Frame-Options/);
     assert.match(src, /&quot;/, 'esc must escape quotes for attribute contexts');
+});
+
+test('admin panel: cross-origin ACAO 를 내보내지 않는다', () => {
+    for (const src of [workerAdmin('demo'), workerAdminApi('demo')]) {
+        assert.equal(src.includes('Access-Control-Allow-Origin'), false);
+    }
+});
+
+test('middleware: 내부 경로를 substring 이 아니라 exact/prefix 로 제외한다', () => {
+    const src = workerMiddleware();
+    assert.match(src, /path === p \|\| path\.startsWith\(p \+ '\/'\)/);
+    assert.equal(src.includes('path.includes(p)'), false);
 });

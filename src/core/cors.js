@@ -10,3 +10,22 @@ export function normalizeCorsConfig(security) {
         .filter(Boolean);
     return { origins };
 }
+
+/**
+ * 요청 Origin 과 CORS 설정으로 응답 헤더를 만든다 (serve/dev 공용).
+ * 설정이 비어 있거나 '*' 이면 기존 동작(ACAO *)을 유지한다.
+ *
+ * @param {string} origin
+ * @param {{ origins?: string[] }} config
+ * @returns {Record<string, string>}
+ */
+export function corsHeadersFor(origin, config) {
+    const origins = Array.isArray(config?.origins) ? config.origins : [];
+    const out = { Vary: 'Origin' };
+    if (origins.length === 0 || origins.includes('*')) {
+        out['Access-Control-Allow-Origin'] = '*';
+    } else if (origin && origins.includes(origin)) {
+        out['Access-Control-Allow-Origin'] = origin;
+    }
+    return out;
+}
