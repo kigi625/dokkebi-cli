@@ -56,7 +56,7 @@ const POLICY = normalizePolicyConfig(
 
 async function loadWorkerInternals() {
     const source = workerDb('d1', ALLOWLIST, null, POLICY, AUTHZ, null, null, null, null, null, null, { origins: ['https://app.example.com'] })
-        + '\nexport { validateSqlAllowlist, findInternalTableRef, _az_checkSql, verifyTenantPolicy, injectTenantPolicy, _pe_detectOp, _isReadOnlySelectSql, _az_resolveJwtSecret, _az_verifyJwtHs256, _jwtClaimIdentity, _corsHeadersFor, _dbIpRateLimited, _loginRateCheck, _loginRateFail, _loginRateReset, _cap_verifyToken };\n';
+        + '\nexport { validateSqlAllowlist, findInternalTableRef, _az_checkSql, verifyTenantPolicy, injectTenantPolicy, _pe_detectOp, _isReadOnlySelectSql, _az_resolveJwtSecret, _az_verifyJwtHs256, _jwtClaimIdentity, _corsHeadersFor, _dbIpRateLimited, _loginRateCheck, _loginRateFail, _loginRateReset, _cap_verifyToken, _readJsonBodyCapped };\n';
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'dokkebi-worker-sec-'));
     const tsPath = path.join(dir, 'worker.ts');
     await fs.writeFile(tsPath, source, 'utf-8');
@@ -500,4 +500,38 @@ test('워커 템플릿: malformed JWT 서명은 throw 없이 거부', async () =
     const token = b64({ alg: 'HS256', typ: 'JWT' }) + '.' + b64({ exp: 9999999999 }) + '.%%%';
     const r = await worker._az_verifyJwtHs256(token, { DOKKEBI_JWT_SECRET: JWT_SECRET });
     assert.equal(r.valid, false);
+});
+
+
+test('워커 템플릿: chunked 본문도 상한 초과 시 거부 (Content-Length 우회 차단)', async () => {
+    const enc = new TextEncoder();
+    const make = (chunks) => new Request('http://localhost/api', {
+        method: 'POST',
+        body: new ReadableStream({
+            start(ctrl) { for (const chunk of chunks) ctrl.enqueue(enc.encode(chunk)); ctrl.close(); },
+        }),
+        duplex: 'half',
+    });
+
+    const ok = await worker._readJsonBodyCapped(make(['{"a":', '1}']), 64);
+    assert.equal(ok.ok, true);
+    assert.equal(ok.tooLarge, false);
+    assert.deepEqual(ok.value, { a: 1 });
+
+    const big = await worker._readJsonBodyCapped(make(['{"a":"', 'x'.repeat(128), '"}']), 64);
+    assert.equal(big.ok, false);
+    assert.equal(big.tooLarge, true);
+
+    const bad = await worker._readJsonBodyCapped(make(['{oops']), 64);
+    assert.equal(bad.ok, false);
+    assert.equal(bad.tooLarge, false);
+
+    const declared = new Request('http://localhost/api', {
+        method: 'POST',
+        headers: { 'content-length': '999999' },
+        body: '{"a":1}',
+    });
+    const fast = await worker._readJsonBodyCapped(declared, 64);
+    assert.equal(fast.ok, false);
+    assert.equal(fast.tooLarge, true);
 });

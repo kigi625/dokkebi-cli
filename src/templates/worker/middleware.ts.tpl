@@ -8,7 +8,7 @@ function _internalDb(env: any): D1Database {
   if (env && env.DB) return env.DB as D1Database; // 내부 바인딩 미설정 시 기본 DB
   throw new Error('[dokkebi] D1 바인딩 "' + _DOKKEBI_INTERNAL_BINDING + '" 이 없습니다. wrangler.toml 의 d1_databases 를 확인하세요.');
 }
-// @dokkebi-version: 2
+// @dokkebi-version: 3
 // worker/api/_middleware.ts
 // Cloudflare Pages 미들웨어 — /api/* 요청 자동 추적
 // 모든 API 요청의 method/path/status/duration/IP를 _dokkebi_requests에 기록
@@ -33,11 +33,49 @@ const LOW_VALUE_PATHS = ['/api/health', '/favicon.ico'];
 const _reqDedup = new Map<string, number>();
 const _REQ_DEDUP_TTL_MS = 10_000;
 const _REQ_DEDUP_MAX = 2048;
+
+// 고유 경로 폭주(예: /api/x/<random>)로 D1 로그 테이블이 무한히 커지는 것을
+// 막기 위한 isolate 단위 쓰기 예산. 초과분은 로그만 생략하고 요청은 통과시킨다.
+const _REQ_LOG_MAX_PER_MIN = 600;
+const _ERR_LOG_MAX_PER_MIN = 60;
+let _reqLogTokens = _REQ_LOG_MAX_PER_MIN;
+let _reqLogRefillAt = 0;
+let _errLogTokens = _ERR_LOG_MAX_PER_MIN;
+let _errLogRefillAt = 0;
+
+function _takeBudget(tokens: number, refillAt: number, max: number, now: number): [boolean, number, number] {
+  if (refillAt === 0) refillAt = now;
+  const refillMs = Math.max(50, Math.floor(60_000 / max));
+  const refill = Math.floor((now - refillAt) / refillMs);
+  if (refill > 0) {
+    tokens = Math.min(max, tokens + refill);
+    refillAt = now;
+  }
+  if (tokens <= 0) return [false, tokens, refillAt];
+  return [true, tokens - 1, refillAt];
+}
+function _takeReqLogToken(now: number): boolean {
+  const [ok, tokens, refillAt] = _takeBudget(_reqLogTokens, _reqLogRefillAt, _REQ_LOG_MAX_PER_MIN, now);
+  _reqLogTokens = tokens; _reqLogRefillAt = refillAt;
+  return ok;
+}
+function _takeErrLogToken(now: number): boolean {
+  const [ok, tokens, refillAt] = _takeBudget(_errLogTokens, _errLogRefillAt, _ERR_LOG_MAX_PER_MIN, now);
+  _errLogTokens = tokens; _errLogRefillAt = refillAt;
+  return ok;
+}
+
 function _pruneReqDedup(now: number) {
   if (_reqDedup.size <= _REQ_DEDUP_MAX) return;
   for (const [k, until] of _reqDedup) {
     if (until <= now) _reqDedup.delete(k);
     if (_reqDedup.size <= Math.floor(_REQ_DEDUP_MAX * 0.8)) break;
+  }
+  // 만료 항목이 부족해도 상한 아래로 내려가도록 가장 오래된 항목부터 제거.
+  while (_reqDedup.size > Math.floor(_REQ_DEDUP_MAX * 0.8)) {
+    const oldest = _reqDedup.keys().next().value;
+    if (oldest === undefined) break;
+    _reqDedup.delete(oldest);
   }
 }
 function _shouldWriteReqLog(method: string, path: string, status: number, ip: string, now: number) {
@@ -45,6 +83,7 @@ function _shouldWriteReqLog(method: string, path: string, status: number, ip: st
   const key = [method || '-', path || '-', String(Math.floor(Number(status || 0) / 100)), ip || '-'].join('|');
   const until = _reqDedup.get(key);
   if (until && until > now) return false;
+  if (!_takeReqLogToken(now)) return false;
   _reqDedup.set(key, now + _REQ_DEDUP_TTL_MS);
   _pruneReqDedup(now);
   return true;
@@ -69,7 +108,9 @@ async function insertError(
   path: string, method: string, status: number, message: string
 ) {
   try {
-    const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const now = Date.now();
+    if (!_takeErrLogToken(now)) return;
+    const id = Math.random().toString(36).slice(2) + now.toString(36);
     await db.prepare(
       `INSERT OR IGNORE INTO "_dokkebi_errors" ("id","source","level","message","path","method") VALUES (?,?,?,?,?,?)`
     ).bind(id, 'worker', 'error', message.slice(0, 500), path, method).run();

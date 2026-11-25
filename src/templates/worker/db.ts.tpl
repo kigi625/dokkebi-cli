@@ -1,4 +1,4 @@
-// @dokkebi-version: 12
+// @dokkebi-version: 13
 // worker/api/_dokkebi/db.ts
 // Cloudflare Pages Function — DB 프록시 (D1 세션 + AES-256-GCM 양방향 암호화 + Nonce 재전송 방어)
 //
@@ -2817,6 +2817,53 @@ function _corsHeadersFor(req: Request): Record<string, string> {
   return out;
 }
 
+
+// ── Chunked body 상한 ───────────────────────────────────────
+//   Content-Length 는 chunked 전송에서 0/부재일 수 있다. 스트림을 직접 읽어
+//   누적 바이트가 상한을 넘으면 즉시 취소한다. (파싱 전 CPU/메모리 DoS 차단)
+async function _readJsonBodyCapped(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: boolean; tooLarge: boolean; value?: any }> {
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { ok: false, tooLarge: true };
+  }
+  if (!request.body) return { ok: false, tooLarge: false };
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* already closed */ }
+        return { ok: false, tooLarge: true };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, tooLarge: false };
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+  }
+  try {
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const text = new TextDecoder('utf-8').decode(merged);
+    return { ok: true, tooLarge: false, value: JSON.parse(text) };
+  } catch {
+    return { ok: false, tooLarge: false };
+  }
+}
+
 export const onRequest: PagesFunction<Env> = async (ctx) => {
   const { request, env } = ctx;
 
@@ -2842,16 +2889,17 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
 
   // ── Phase 1-② Envelope size cap (pre-parse) ─────────────
   //   파싱/복호화 전에 거대 페이로드를 잘라 CPU DoS 차단.
-  const _contentLen = Number(request.headers.get('content-length') || 0);
-  if (_contentLen > MAX_ENVELOPE_BYTES) {
+  //   Content-Length 뿐 아니라 chunked 본문도 스트림에서 누적 검사한다.
+  const _body = await _readJsonBodyCapped(request, MAX_ENVELOPE_BYTES);
+  if (_body.tooLarge) {
     return new Response(JSON.stringify({
       ok: false, code: 'PAYLOAD_TOO_LARGE', error: '요청이 허용 크기를 초과했습니다.',
     }), { status: 413, headers });
   }
-
-  let raw: any;
-  try { raw = await request.json(); }
-  catch { return new Response(JSON.stringify({ error: '잘못된 요청 본문' }), { status: 400, headers }); }
+  if (!_body.ok) {
+    return new Response(JSON.stringify({ error: '잘못된 요청 본문' }), { status: 400, headers });
+  }
+  const raw: any = _body.value;
 
   try {
     const { sid, enc, iv: ivB64, nonce, ts: reqTs, sig } = raw;

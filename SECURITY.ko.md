@@ -118,7 +118,9 @@ dokkebi 는 다음 한 가지를 성립시키려고 설계된 실험적 아키�
 | DB 쿼리 | 아이솔레이트당 IP별 1,200/분(`DOKKEBI_DB_RPM`, D1 앞 단) + 세션당 300/분 |
 | 로그 | IP당 600/분 + 64KB body |
 | 워커 로그인 | IP당 5분에 10회 실패, 식별자당 5분에 5회 실패, 10분 잠금(아이솔레이트 단위, Cloudflare WAF 병행 권장) |
-| Body 크기 | handshake 8KB / db 128KB / log 64KB / admin 2KB — `Content-Length` 선체크 + 스트리밍 중 중단 |
+| Body 크기 | handshake 8KB / db 512KB / log 64KB / admin 2KB — `Content-Length` 빠른 검사 + **스트리밍 바이트 상한**(chunked 포함, 초과 즉시 스트림 취소) |
+| 요청 로그 | 아이솔레이트당 분당 요청 로그 600건(10초 중복 제거, 2,048키 하드 캡) + 오류 로그 60건/분 — 고유 경로 폭주로 `_dokkebi_requests`/`_dokkebi_errors` 가 무한히 커지지 않음 |
+| 패널 인증 맵 | IP 항목 최대 5,000개, 만료 항목 정리 + 가장 오래된 항목 축출 |
 | 세션 | 전역 최대 500(`DOKKEBI_MAX_SESSIONS`) + IP별 20(`DOKKEBI_MAX_SESSIONS_PER_IP`). 전역 초과 시 **가장 많이 만든 IP**에서 먼저 축출(오래된 전역 세션 축출 아님) |
 | Nonce 캐시 | TTL 35s + 60s 주기 정리 |
 
@@ -743,7 +745,7 @@ dokkebi 는 다음 3중 방어로 이 race 를 제거합니다 (모두 자동, �
 | 3 | **Replay 방어 (Nonce + ±5s TS)** | 네트워크/전송 | 재전송 차단 | `workerDb` 가 nonce/timestamp 검증 → 인메모리 검사 후 D1 `_dokkebi_nonces` 선점. **쓰기/특수 명령은 동기** `INSERT OR IGNORE` + changes 로 다른 아이솔레이트 재전송을 차단하고, 읽기는 백그라운드 기록. `REPLAY_DETECTED` / `TIMESTAMP_SKEW` 코드. `replay.timestampWindowMs`(1-30s clamp), `nonceTtlMs`(window+5s ~ 5min clamp) 튜닝 가능 | 캡처 요청 재전송, 빠른 다발 발사 | ✅ 정상 |
 | 4 | **Forward Secrecy (Ephemeral ECDH)** | 네트워크/전송 | 세션키 노출 시에도 과거 트래픽 보호 | 매 핸드셰이크마다 새 키쌍, `_dokkebi_ephemeral_keys` 60s TTL 후 삭제 | 장기 세션키 탈취 후 과거 트래픽 복호화 | ✅ 정상 |
 | 5 | **세션 관리 (FIFO + 토큰 버킷)** | 네트워크/세션 | DoS 방어 | `_dokkebi_sessions` D1 + per-session `bucketTokens`/`bucketRefillAt`; 핸드셰이크 IP 버킷(20/분) + 전역 상한 `DOKKEBI_MAX_SESSIONS`(기본 500, FIFO 축출). 세션 폭탄/요청 폭주 방어 | 세션 폭탄, 단일 세션 다발 공격 | ✅ 정상 |
-| 6 | **Envelope Body 크기 제한 (512KB)** | 네트워크/DoS | body DoS 방어 | `MAX_ENVELOPE_BYTES = 512*1024` + `Content-Length` 선체크 → 413 | 거대 페이로드 DoS, 메모리 고갈 | ✅ 정상 |
+| 6 | **Envelope Body 크기 제한 (512KB)** | 네트워크/DoS | body DoS 방어 | `MAX_ENVELOPE_BYTES = 512*1024`; `Content-Length` 빠른 검사 + 누적 바이트가 상한을 넘는 즉시 스트림을 취소하는 리더(chunked 포함) → 413 | 거대 페이로드 DoS, 메모리 고갈 | ✅ 정상 |
 | 7 | **SQL Allowlist (테이블×op)** | 백엔드 로직/DB | 4-레이어 1단계 — 허용된 테이블·op만 통과 | `dist/dokkebi/sql-allowlist.json` 빌드시 추출 → `workerDb` 에 인라인 임베드. SELECT/INSERT/UPDATE/DELETE 단위. 참조 추출은 따옴표/괄호를 인식하며 콤마 조인, `INDEXED BY`/`ON`/`USING`, 괄호 목록, `UPDATE OR …` 대상을 포함. 2차 참조는 SELECT 필수. **내부 테이블(`_dokkebi_*`, `sqlite_*`)·클라이언트 DDL 은 항상 차단** (`findInternalTableRef`) | 임의 테이블 SELECT/UPDATE/DELETE, **시스템 테이블 변조 / 세션키 탈취**, 스키마 탐색 | ✅ 정상 |
 | 8 | **Query Registry (SQL shape)** | 백엔드 로직/DB | 4-레이어 2단계 — SQL 구조 변조 차단 | shape 등록·매칭. `OR 1=1`, WHERE 누락, 컬럼 변경 차단. **기본 `auto`** (등록 안된 건 _debugSql 폴백 = 사실상 비활성), `queryRegistry.strict: true` 시 미등록 차단 | SQL 구조 변조, `OR 1=1`, WHERE 제거 | ✅ 정상 (auto 시 방어 약화 — §4.2 참조) |
 | 9 | **공통 SQL 방어** | 백엔드 로직/DB | 4-레이어 0단계 | `hasMultipleStatements` (다중 문장 `;`), `stripStringsAndComments` (주석 `--`/`/* */`), 위험토큰 차단 (`ATTACH`, `DETACH`, `PRAGMA`, `LOAD_EXTENSION`, `INTO OUTFILE`, `INTO DUMPFILE`, `INFORMATION_SCHEMA`, `PG_SLEEP`, `SLEEP(`, `BENCHMARK(`, `WAITFOR`, `XP_`, `SP_EXECUTESQL`) | SQL injection (스택 쿼리, 주석 우회), DB 권한 확장, 시간 기반 blind injection | ✅ 정상 |
@@ -756,7 +758,7 @@ dokkebi 는 다음 3중 방어로 이 race 를 제거합니다 (모두 자동, �
 | 16 | **Bundle Attestation (chunk SHA-256)** | 백엔드 로직/번들 무결성 | (opt-in, capabilities 켜면 자동) 변조된 번들 차단 | `dok build` 가 `backend-bundle.chunks.json` (16KB chunk SHA-256 매니페스트) 생성 → 워커 코드에 임베드 (클라이언트 비노출). `_attest` challenge → 클라가 메모리 번들 슬라이싱 응답. 실패시 `attest_failed` / `CAPABILITY_ATTEST_REQUIRED`. `requires: { attest: true }` 시 capability 발급 게이트 | 클라이언트 번들 패치(권한 분기 우회·자유 capability 발급) | ✅ 정상 |
 | 17 | **Active Defense Layer (ADL)** | 백엔드 로직/봇·자동화 | (opt-in) 위험 점수 기반 차단 | `_adlRisk` 계산 (`ADL_RISK_BLOCK` threshold). `mode: 'monitor'` 로그만 / `'enforce'` 차단. `sampleRate`, `riskBlockThreshold`, `trigger: 'lazy'/'cron'`, Workers AI 옵션 | 자동화 스크래핑, 403/인증 실패 다발, 가격 fuzzing | ✅ 정상 |
 | 18 | **Panel IP Guard (CIDR)** | 네트워크/관제 | (opt-in) 관제 패널 외부 IP 차단 | `workerAdmin`/`workerAdminApi` 에 `panelIpAllowed` + CIDR 매칭. `CF-Connecting-IP` 우선 → `X-Forwarded-For` fallback. 차단 시 403 + `panel_ip_block` 이벤트 (`_dokkebi_security`) | 패널 비밀번호 무차별 대입, 외부 IP 관제 API 호출, 로그/이벤트 무단 조회·삭제 | ✅ 정상 |
-| 19 | **관리자 패널 보안 (PW + 락 + 토큰)** | 백엔드 로직/관제 | 항상 ON | `timingSafeEqual` 상수-시간 PW 비교, 5회 실패 → 5분 락, HMAC 서명 + 만료 토큰, 2KB body 상한, 600/min 로그 한도, 패널 응답 ACAO 미전송(same-origin 전용) | 패널 PW 브루트포스, 타이밍 공격, 토큰 위조, 교차 출처 토큰 탈취, 관제 DoS | ✅ 정상 |
+| 19 | **관리자 패널 보안 (PW + 락 + 토큰)** | 백엔드 로직/관제 | 항상 ON | `timingSafeEqual` 상수-시간 PW 비교, 5분에 10회 실패 → 10분 락, 시도 맵 상한(5,000 IP), HMAC 서명 + 만료 토큰, 2KB body 상한, 패널 응답 ACAO 미전송(same-origin 전용) | 패널 PW 브루트포스, 타이밍 공격, 토큰 위조, 교차 출처 토큰 탈취, 관제 DoS | ✅ 정상 |
 | 20 | **Strict CSP (hash-pinned)** | 네트워크/XSS 심층방어 | (opt-in) | `deploy.js _writeSecurityHeaders` → `dist/_headers`. 인라인 `<script>/<style>` 콘텐츠를 SHA-256 해싱해 `script-src 'self' 'sha256-…'` 자동 부여, `unsafe-inline` 제거. CSP 전 directive 명시 | XSS 후속 외부 스크립트 주입, eval, 데이터 유출 (자료/키 탈취) | ✅ 정상 |
 | 21 | **Opaque Handle (번들 키 한정)** | 백엔드 로직/시크릿 | 항상 ON | `__DOKKEBI_BC_KEY__` 만 AES-GCM 으로 감싸 OPFS 저장, host 클로저에서만 복호화. 서버 전용 `.env` Secret 은 브라우저로 전달되지 않으며 백엔드 `process.env.SECRET` 은 배포/strict 빌드에서 차단. `.dokkebi/env-secrets.json` 정적 서빙 차단 | 브라우저 콘솔/DevTools 환경변수 노출, 클라이언트 코드 dump | ✅ 정상 (XSS 시 같은 origin 재현 가능 — §4.3) |
 | 22 | **번들 무결성 SHA-256** | 빌드/번들 | 항상 ON | `dok build` 가 `backend.bundle.enc` SHA-256 → `backend.bundle.<hash12>.enc` immutable 파일명 + 런타임 `crypto.subtle.digest` 검증 | 번들 교체/변조, MITM 번들 swap | ✅ 정상 |

@@ -21,6 +21,22 @@ import { resolveClientIp } from './clientIp.js';
 // /auth Rate Limiting — IP당 5분에 최대 10회, 초과 시 10분 잠금
 // ─────────────────────────────────────────────────────────────
 const _authAttempts = new Map(); // ip → { count, resetAt, lockedUntil }
+const _AUTH_ATTEMPTS_MAX = 5000;
+
+function _pruneAuthAttempts(now) {
+    if (_authAttempts.size <= _AUTH_ATTEMPTS_MAX) return;
+    for (const [k, v] of _authAttempts) {
+        if ((v.lockedUntil && v.lockedUntil <= now) || (!v.lockedUntil && now > v.resetAt)) {
+            _authAttempts.delete(k);
+        }
+        if (_authAttempts.size <= Math.floor(_AUTH_ATTEMPTS_MAX * 0.8)) break;
+    }
+    while (_authAttempts.size > Math.floor(_AUTH_ATTEMPTS_MAX * 0.8)) {
+        const oldest = _authAttempts.keys().next().value;
+        if (oldest === undefined) break;
+        _authAttempts.delete(oldest);
+    }
+}
 
 function _checkAuthRateLimit(ip) {
     const now = Date.now();
@@ -37,6 +53,7 @@ function _checkAuthRateLimit(ip) {
 
     entry.count += 1;
     _authAttempts.set(ip, entry);
+    _pruneAuthAttempts(now);
 
     if (entry.count > 10) {
         entry.lockedUntil = now + 10 * 60 * 1000;
@@ -464,3 +481,6 @@ export function generateAdminHtml({ projectName = 'dokkebi', mode = 'serve' } = 
         { find: '__DOKKEBI_PH_MODE__',         replace: String(mode) },
     ]);
 }
+
+// 테스트용 내부 노출 (런타임 동작에는 영향 없음)
+export { _authAttempts as __authAttempts, _pruneAuthAttempts as __pruneAuthAttempts, _AUTH_ATTEMPTS_MAX as __AUTH_ATTEMPTS_MAX };

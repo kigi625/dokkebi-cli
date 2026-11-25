@@ -8,7 +8,7 @@ function _internalDb(env: any): D1Database {
   if (env && env.DB) return env.DB as D1Database; // 내부 바인딩 미설정 시 기본 DB
   throw new Error('[dokkebi] D1 바인딩 "' + _DOKKEBI_INTERNAL_BINDING + '" 이 없습니다. wrangler.toml 의 d1_databases 를 확인하세요.');
 }
-// @dokkebi-version: 4
+// @dokkebi-version: 5
 // worker/api/_dokkebi/log.ts
 // Cloudflare Pages Function — WASM VM 로그 수집
 // POST /api/_dokkebi/log {level, tag, messages}
@@ -99,6 +99,50 @@ async function _saveErrorToDb(db: D1Database, tag: string, message: string, stac
   } catch { /* 에러 로그 저장 실패 무시 */ }
 }
 
+
+// Content-Length/chunked 모두에서 동작하는 상한부 JSON 리더.
+async function _logReadJsonBodyCapped(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: boolean; tooLarge: boolean; value?: any }> {
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { ok: false, tooLarge: true };
+  }
+  if (!request.body) return { ok: false, tooLarge: false };
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* already closed */ }
+        return { ok: false, tooLarge: true };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, tooLarge: false };
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+  }
+  try {
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { ok: true, tooLarge: false, value: JSON.parse(new TextDecoder('utf-8').decode(merged)) };
+  } catch {
+    return { ok: false, tooLarge: false };
+  }
+}
+
 export const onRequest: PagesFunction<Env> = async (ctx) => {
   const { request, env } = ctx;
 
@@ -116,14 +160,14 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
         status: 429, headers: { 'Content-Type': 'application/json', ..._corsHeadersFor(request) },
       });
     }
-    const _len = Number(request.headers.get('content-length') || 0);
-    if (Number.isFinite(_len) && _len > _LOG_BODY_MAX) {
+    const _body = await _logReadJsonBodyCapped(request, _LOG_BODY_MAX);
+    if (_body.tooLarge) {
       return new Response(JSON.stringify({ ok: false, code: 'PAYLOAD_TOO_LARGE', error: '로그 본문이 너무 큽니다.' }), {
         status: 413, headers: { 'Content-Type': 'application/json', ..._corsHeadersFor(request) },
       });
     }
 
-    const parsed: any = await request.json<any>().catch(() => null);
+    const parsed: any = _body.ok ? _body.value : null;
     if (!parsed || typeof parsed !== 'object') {
       return new Response('ok', { headers: { 'Content-Type': 'text/plain', ..._corsHeadersFor(request) } });
     }

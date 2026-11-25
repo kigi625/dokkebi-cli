@@ -1,4 +1,4 @@
-// @dokkebi-version: 4
+// @dokkebi-version: 5
 // worker/api/_dokkebi/handshake.ts
 // Cloudflare Pages Function — ECDH P-256 핸드셰이크 (Ephemeral 키 — Forward Secrecy)
 //
@@ -65,9 +65,47 @@ function _hsRateLimited(env: Env, ip: string): boolean {
   b.tokens -= 1;
   return false;
 }
-function _hsBodyTooLarge(req: Request, maxBytes = 8 * 1024): boolean {
-  const len = Number(req.headers.get('content-length') || 0);
-  return Number.isFinite(len) && len > maxBytes;
+// Content-Length/chunked 모두에서 동작하는 상한부 JSON 리더.
+async function _hsReadJsonBodyCapped(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: boolean; tooLarge: boolean; value?: any }> {
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { ok: false, tooLarge: true };
+  }
+  if (!request.body) return { ok: false, tooLarge: false };
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* already closed */ }
+        return { ok: false, tooLarge: true };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: false, tooLarge: false };
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+  }
+  try {
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { ok: true, tooLarge: false, value: JSON.parse(new TextDecoder('utf-8').decode(merged)) };
+  } catch {
+    return { ok: false, tooLarge: false };
+  }
 }
 
 
@@ -170,12 +208,6 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
         ok: false, code: 'HANDSHAKE_RATE_LIMIT', error: '핸드셰이크 요청이 너무 많습니다. 잠시 후 다시 시도하세요.',
       }), { status: 429, headers });
     }
-    if (_hsBodyTooLarge(request, 8 * 1024)) {
-      return new Response(JSON.stringify({
-        ok: false, code: 'PAYLOAD_TOO_LARGE', error: '핸드셰이크 요청이 허용 크기를 초과했습니다.',
-      }), { status: 413, headers });
-    }
-
     if (method === 'GET') {
       const ephemeral = await crypto.subtle.generateKey(
         { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
@@ -198,7 +230,16 @@ export const onRequest: PagesFunction<Env> = async (ctx) => {
     }
 
     if (method === 'POST') {
-      const body = await request.json<{ clientPubKey?: string; keyId?: string; bh?: string }>();
+      const _body = await _hsReadJsonBodyCapped(request, 8 * 1024);
+      if (_body.tooLarge) {
+        return new Response(JSON.stringify({
+          ok: false, code: 'PAYLOAD_TOO_LARGE', error: '핸드셰이크 요청이 허용 크기를 초과했습니다.',
+        }), { status: 413, headers });
+      }
+      if (!_body.ok) {
+        return new Response(JSON.stringify({ error: '잘못된 요청 본문' }), { status: 400, headers });
+      }
+      const body = _body.value as { clientPubKey?: string; keyId?: string; bh?: string };
       const { clientPubKey, keyId } = body;
       // 무중단 배포 — 클라이언트가 들고 있는 bundleHash 앞 12자 (없으면 빈값으로 폴백)
       const requestedBh = (() => {
