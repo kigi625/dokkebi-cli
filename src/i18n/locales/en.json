@@ -443,7 +443,7 @@
     "backup": "  backup: {path}",
     "complete": "✓ Update complete",
     "nextSteps": "  Next steps:",
-    "dbTsNote1": "! db.ts has been replaced with the v8 template (Allowlist + Query Registry + Tenant Policy + Authorization).",
+    "dbTsNote1": "! db.ts has been replaced with the latest template (Allowlist + Query Registry + Tenant Policy + Authorization).",
     "dbTsNote2": "Re-run {cmd} to embed allowlist / registry / policy / authorization.",
     "dbTsNote3": "└─ DSL queries are auto-learned when you run the app once in dev mode.",
     "dbTsNote4": "└─ Tenant Policy is opt-in: set policy.enabled: true in dokkebi.config.js",

@@ -443,7 +443,7 @@
     "backup": "  백업: {path}",
     "complete": "✓ 업데이트 완료",
     "nextSteps": "  다음 단계:",
-    "dbTsNote1": "! db.ts 가 v8 템플릿(Allowlist + Query Registry + Tenant Policy + Authorization)으로 교체되었습니다.",
+    "dbTsNote1": "! db.ts 가 최신 템플릿(Allowlist + Query Registry + Tenant Policy + Authorization)으로 교체되었습니다.",
     "dbTsNote2": "{cmd} 를 재실행해 allowlist / 레지스트리 / 정책 / 인가를 임베드하세요.",
     "dbTsNote3": "└─ dev 모드에서 앱을 한 번 실행하면 DSL 쿼리가 자동 학습됩니다.",
     "dbTsNote4": "└─ Tenant Policy 는 opt-in: dokkebi.config.js 의 policy.enabled: true 로 활성",
