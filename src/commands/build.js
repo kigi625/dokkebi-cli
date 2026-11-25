@@ -29,7 +29,7 @@ import { resolveCorsConfig } from '../core/cors.js';
 import { copySqlJsAssets } from '../core/localDbAssets.js';
 import { inferPolicyFromProject, mergeInferredIntoConfig } from '../core/policyInference.js';
 import { scanPolicyAnnotations, mergeAnnotationsIntoInferred } from '../core/policyAnnotations.js';
-import { workerDb, workerAdmin, workerAdminApi, workerHandshake, workerCapability, workerLog, workerRootMiddleware } from '../core/projectGenerator.js';
+import { workerDb, workerAdmin, workerAdminApi, workerHandshake, workerCapability, workerLog, workerRootMiddleware, workerMiddleware } from '../core/projectGenerator.js';
 import { loadPlugins, generatePluginBootstrapCode } from '../core/pluginLoader.js';
 import { loadDokkebiConfigMerged, applySecurityPreset } from '../core/dokkebiConfigLoad.js';
 import { getHardeningFlags } from '../core/hardeningFlags.js';
@@ -1400,6 +1400,18 @@ export async function runBuild(src, options = {}) {
             await fs.access(workerLogPath);
             await fs.writeFile(workerLogPath, workerLog(corsMeta), 'utf-8');
         } catch { /* log.ts 미존재 → 무시 */ }
+
+        // API 요청 로깅 미들웨어도 최신 템플릿으로 갱신한다.
+        // (구버전에는 고유 경로 폭주 시 D1 로그가 무한히 커지는 문제가 있음)
+        const apiMwPath = path.join(sourceRoot, 'worker', 'api', '_middleware.ts');
+        try {
+            const prev = await fs.readFile(apiMwPath, 'utf-8').catch(() => '');
+            const prevVer = Number((prev.match(/@dokkebi-version:\s*(\d+)/) || [])[1] || 0);
+            if (!prev || prevVer < 3) {
+                await fs.mkdir(path.dirname(apiMwPath), { recursive: true });
+                await fs.writeFile(apiMwPath, workerMiddleware(), 'utf-8');
+            }
+        } catch { /* 미들웨어 갱신 실패 → 기존 파일 유지 */ }
 
         // 서버측 capability 검증 헬퍼 — 라우트에서 재검증할 때 import 한다.
         const workerCapPath = path.join(sourceRoot, 'worker', 'api', '_dokkebi', 'capability.ts');

@@ -20,7 +20,7 @@ import { createReadStream } from 'fs';
 import readline from 'readline';
 import { pathToFileURL } from 'url';
 
-import { workerHandshake, workerDb, workerLog, workerAdmin, workerAdminApi, systemTableSql } from '../core/projectGenerator.js';
+import { workerHandshake, workerDb, workerLog, workerAdmin, workerAdminApi, workerMiddleware, systemTableSql } from '../core/projectGenerator.js';
 import { resolveCorsConfig } from '../core/cors.js';
 import { emitPayloadWireTs, disabledWireRuntimeJson } from '../core/payloadWireRuntime.js';
 import { applyDokkebiConfigAliases } from '../core/dokkebiConfigLoad.js';
@@ -70,6 +70,12 @@ const WORKER_FILES = [
         generate: (cfg) => workerLog(resolveCorsConfig(cfg?.security, cfg, { projectName: cfg?._name || '' })),
         version:  5,
         desc:     '로그 수집 Worker',
+    },
+    {
+        rel:      'worker/api/_middleware.ts',
+        generate: () => workerMiddleware(),
+        version:  3,
+        desc:     'API 요청 로깅 미들웨어 (로그 폭주 예산)',
     },
     {
         rel:      'worker/api/_dokkebi/_panel.ts',
